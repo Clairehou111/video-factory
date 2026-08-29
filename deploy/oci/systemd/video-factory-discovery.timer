@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Video Factory discovery schedules every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=video-factory-discovery.service
+
+[Install]
+WantedBy=timers.target
+

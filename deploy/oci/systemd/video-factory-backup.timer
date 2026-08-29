@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Video Factory backup every day
+
+[Timer]
+OnBootSec=30min
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+Unit=video-factory-backup.service
+
+[Install]
+WantedBy=timers.target
+

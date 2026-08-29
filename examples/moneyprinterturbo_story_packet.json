@@ -1,0 +1,32 @@
+{
+  "candidate": {
+    "id": "github-harry0703-MoneyPrinterTurbo",
+    "source_type": "github",
+    "source_url": "https://github.com/harry0703/MoneyPrinterTurbo",
+    "title": "harry0703/MoneyPrinterTurbo",
+    "author": "harry0703",
+    "metadata": {
+      "description": "Generate HD short videos from a topic or keyword with an automated AI workflow.",
+      "license": "MIT"
+    }
+  },
+  "topic_type": "github_project",
+  "content_type": "explainer",
+  "target_duration": 35,
+  "evidence": [
+    {
+      "id": "mpt-repo-metadata",
+      "candidate_id": "github-harry0703-MoneyPrinterTurbo",
+      "url": "https://github.com/harry0703/MoneyPrinterTurbo",
+      "quote": "The repository describes an automated workflow for generating HD short videos from a topic or keyword.",
+      "source_kind": "github:repository"
+    },
+    {
+      "id": "mpt-readme",
+      "candidate_id": "github-harry0703-MoneyPrinterTurbo",
+      "url": "https://github.com/harry0703/MoneyPrinterTurbo#readme",
+      "quote": "The freshly captured README is the source for feature headings, installation, usage, configuration, limitations and license anchors.",
+      "source_kind": "github:readme"
+    }
+  ]
+}

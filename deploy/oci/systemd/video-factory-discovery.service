@@ -1,0 +1,16 @@
+[Unit]
+Description=Video Factory scheduled discovery and generation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=video-factory
+Group=video-factory
+EnvironmentFile=/etc/video-factory/video-factory.env
+WorkingDirectory=/opt/video-factory/app
+ExecStart=/opt/video-factory/app/deploy/oci/run-discovery.sh
+UMask=0077
+Nice=10
+TimeoutStartSec=infinity
+

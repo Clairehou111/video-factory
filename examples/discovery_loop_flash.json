@@ -1,0 +1,73 @@
+{
+  "id": "discovery-loop-flash-20260820",
+  "candidate_id": "tweet-2085034604172603724",
+  "content_type": "flash",
+  "topic_type": "company_or_team",
+  "source_urls": [
+    "https://x.com/JeffDean/status/2085034604172603724",
+    "https://www.discoveryloop.com/"
+  ],
+  "fixed_footer": "今天公布的是方向，不是成熟产品",
+  "footer_shows_source_url": false,
+  "scenes": [
+    {
+      "id": "event",
+      "start": 0,
+      "end": 3,
+      "narration": "Jeff Dean 和三位合作者成立 Discovery Loop。",
+      "caption": "四位长期合作者成立新公司",
+      "evidence_ids": ["discovery-post"],
+      "material_role": "proof",
+      "visual_action": "show the complete source post in one readable card",
+      "recording_cues": [{"action": "wait", "instruction": "hold source card", "wait_ms": 3000}]
+    },
+    {
+      "id": "product-direction",
+      "start": 3,
+      "end": 7,
+      "narration": "官网的第一步，是把机器学习实验循环交给 AI：提出、运行、评估、再迭代。",
+      "caption": "先自动化机器学习实验循环",
+      "evidence_ids": ["discovery-official"],
+      "material_role": "proof",
+      "visual_action": "scroll and highlight the official experimental-loop statement",
+      "recording_cues": [
+        {"action": "highlight", "instruction": "highlight the official approach", "target": "\"Automating the experimental loop.\"", "wait_ms": 2000},
+        {"action": "scroll", "instruction": "reach ML focus", "target": "\"Start with Machine Learning\"", "wait_ms": 2000}
+      ]
+    },
+    {
+      "id": "boundary",
+      "start": 7,
+      "end": 9.9,
+      "narration": "注意，今天公布的是方向，还不是成熟产品。",
+      "caption": "有方向，尚无已交付产品",
+      "evidence_ids": ["discovery-official"],
+      "material_role": "explanation",
+      "visual_action": "hold the official page and fixed conclusion",
+      "recording_cues": [{"action": "wait", "instruction": "hold conclusion", "wait_ms": 2900}]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "discovery-post",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://x.com/JeffDean/status/2085034604172603724",
+      "quote": "Jeff Dean announced Discovery Loop with Sanjay Ghemawat, Oriol Vinyals and Quoc Le.",
+      "source_kind": "x:thread_post",
+      "captured_at": "2026-08-20T10:35:00Z"
+    },
+    {
+      "id": "discovery-official",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://www.discoveryloop.com/",
+      "quote": "The official site says it is building systems to automate entire experimental loops and will initially focus on machine learning research and engineering.",
+      "source_kind": "official:web",
+      "captured_at": "2026-08-20T10:35:00Z"
+    }
+  ],
+  "story_beats": [
+    {"id": "identity", "answer": "Discovery Loop was announced by Jeff Dean with Sanjay Ghemawat, Oriol Vinyals and Quoc Le.", "evidence_ids": ["discovery-post"]},
+    {"id": "product_direction", "answer": "The stated first focus is automating machine-learning experimental loops.", "evidence_ids": ["discovery-official"]},
+    {"id": "unknown", "answer": "The announcement describes a direction and initial focus; it does not establish a mature released product.", "evidence_ids": ["discovery-official"]}
+  ]
+}

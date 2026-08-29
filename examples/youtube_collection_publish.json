@@ -1,0 +1,15 @@
+{
+  "collection_title": "AI 工程团队升级",
+  "targets": {
+    "bilibili": {
+      "account": "main",
+      "tid": 231,
+      "tags": ["AI", "AI工程", "中文字幕"]
+    },
+    "tencent": {
+      "account": "main",
+      "collection": "AI 工程团队升级",
+      "tags": ["AI", "开发者", "技术团队"]
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "cadence_hours": 48,
+  "max_source_selections": 1,
+  "minimum_score": 70,
+  "source_duration_minutes": [15, 120],
+  "lookback_days": 30,
+  "results_per_query": 8,
+  "metadata_probe_limit": 10,
+  "timezone": "Asia/Tokyo",
+  "query_pools": {
+    "perplexity": [
+      "Aravind Srinivas Perplexity interview",
+      "Perplexity CEO AI engineering"
+    ],
+    "karpathy": [
+      "Andrej Karpathy AI talk",
+      "Andrej Karpathy agentic engineering"
+    ],
+    "yc": [
+      "Y Combinator AI startup",
+      "Y Combinator AI engineering"
+    ],
+    "popular_ai": [
+      "AI engineering agents talk",
+      "coding agents platform engineering",
+      "AI developer productivity conference"
+    ]
+  }
+}

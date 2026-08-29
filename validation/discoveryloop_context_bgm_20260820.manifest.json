@@ -1,0 +1,464 @@
+{
+  "id": "story-tweet-2085034604172603724",
+  "candidate_id": "tweet-2085034604172603724",
+  "content_type": "explainer",
+  "scenes": [
+    {
+      "id": "scene-1",
+      "start": 0.0,
+      "end": 5.0,
+      "narration": "内部说明：展示 Jeff Dean 帖文首段，突出公司名、创始人与公共利益公司性质，事实来自帖文。",
+      "caption": "Jeff Dean 官宣创立 Discovery Loop",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085034604172603724"
+      ],
+      "material_role": "proof",
+      "visual_action": "从 Jeff Dean 帖文顶部开始，高亮“Announcing Discovery Loop!”及四位创始人姓名。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "官宣：四巨头创立 Discovery Loop",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "highlight",
+          "instruction": "高亮首行和创始人姓名，停留",
+          "target": "帖子首段",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "Jeff Dean 在 X 帖文写道：与 Sanjay Ghemawat、Oriol Vinyals、Quoc Le 联合创立 Discovery Loop，一家 Public Benefit Corporation（公共利益公司）。",
+      "screen_interpretation": "公司性质是公共利益公司，不是 Google 内部项目；四位已有 14–30 年合作史，同属核心 AI 技术圈。",
+      "highlight_translation": "“Announcing Discovery Loop! ... founding Discovery Loop, a Public Benefit Corporation” 译为：宣布 Discovery Loop！……联合创立 Discovery Loop，一家公共利益公司。"
+    },
+    {
+      "id": "scene-2",
+      "start": 5.0,
+      "end": 10.0,
+      "narration": "内部说明：切换至帖文第二条，说明初始领域为机器学习研究与工程，并关联官网方法论。",
+      "caption": "要自动化机器学习实验循环",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085035498222002595",
+        "web-www-discoveryloop-com-page"
+      ],
+      "material_role": "proof",
+      "visual_action": "滚动到帖文第二条，高亮“automate the experimental loop”和“initially focus on ML research and engineering”。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "产品方向：自动化实验循环",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "scroll",
+          "instruction": "下滚到第二条帖文，再高亮关键词",
+          "target": "帖文第二条",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "帖文称：“我们的总体方法是自动化实验循环；先聚焦机器学习研究与工程，但认为方法可应用于 NAE 十四项重大挑战的许多子问题。”",
+      "screen_interpretation": "首款试炼不是面向 C 端聊天，而是用来做 ML 研发的自动实验平台，再逐步扩展科学与工程。",
+      "highlight_translation": "“automate the experimental loop” 译为：自动化实验循环。"
+    },
+    {
+      "id": "scene-3",
+      "start": 10.0,
+      "end": 15.0,
+      "narration": "内部说明：从帖文链接跳到官网，展示主标题与使命句，证明宣布不是孤证。",
+      "caption": "官网主标题：Continuous Exploration",
+      "evidence_ids": [
+        "web-www-discoveryloop-com-page"
+      ],
+      "material_role": "proof",
+      "visual_action": "显示官网首页顶部标题和副标题，并高亮主句。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "外部来源：官网核实",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "highlight",
+          "instruction": "高亮官网主标题和副标题",
+          "target": "官网首页",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "帖文所附链接打开官网，首页主标题为“Continuous Exploration”，并写明“Automating discovery to accelerate science and engineering for the world.”",
+      "screen_interpretation": "官网与帖文口径一致：不是只做研究论文，而是把“自动化发现”当成公司级使命，面向全球科学和工程。",
+      "highlight_translation": "“Continuous Exploration — Automating discovery to accelerate science and engineering for the world.” 译为：持续探索——自动化发现，以加速全世界的科学与工程。"
+    },
+    {
+      "id": "scene-4",
+      "start": 15.0,
+      "end": 20.0,
+      "narration": "内部说明：展示官网方法论段落，解释系统如何提出、运行并学习评估；强调数量级。",
+      "caption": "数千实验并行压缩迭代",
+      "evidence_ids": [
+        "web-www-discoveryloop-com-page"
+      ],
+      "material_role": "explanation",
+      "visual_action": "滚动到官网方法段落，高亮“parallel execution of thousands of experiments”。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "技术路线：前沿模型+大规模并行",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "scroll",
+          "instruction": "下滚至方法段落后高亮",
+          "target": "官网方法段落",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "官网称：利用前沿 AI 模型和大规模计算基础设施，让系统快速提出、运行并从评估中学习；可并行执行数千个实验，大幅压缩迭代时间。",
+      "screen_interpretation": "技术关键在“并行实验 + 自动评估”的量级，而不是单次推理；这要求大模型、基础设施和实验管理深度耦合。",
+      "highlight_translation": "“parallel execution of thousands of experiments” 译为：并行执行数千个实验。"
+    },
+    {
+      "id": "scene-5",
+      "start": 20.0,
+      "end": 25.0,
+      "narration": "内部说明：结合帖文第四条与官网，说明公司会先用自动化 ML 能力优化自身技术栈，不虚构客户。",
+      "caption": "第一阶段：自己做客户",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085036513449140679",
+        "web-www-discoveryloop-com-page"
+      ],
+      "material_role": "explanation",
+      "visual_action": "切换到帖文第四条，高亮“we’re going to be our own first customers”；旁边并列官网“Act as Our Own First Customer”。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "自己先当第一个客户",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "highlight",
+          "instruction": "高亮帖文和官网同义句",
+          "target": "帖文第四条与官网段落",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "帖文称公司要建立基础设施、AI 模型和系统，并“做自己的第一个客户”；官网也写“Act as Our Own First Customer”。",
+      "screen_interpretation": "这是自我验证路线：先内部跑通 ML 实验自动化，再谈外部科学/工程任务；目前没有公布任何具体客户或案例。",
+      "highlight_translation": "“we’re going to be our own first customers” 译为：我们将成为自己的第一个客户。"
+    },
+    {
+      "id": "scene-6",
+      "start": 25.0,
+      "end": 30.0,
+      "narration": "内部说明：展示帖文第三条投资方名单，并明确指出未披露金额，同时引用 Axios 补充 Google 是投资方/云服务商。",
+      "caption": "Radical 和 Khosla 领投，金额未公开",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085036253263921218",
+        "web-www-axios-com-55f4e40fb0-page"
+      ],
+      "material_role": "proof",
+      "visual_action": "显示帖文第三条投资方列表，高亮“Radical Ventures”“Khosla Ventures”及“Alphabet (Google)”。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "资金：领投方已定但金额未披露",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "highlight",
+          "instruction": "高亮投资方名单",
+          "target": "帖文第三条",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "帖文列出：Radical Ventures 和 Khosla Ventures 领投，Lightspeed、Kleiner Perkins、Doerr Capital、Alphabet/Google 参与；Axios 补充 Google 将作为投资者和云服务商。",
+      "screen_interpretation": "投资阵容已公开，但种子轮规模、估值和资金用途均未披露；这仍是公司成立阶段的信息，而非产品验证。",
+      "highlight_translation": "“lead our initial funding round” 译为：领投我们的首轮融资。"
+    },
+    {
+      "id": "scene-7",
+      "start": 30.0,
+      "end": 35.0,
+      "narration": "内部说明：引用 Axios 对 Google DeepMind 的报道，说明同日 Hassabis 转岗、股价波动与人才流失，作为事件影响。",
+      "caption": "Google 同日高层变动",
+      "evidence_ids": [
+        "web-www-axios-com-55f4e40fb0-page"
+      ],
+      "material_role": "proof",
+      "visual_action": "展示 Axios 标题和关键段落，高亮“Demis Hassabis is stepping aside”和股价下跌句。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "Google 组织连锁反应",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "highlight",
+          "instruction": "高亮标题与股价段",
+          "target": "Axios 报道",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "Axios 报道：DeepMind CEO Demis Hassabis 转任董事长，Jeff Dean 等人离开并创立 Discovery Loop；当日 Google 股价下跌逾 4%。",
+      "screen_interpretation": "这不是孤立创业；同一天 Google AI 最高层变动，显示 AI 人才争夺已影响巨头组织稳定性，Discovery Loop 处于竞争中心。",
+      "highlight_translation": "“Google's stock fell over 4% on the news.” 译为：消息发布后 Google 股价下跌超过 4%。"
+    },
+    {
+      "id": "scene-8",
+      "start": 35.0,
+      "end": 40.0,
+      "narration": "内部说明：回到事实边界，强调当前只有宣布、网站、路线图和招聘，未发布模型或系统。",
+      "caption": "当前只有公司壳与路线图",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085036513449140679",
+        "web-www-discoveryloop-com-page"
+      ],
+      "material_role": "transition",
+      "visual_action": "把画面拉回到 Discovery Loop 官网底部“What's Next”段落，用占位标记列出未知项。",
+      "asset_query": null,
+      "asset_path": null,
+      "pointer_track": [],
+      "zoom_track": [],
+      "overlay_labels": [],
+      "stage_name": "还没到产品验证",
+      "sound_hint": null,
+      "recording_cues": [
+        {
+          "action": "zoom",
+          "instruction": "缩放至官网 What's Next 并叠加未知项",
+          "target": "官网 What's Next",
+          "selector": null,
+          "value": null,
+          "wait_ms": 3500
+        }
+      ],
+      "screen_fact": "已验证：公司名、创始团队、初始方向、投资方名单和官网存在；未知：融资总额、办公室、团队规模、模型/系统性能、可运行产品均未公开。",
+      "screen_interpretation": "这是强信号的公司诞生，不是技术突破宣告；其真正的试金石是“自动化 ML 实验”系统能否跑通并产出可靠结果。",
+      "highlight_translation": ""
+    }
+  ],
+  "evidence": [
+    {
+      "id": "tweet-2085034604172603724-post-2085034604172603724",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://x.com/JeffDean/status/2085034604172603724",
+      "quote": "Announcing Discovery Loop! \n\nI am very excited to announce that, along with my longtime friends and collaborators @Sanjay_Ghemawat, @OriolVinyalsML and @quocleix, we are founding Discovery Loop (@DiscoLoopAI), a Public Benefit Corporation whose mission is to automate machine learning, science, and engineering to accelerate discoveries and progress. The four of us have worked together for 14 to 30 years, and have helped build some of the world’s most used products, infrastructure and AI models, and we’re excited to turn our attention to this ambitious endeavor.\n\n♾\n\nLearn more at: https://t.co/Rv3LMdLluK",
+      "source_kind": "x:thread_post",
+      "captured_asset": "assets/twitter-captures/b05e0b64c440/video-factory-jeff.json",
+      "captured_at": "2026-08-20T10:29:48.361192Z",
+      "sha256": "b05e0b64c440676bfd9c8216e92ef4c615cd8b93606b1701072f75266fed2b88",
+      "notes": "Thread position 1; structured capture retains visible author/date/metrics."
+    },
+    {
+      "id": "tweet-2085034604172603724-post-2085035498222002595",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://x.com/JeffDean/status/2085035498222002595",
+      "quote": "Our general approach is to automate the experimental loop. We think this approach is broadly applicable across many different fields of science and engineering. We’ll initially focus on ML research and engineering, but believe the approach can help with important subproblems in nearly every one of the fourteen <at>NAE Grand Challenge problems. We think doing this well requires strong expertise in machine learning as well as large-scale systems.",
+      "source_kind": "x:thread_post",
+      "captured_asset": "assets/twitter-captures/b05e0b64c440/video-factory-jeff.json",
+      "captured_at": "2026-08-20T10:29:48.361199Z",
+      "sha256": "b05e0b64c440676bfd9c8216e92ef4c615cd8b93606b1701072f75266fed2b88",
+      "notes": "Thread position 2; structured capture retains visible author/date/metrics."
+    },
+    {
+      "id": "tweet-2085034604172603724-post-2085036253263921218",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://x.com/JeffDean/status/2085036253263921218",
+      "quote": "We created a pitch deck to tell a handful of VC firms about us and what we were up to (a fun experience!). Here’s a few slides about our background and some of the things we’ve worked on from the pitch deck (it was fun putting together the list of people in our teams who have gone on to found a whole range of exciting companies). We are delighted to have selected @radicalvcfund \nand @khoslaventures to lead our initial funding round, along with participation from @lightspeedvp, @kleinerperkins, Doerr Capital (@johndoerr), and Alphabet (@Google).  We’ll be working with them to close our seed round over the next few weeks.",
+      "source_kind": "x:thread_post",
+      "captured_asset": "assets/twitter-captures/b05e0b64c440/video-factory-jeff.json",
+      "captured_at": "2026-08-20T10:29:48.361202Z",
+      "sha256": "b05e0b64c440676bfd9c8216e92ef4c615cd8b93606b1701072f75266fed2b88",
+      "notes": "Thread position 3; structured capture retains visible author/date/metrics."
+    },
+    {
+      "id": "tweet-2085034604172603724-post-2085036513449140679",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://x.com/JeffDean/status/2085036513449140679",
+      "quote": "Our immediate order of business is to find office space, and hire an amazing founding team over the next few weeks. We want to create an awesome environment with a great culture of technical excellence, teamwork, respect, and ambition.  We’ll also start building our infrastructure and AI models and systems to tackle our first domain: automating large-scale experimentation for ML research and engineering.  In doing so, we’re going to be our own first customers.  The rapid feedback from doing that is the way to build something amazing.\n\nOh, we’re hiring! See https://t.co/MSH3UfcqL9",
+      "source_kind": "x:thread_post",
+      "captured_asset": "assets/twitter-captures/b05e0b64c440/video-factory-jeff.json",
+      "captured_at": "2026-08-20T10:29:48.361205Z",
+      "sha256": "b05e0b64c440676bfd9c8216e92ef4c615cd8b93606b1701072f75266fed2b88",
+      "notes": "Thread position 4; structured capture retains visible author/date/metrics."
+    },
+    {
+      "id": "tweet-2085034604172603724-post-2085044057387286583",
+      "candidate_id": "tweet-2085034604172603724",
+      "url": "https://x.com/JeffDean/status/2085044057387286583",
+      "quote": "One more fun slide from our pitch deck. https://t.co/Cb8ZYxKitN",
+      "source_kind": "x:thread_post",
+      "captured_asset": "assets/twitter-captures/b05e0b64c440/video-factory-jeff.json",
+      "captured_at": "2026-08-20T10:29:48.361208Z",
+      "sha256": "b05e0b64c440676bfd9c8216e92ef4c615cd8b93606b1701072f75266fed2b88",
+      "notes": "Thread position 5; structured capture retains visible author/date/metrics."
+    },
+    {
+      "id": "web-www-axios-com-55f4e40fb0-page",
+      "candidate_id": "web-www-axios-com-55f4e40fb0",
+      "url": "https://www.axios.com/2026/08/05/google-deepmind-demis-hassabis-ai",
+      "quote": "Title: Google DeepMind CEO Demis Hassabis is stepping aside\n\nURL Source: https://www.axios.com/2026/08/05/google-deepmind-demis-hassabis-ai\n\nPublished Time: 2026-08-05T16:00:19.336524Z\n\nMarkdown Content:\n[Demis Hassabis](https://www.axios.com/2026/07/14/demis-hassabis-ai-regulation-google-deepmind) is leaving his role as CEO of Google DeepMind to be the unit's chairman. Chief scientist Jeff Dean and several Google AI colleagues are leaving to start their own company, which Google will invest in.\n\n**Why it matters:**Google's AI organization is undergoing a profound change as the company struggles to keep pace with OpenAI and Anthropic.\n\n**The big picture:**The moves are the latest in a series of departures and shifts at Google as frontier AI models have been advancing rapidly in recent months.\n\n**Driving the news:**Hassabis will add the title of chief scientist for Google parent company Alphabet and also continue to lead Isomorphic Labs, the company's AI drug discovery spinoff.\n\n*   Koray Kavukcuoglu, the current chief technology officer of Google DeepMind will serve as senior VP of the unit, reporting to CEO Sundar Pichai.\n*   Dean, a 27-year Google veteran is starting Discovery Loop, an independent public benefit corporation in which Google will be an investor and cloud provider. Joining him in that effort are Google senior fellow Sanjay Ghemawat as well as Oriol Vinyals, a DeepMind VP and Quoc Le, a Google Brain co-founder.\n\n**Follow the money**: Google's stock fell over 4% on the news.\n\n*   The stock had been on a tear, rallying 13% from a post-earnings report low.\n\n**What they're saying:** Google aimed to put a positive spin on the exits and shifts, with Hassabis, Pichai and Kavukcuoglu all sharing upbeat memos.\n\n**Hassabis:** \"I've been working towards AGI my whole life and now, like many of you, I feel it is close at hand,\" Hassabis wrote. \"It's critical that we collectively get the next steps right to ensure this all goes well for humanity and we usher in an incredible new age of discovery and wonder.\"\n\n*   \"With this backdrop, I've decided that now is the right time for me to hand over my day-to-day operational responsibilities at GDM, so that I have the time and space to focus on the big picture and help influence what is to come to the best of my ability\"\n\n**Pichai: \"**We've got amazing talent, world-class compute, and products that bring AI to more people than any other company.\"\n\n*   \"We have to accelerate all this work and stay focused on the AI frontier. At the same time, there's never been a more important moment to shape the future of AGI and science.\"\n\n**Kavukcuoglu**: \"For Google DeepMind, our mission to build AI responsibly to benefit humanity does not change. My primary focus is ensuring we have the clearest possible path to delivering on our ambitious Gemini roadmap as we progress toward AGI. In today's rapidly evolving landscape, we must operate with absolute intention and velocity.\"\n\n**Zoom in:** The role positions Hassabis to focus more keenly on the scientific aspects of AI development.\n\n*   The work Hassabis did on AlphaFold to predict 3D structures of proteins helped him and co-lead John Jumper win a Nobel prize in 2024.\n\n**Zoom out:**In an interview with [The New York Times](https://www.nytimes.com/2026/08/05/technology/google-researchers-ai-startup.html), Dean indicated that leaving Google, a public company, gives him more leeway to focus on scientific discoveries associated with AI as well.\n\n*   \"We might make decisions that are not necessarily in the company's purist financial interests,\" he told NYT.\n\n**What we're watching:**The change comes after a groundswell of pushback from Google DeepMind employees and several high profile talent exits.\n\n*   Google's Gemini 3.5 Pro is months behind, with some company sources telling Axios that's in part due to low morale.\n*   Several top researchers, including Gemini's co-lead, have [left the firm](https://www.axios.com/2026/07/23/googles-deep-mind-ai-model-race) for competing AI labs.\n\n_This story has been updated with details throughout._\n",
+      "source_kind": "web:primary_page",
+      "captured_asset": "assets/web-pages/4ebccf341985/axios-google-reshuffle.md",
+      "captured_at": "2026-08-20T13:51:56.861916Z",
+      "sha256": "4ebccf3419851298f00e257f16cf99fffa7a20e03afeb6e944be497302555de3",
+      "notes": "Primary page captured for linked-source extension."
+    },
+    {
+      "id": "web-www-axios-com-a335d290d5-page",
+      "candidate_id": "web-www-axios-com-a335d290d5",
+      "url": "https://www.axios.com/2026/06/23/ai-lab-agi-google-deepmind-departures",
+      "quote": "Title: AI lab musical chairs hits Google the hardest\n\nURL Source: https://www.axios.com/2026/06/23/ai-lab-agi-google-deepmind-departures\n\nPublished Time: 2026-06-23T08:28:04.685297Z\n\nMarkdown Content:\n![Image 1](https://www.axios.com/_next/image?url=https%3A%2F%2Fimages.axios.com%2Fn6wOkDPrXyQGkQw9Wpy0xgM7YdQ%3D%2F0x0%3A328x328%2F52x0%2F2020%2F05%2F01%2F1588371270782.jpg&w=128&q=75)\n\n*   [Ina Fried](https://www.axios.com/authors/ina)\n\nAdd Axios as your preferred source to\n\nsee more of our stories on Google.\n\n![Image 2: Illustration of an exit sign on a computer screen](https://images.axios.com/dsqdwU4mLAddyvoCfPqFQn3jChA=/0x0:1920x1080/1920x1080/2026/06/22/1782143312101.jpeg?w=3840)\n\nIllustration: Sarah Grillo/Axios. Stock: Getty Images\n\nGoogle DeepMind [lost](https://www.axios.com/2026/06/18/noam-shazeer-google-openai-characterai) two high-profile researchers in a week marked by a flurry of departures across major AI labs.\n\n**Why it matters:** The [talent wars](https://www.axios.com/2025/08/05/ai-talent-zuckerberg-meta-openai-altman) continue and have intensified at the highest levels as many AI developers believe that artificial general intelligence (AGI) is on the horizon.\n\n**Driving the news:** Noam Shazeer announced last week that he was [leaving](https://www.axios.com/2026/06/18/noam-shazeer-google-openai-characterai) Google DeepMind for OpenAI. Google previously paid more than $2 billion to acqui-hire Shazeer and part of his Character.ai team.\n\n*   Shazeer co-authored the pivotal 2017 paper \"Attention Is All You Need,\" which introduced the transformer architecture — the \"T\" in ChatGPT.\n*   Two days later, John Jumper, who shared the 2024 Nobel Prize in Chemistry for AlphaFold, said he was also [leaving Google DeepMind](https://x.com/johnjumpersci/status/2068001285173834106) for Anthropic.\n*   Meanwhile, Barret Zoph, who left Thinking Machines in January after \"[alleged misconduct](https://www.wired.com/story/thinking-machines-lab-cofounder-office-relationship-firing-openai/),\" [rejoined](https://x.com/fidjissimo/status/2011592010881446116) OpenAI and is now departing the company for a second time.\n*   Nvidia also [acqui-hired](https://x.com/sharongoldman/status/2068394595172426172?s=46) the team behind Essential AI, including AI researcher Ashish Vaswani.\n\n**The big picture:** Even as companies race to automate more of AI research itself, they're placing extraordinary value on a tiny number of humans who know how to direct that work.\n\n*   Plus, one or two key hires can also help spur further hiring while a major departure can spur further defections.\n\n**Yes, but:** Not all of the recent personnel moves are the same.\n\n*   Shazeer and Jumper are genuine lab-to-lab defections.\n*   Essential AI is more along the lines of the expected consolidation of startups.\n*   Zoph's latest departure remains unexplained.\n\n**Between the lines:** The most coveted researchers offer more than technical knowledge contained in papers or code.\n\n*   They bring judgment about which ideas to pursue, experience running enormous experiments and the ability to recruit other sought-after scientists.\n\n*   For top researchers, deciding where to work often involves a complicated calculus: potential financial rewards, access to computing power, each company's prospects of leading the field, and whether its leadership will wield that power responsibly and in ways that align with their own beliefs.\n*   On the financial front, Anthropic and OpenAI have the advantage of forthcoming IPOs, which could have greater upside than can be offered by the other major players, which are already publicly traded.\n*   The other factors are more subjective, with perceptions around leadership and responsibility varying from person to person.\n\n**What we're watching:** Many in the industry see just a short window until the models start getting better on their own, often called [recursive self-improvement](https://www.axios.com/2026/01/27/models-improve-ai).\n\n*   The competition for top talent could intensify as researchers decide where they want to be during a period many view as pivotal for AI development.\n",
+      "source_kind": "web:primary_page",
+      "captured_asset": "assets/web-pages/c13325318e1a/axios-google-talent.md",
+      "captured_at": "2026-08-20T13:51:56.923349Z",
+      "sha256": "c13325318e1ae85dc4330f42e38138194e875bf872797abb481b2cf554e42990",
+      "notes": "Primary page captured for linked-source extension."
+    },
+    {
+      "id": "web-www-discoveryloop-com-page",
+      "candidate_id": "web-www-discoveryloop-com",
+      "url": "https://www.discoveryloop.com/",
+      "quote": "Title: Discovery Loop — Continuous Exploration\n\nURL Source: https://www.discoveryloop.com/\n\nMarkdown Content:\nContinuous Exploration\n\nAutomating discovery to accelerate science and engineering for the world.\n\n## Scientific discovery is _bottlenecked_.\n\nThe scientific method is one of the greatest tools humanity has ever devised, yet execution entails repetitive experimental loops that are hard to scale with today's manual efforts: you propose an experiment, implement and run it, examine the results, then iterate to refine your approach.\n\nHistorically, scientific progress has relied on these sequential human iterations. In many domains, this process remains incredibly slow and labor-intensive.\n\n* * *\n\n**01**— The Approach\n\n## Automating the experimental loop.\n\nAt Discovery Loop, we are building systems to automate these entire experimental loops. By utilizing frontier AI models and large-scale computational infrastructure, our systems will be able to rapidly propose, run, and learn from evaluations.\n\nThis approach allows for the parallel execution of thousands of experiments, drastically compressing iteration time and driving up the quantity and quality of scientific and engineering output.\n\n### Start with Machine Learning\n\nWe will initially focus on automating the process of machine learning research and engineering.\n\n### Act as Our Own First Customer\n\nWe will use these automated ML capabilities to rapidly optimize our own technology stack before expanding to other domains.\n\n### Grand Challenges\n\nWe believe our approach will be able to solve any learning loop with measurable outcomes within the domains of science and engineering. Ultimately, we are building systems capable of taking on National Academy of Engineering (NAE) Grand Challenges—such as engineering better medicines, advancing health informatics, making solar energy economical, providing access to clean water, securing cyberspace, and engineering the tools of scientific discovery.\n\n**02**— Mission\n\nOur mission is straightforward: we are building AI solutions that can **automatically solve important problems** in machine learning, science, and engineering. By advancing the pace at which we conduct engineering and scientific discovery, we can bring the benefits of science and technology to the world much faster. Ultimately, our goal is to build AI systems that act as a deeply positive, empowering force for humanity, delivering technology solutions that improve people's lives on a global scale.\n\n* * *\n\n**03**— The Team\n\n## The brain trust.\n\nOur founding team — Jeff Dean, Sanjay Ghemawat, Quoc Le, and Oriol Vinyals — has a shared history of deep friendship and decades of close and impactful collaboration.\n\n![Image 1: The founding team of Discovery Loop](https://www.discoveryloop.com/assets/team-web.jpg)\nFrom left Oriol Vinyals · Sanjay Ghemawat · Jeff Dean · Quoc Le\n\nCollectively, we represent three of the most-cited researchers in artificial intelligence and two of the most-cited researchers in distributed systems.\n\nBetween us, we have pioneered massive scale computing and led the creation of critical infrastructure, products, and foundational AI advances that the world relies on, including multiple generations of Google Search, Google Ads, Google News, Google Translate, Google File System, MapReduce, BigTable, Spanner, TensorFlow, Pathways, TPUs, AlphaChip, AlphaStar, AlphaCode, AlphaFold, Gemini, model distillation, mixture-of-experts model architectures, word2vec, sequence-to-sequence models, chain of thought reasoning, neural architecture search, and multiple generations of Large Language Models (LLMs) among others.\n\nOur relative advantage isn't just our technical ability; it is the unprecedented scale of the systems we have previously built. We possess true full-stack depth that spans chips, hardware infrastructure, software infrastructure, ML models, and products.\n\n**04**— What's Next\n\nImagine a future where a handful of people can conduct scientific research and engineering tasks much more rapidly, and with higher quality, than massive teams of scientists and engineers do today. By automating the loops of discovery, the world will be able to make much more rapid advances across countless fields of science.\n\nWe are building a lean, in-person team to execute this transformative vision.\n",
+      "source_kind": "web:primary_page",
+      "captured_asset": "assets/web-pages/11b96d23376a/video-factory-discoveryloop.md",
+      "captured_at": "2026-08-20T13:02:35.909204Z",
+      "sha256": "11b96d23376a04ab115d71e337cae7fb994eff99df4ea5099fe24b98f0aaec36",
+      "notes": "Primary page captured for linked-source extension."
+    }
+  ],
+  "source_urls": [
+    "https://x.com/JeffDean/status/2085034604172603724",
+    "https://t.co/Rv3LMdLluK",
+    "https://t.co/MSH3UfcqL9",
+    "https://t.co/Cb8ZYxKitN",
+    "https://www.discoveryloop.com/",
+    "https://www.axios.com/2026/08/05/google-deepmind-demis-hassabis-ai",
+    "https://www.axios.com/2026/06/23/ai-lab-agi-google-deepmind-departures"
+  ],
+  "topic_type": "company_or_team",
+  "story_beats": [
+    {
+      "id": "identity",
+      "answer": "公司是 Discovery Loop，由 Jeff Dean、Sanjay Ghemawat、Oriol Vinyals 和 Quoc Le 联合创立，性质为公共利益公司（Public Benefit Corporation）。四位创始人有 14–30 年合作史，曾参与 Google 搜索、TensorFlow、Gemini 等核心项目。",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085034604172603724",
+        "web-www-discoveryloop-com-page"
+      ],
+      "scene_ids": []
+    },
+    {
+      "id": "product_direction",
+      "answer": "产品方向是自动化机器学习、科学和工程的实验循环。初始领域为机器学习研究与工程，远期目标是解决 NAE 十四项重大挑战中的多个子问题，例如工程化更优药物、推进健康信息学、让太阳能更经济、提供清洁水、保障网络空间等。",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085035498222002595",
+        "web-www-discoveryloop-com-page"
+      ],
+      "scene_ids": []
+    },
+    {
+      "id": "primary_evidence",
+      "answer": "主要原始文件为 Jeff Dean 的 X 帖文及线程，宣布公司成立、方法、投资方与招聘意图；Discovery Loop 官网提供方法、使命、团队与技术路线；Axios 同日报道补充 Google DeepMind 高层变动、Google 投资及股价反应。",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085034604172603724",
+        "tweet-2085034604172603724-post-2085036253263921218",
+        "tweet-2085034604172603724-post-2085036513449140679",
+        "web-www-discoveryloop-com-page",
+        "web-www-axios-com-55f4e40fb0-page"
+      ],
+      "scene_ids": []
+    },
+    {
+      "id": "technical_route",
+      "answer": "技术路线是构建前沿 AI 模型和大规模计算基础设施，让系统自动提出实验、运行实验并从评估中学习；支持并行执行数千个实验，以压缩迭代时间。公司会先做自己的第一个客户，用自动化 ML 能力优化自身技术栈，再扩展到其他领域。",
+      "evidence_ids": [
+        "web-www-discoveryloop-com-page",
+        "tweet-2085034604172603724-post-2085035498222002595",
+        "tweet-2085034604172603724-post-2085036513449140679"
+      ],
+      "scene_ids": []
+    },
+    {
+      "id": "unknown",
+      "answer": "已验证事实：公司名称、创始团队、公共利益公司性质、初始聚焦 ML、投资方名单（Radical Ventures、Khosla Ventures 领投，Lightspeed、Kleiner Perkins、Doerr Capital、Alphabet/Google 参与）以及官网存在。未知信息：融资总金额、估值、办公室地点、首批招聘人数、模型或系统架构、性能基准、可运行产品、用户或案例研究均未公开。",
+      "evidence_ids": [
+        "tweet-2085034604172603724-post-2085036253263921218",
+        "tweet-2085034604172603724-post-2085036513449140679",
+        "web-www-discoveryloop-com-page",
+        "web-www-axios-com-55f4e40fb0-page"
+      ],
+      "scene_ids": []
+    },
+    {
+      "id": "impact",
+      "answer": "可能影响 AI 研究自动化工具链和 ML 研发人才市场；对 Google DeepMind 造成高层流失与当日股价下挫的即期冲击。若其系统跑通，可能让少数人队以更高并行度完成实验，并把自动化实验方法扩展到药物、材料、清洁能源等 NAE 重大挑战领域。",
+      "evidence_ids": [
+        "web-www-axios-com-55f4e40fb0-page",
+        "web-www-discoveryloop-com-page"
+      ],
+      "scene_ids": []
+    }
+  ],
+  "github_walkthrough": null,
+  "fixed_hook": "Jeff Dean 与三位老战友成立 Discovery Loop，要自动化机器学习实验循环，先拿自己的 ML 研发当试炼。",
+  "fixed_footer": "当前只是公司级官宣和网站；产品、融资总额与系统能力尚未公开，第一个试炼是拿自己的 ML 研发当客户。",
+  "footer_shows_source_url": false,
+  "audio_mode": "bgm_only",
+  "music_license_status": "unreviewed",
+  "audio_path": null,
+  "subtitle_path": null,
+  "video_path": null,
+  "license_records": [],
+  "quality_checks": [
+    {
+      "name": "model_generation",
+      "passed": true,
+      "detail": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "generated_at": "2026-08-20T13:55:22.218924Z",
+        "usage": {
+          "prompt_tokens": 5338,
+          "completion_tokens": 10118,
+          "total_tokens": 15456,
+          "prompt_tokens_details": {
+            "cached_tokens": 384
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 6524
+          },
+          "prompt_cache_hit_tokens": 384,
+          "prompt_cache_miss_tokens": 4954
+        }
+      }
+    }
+  ],
+  "created_at": "2026-08-20T13:55:22.219815Z"
+}

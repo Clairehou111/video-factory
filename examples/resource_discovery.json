@@ -1,0 +1,152 @@
+{
+  "timezone": "Asia/Tokyo",
+  "retry_backoff_seconds": [0, 30, 120],
+  "event_dedupe_days": 30,
+  "channels": {
+    "x": {
+      "cadence_hours": 2,
+      "lookback_hours": 6,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 10,
+      "seed_accounts": [
+        "OpenAI", "AnthropicAI", "GoogleDeepMind", "MetaAI", "MistralAI",
+        "Cohere", "huggingface", "karpathy"
+      ],
+      "queries": [
+        "AI (agent OR SDK OR API OR model OR benchmark OR funding OR launch)",
+        "(open source OR paper OR product) AI"
+      ]
+    },
+    "github": {
+      "cadence_hours": 48,
+      "lookback_hours": 336,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "queries": [
+        "AI agent created:>{date}",
+        "LLM tool created:>{date}",
+        "agent SDK created:>{date}"
+      ]
+    },
+    "news": {
+      "cadence_hours": 2,
+      "lookback_hours": 12,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "seed_domains": [
+        "reuters.com", "bloomberg.com", "ft.com", "techcrunch.com",
+        "theverge.com", "wired.com", "arstechnica.com", "axios.com",
+        "nytimes.com"
+      ],
+      "queries": [
+        "AI model launch OR agent API",
+        "AI startup funding OR founding team",
+        "AI research benchmark"
+      ]
+    },
+    "news_zh": {
+      "cadence_hours": 2,
+      "lookback_hours": 12,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "seed_domains": [
+        "36kr.com", "caixin.com", "jiemian.com", "yicai.com", "cls.cn",
+        "stcn.com", "thepaper.cn", "tmtpost.com", "leiphone.com",
+        "qbitai.com", "jiqizhixin.com"
+      ],
+      "queries": [
+        "(DeepSeek OR 智谱 OR GLM OR Kimi OR 通义千问 OR Qwen OR 豆包 OR 混元 OR 文心 OR MiniMax OR 阶跃星辰) (新模型 OR 新产品 OR 发布 OR 开源)",
+        "(大模型 OR AI 模型) (降价 OR 涨价 OR 调价 OR 价格战 OR 对标 OR 超越 OR 争议)"
+      ]
+    },
+    "official": {
+      "cadence_hours": 2,
+      "lookback_hours": 12,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "seed_domains": [
+        "openai.com", "anthropic.com", "deepmind.google", "ai.google",
+        "meta.com", "microsoft.com", "x.ai", "mistral.ai", "cohere.com",
+        "nvidia.com", "aws.amazon.com", "huggingface.co"
+      ],
+      "feeds": [
+        "https://openai.com/news/rss.xml",
+        "https://deepmind.google/blog/rss.xml",
+        "https://huggingface.co/blog/feed.xml"
+      ],
+      "queries": [
+        "AI model product launch",
+        "agent SDK API announcement",
+        "research benchmark release"
+      ]
+    },
+    "official_zh": {
+      "cadence_hours": 2,
+      "lookback_hours": 12,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "seed_domains": [
+        "deepseek.com", "zhipuai.cn", "bigmodel.cn", "z.ai", "moonshot.cn",
+        "kimi.com", "qwen.ai", "aliyun.com", "volcengine.com", "doubao.com",
+        "hunyuan.tencent.com", "cloud.tencent.com", "qianfan.cloud.baidu.com",
+        "cloud.baidu.com", "minimaxi.com", "minimax.io", "stepfun.com",
+        "baichuan-ai.com", "01.ai", "sensenova.cn", "sensetime.com",
+        "xfyun.cn", "huaweicloud.com"
+      ],
+      "queries": [
+        "(新模型 OR 新产品 OR 发布 OR 上线 OR 开源 OR 开放权重)",
+        "(价格 OR 降价 OR 涨价 OR 调价 OR 免费 OR 套餐) (模型 OR API OR token)",
+        "(API OR 上下文 OR 多模态 OR 智能体 OR Agent OR 工具调用) (升级 OR 发布 OR 开放)",
+        "(下线 OR 停服 OR 迁移 OR 弃用 OR 基准 OR 榜单 OR 评测 OR 安全事件)"
+      ]
+    },
+    "paper": {
+      "cadence_hours": 24,
+      "lookback_hours": 72,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 10,
+      "queries": [
+        "all:\"AI agent\"",
+        "all:\"large language model\" AND (all:benchmark OR all:reasoning)"
+      ]
+    },
+    "youtube": {
+      "cadence_hours": 48,
+      "lookback_hours": 720,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 10,
+      "settings": {
+        "minimum_duration_seconds": 900,
+        "maximum_duration_seconds": 7200,
+        "results_per_query": 8,
+        "metadata_probe_limit": 10
+      }
+    },
+    "openrouter": {
+      "cadence_hours": 2,
+      "lookback_hours": 24,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "settings": {
+        "probe_minimum_discount_percent": 50,
+        "extreme_discount_percent": 75,
+        "new_model_discount_percent": 50,
+        "new_model_days": 21,
+        "minimum_vendor_savings_percent": 50,
+        "minimum_temptation_score": 70,
+        "minimum_endpoint_uptime": 99.0,
+        "maximum_shock_workload_cost_usd": 0.01,
+        "vendor_probe_limit": 6
+      }
+    }
+  }
+}

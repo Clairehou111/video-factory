@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up Video Factory audit state and selected artifacts
+
+[Service]
+Type=oneshot
+User=video-factory
+Group=video-factory
+EnvironmentFile=/etc/video-factory/video-factory.env
+ExecStart=/opt/video-factory/app/deploy/oci/backup.sh
+UMask=0077
+Nice=10
+

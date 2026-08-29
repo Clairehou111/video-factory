@@ -1,0 +1,30 @@
+{
+  "title": "请替换为审核后的标题",
+  "description": "请替换为审核后的简介",
+  "tags": ["AI", "开发工具"],
+  "schedule_at": null,
+  "targets": [
+    {
+      "platform": "tencent",
+      "account": "main",
+      "options": {}
+    },
+    {
+      "platform": "douyin",
+      "account": "main",
+      "options": {}
+    },
+    {
+      "platform": "xiaohongshu",
+      "account": "main",
+      "options": {}
+    },
+    {
+      "platform": "bilibili",
+      "account": "main",
+      "options": {
+        "tid": 249
+      }
+    }
+  ]
+}

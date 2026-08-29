@@ -1,0 +1,39 @@
+{
+  "id": "example-flash-001",
+  "candidate_id": "candidate-example-001",
+  "content_type": "flash",
+  "source_urls": ["https://example.com/source"],
+  "fixed_footer": "结论写在这里，全程固定",
+  "footer_shows_source_url": false,
+  "scenes": [
+    {
+      "id": "proof",
+      "start": 0,
+      "end": 4,
+      "narration": "这是已经核验的事实。",
+      "caption": "发生了什么",
+      "evidence_ids": ["evidence-example-001"],
+      "material_role": "proof",
+      "visual_action": "show a readable source card"
+    },
+    {
+      "id": "explain",
+      "start": 4,
+      "end": 8,
+      "narration": "这件事的关键影响是。",
+      "caption": "为什么重要",
+      "evidence_ids": ["evidence-example-001"],
+      "material_role": "explanation",
+      "visual_action": "highlight the conclusion"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "evidence-example-001",
+      "candidate_id": "candidate-example-001",
+      "url": "https://example.com/source",
+      "quote": "Replace this illustrative record with freshly captured evidence before rendering.",
+      "source_kind": "example"
+    }
+  ]
+}

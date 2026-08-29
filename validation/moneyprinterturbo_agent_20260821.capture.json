@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "width": 1384,
+  "height": 1602,
+  "duration": 20.0,
+  "shots": [
+    {
+      "id": "repo_overview",
+      "action": "wait",
+      "start": 0.2,
+      "end": 1.2,
+      "target": null,
+      "selector": null,
+      "translation": ""
+    },
+    {
+      "id": "repo_name",
+      "action": "highlight",
+      "start": 1.2,
+      "end": 2.2,
+      "target": null,
+      "selector": "strong[itemprop=\"name\"] a",
+      "translation": ""
+    },
+    {
+      "id": "repo_description",
+      "action": "highlight",
+      "start": 2.2,
+      "end": 3.7,
+      "target": "利用 AI 大模型和自动化工作流，根据主题或关键词一键生成高清短视频。Generate HD short videos from a topic or keyword with an automated AI workflow.",
+      "selector": null,
+      "translation": "利用 AI 大模型和自动化工作流，根据主题或关键词一键生成高清短视频。"
+    },
+    {
+      "id": "file_tree",
+      "action": "highlight",
+      "start": 3.7,
+      "end": 4.7,
+      "target": "cli.py",
+      "selector": null,
+      "translation": ""
+    },
+    {
+      "id": "readme_claim",
+      "action": "highlight",
+      "start": 5.0,
+      "end": 9.4,
+      "target": "只需提供视频主题或关键词，即可自动生成视频脚本、匹配素材、生成字幕和背景音乐，并合成高清短视频。",
+      "selector": null,
+      "translation": "只需提供视频主题或关键词，即可自动生成视频脚本、匹配素材、生成字幕和背景音乐，并合成高清短视频。"
+    },
+    {
+      "id": "focus_1",
+      "action": "highlight",
+      "start": 9.7,
+      "end": 14.7,
+      "target": "如果你无法使用浏览器或端口转发，可以直接在命令行生成视频。最简单的完整视频生成命令如下：",
+      "selector": null,
+      "translation": ""
+    },
+    {
+      "id": "focus_2",
+      "action": "highlight",
+      "start": 15.0,
+      "end": 20.0,
+      "target": "支持 批量视频生成，可以一次生成多个视频，然后选择一个最满意的",
+      "selector": null,
+      "translation": "支持批量生成多个视频，用户可选择最满意的一个。"
+    }
+  ]
+}

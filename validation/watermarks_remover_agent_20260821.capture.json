@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "width": 1384,
+  "height": 1602,
+  "duration": 20.0,
+  "shots": [
+    {
+      "id": "repo_overview",
+      "action": "wait",
+      "start": 0.2,
+      "end": 1.2,
+      "target": null,
+      "selector": null,
+      "translation": ""
+    },
+    {
+      "id": "repo_name",
+      "action": "highlight",
+      "start": 1.2,
+      "end": 2.2,
+      "target": null,
+      "selector": "strong[itemprop=\"name\"] a",
+      "translation": "",
+      "highlight_box": {
+        "left": 194,
+        "top": 77,
+        "width": 221,
+        "height": 50
+      }
+    },
+    {
+      "id": "repo_description",
+      "action": "highlight",
+      "start": 2.2,
+      "end": 3.7,
+      "target": "Strip multi-vendor AI provenance marks: Unicode text hygiene, statistical rewrite hooks, and C2PA/metadata from PNG/JPEG/SVG/PDF/DOCX/HTML/MD",
+      "selector": null,
+      "translation": "剥离多厂商AI水印：Unicode文本清洗、统计重写钩子、C2PA/元数据清理。",
+      "highlight_box": {
+        "left": 1014,
+        "top": 228,
+        "width": 299,
+        "height": 171
+      }
+    },
+    {
+      "id": "file_tree",
+      "action": "highlight",
+      "start": 3.7,
+      "end": 4.7,
+      "target": "README.md",
+      "selector": null,
+      "translation": "",
+      "highlight_box": {
+        "left": 113,
+        "top": 779,
+        "width": 108,
+        "height": 44
+      }
+    },
+    {
+      "id": "readme_claim",
+      "action": "highlight",
+      "start": 5.0,
+      "end": 9.4,
+      "target": "Agent skill + stdlib Python service to strip multi-vendor AI provenance marks from text and files — for privacy and hygiene on content you own.",
+      "selector": null,
+      "translation": "Agent技能+标准库Python服务，剥离多厂商AI水印，用于自有内容的隐私和卫生。",
+      "highlight_box": {
+        "left": 103,
+        "top": 751,
+        "width": 865,
+        "height": 99
+      }
+    },
+    {
+      "id": "focus_1",
+      "action": "highlight",
+      "start": 9.7,
+      "end": 14.7,
+      "target": "Quick use (scripts)",
+      "selector": null,
+      "translation": "快速使用（脚本）",
+      "highlight_box": {
+        "left": 103,
+        "top": 768,
+        "width": 865,
+        "height": 65
+      }
+    },
+    {
+      "id": "focus_2",
+      "action": "highlight",
+      "start": 15.0,
+      "end": 20.0,
+      "target": "Until vendors ship public detectors and keys, no tool can honestly certify “this fails the official check.”",
+      "selector": null,
+      "translation": "在厂商公开检测器和密钥之前，没有工具能诚实保证通过官方检查。",
+      "highlight_box": {
+        "left": 103,
+        "top": 763,
+        "width": 865,
+        "height": 75
+      }
+    }
+  ]
+}
