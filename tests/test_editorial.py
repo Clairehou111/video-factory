@@ -12,16 +12,14 @@ from video_factory.editorial import (
 )
 from video_factory.compositor import (
     GITHUB_COLD_OPEN_LAYOUTS, WECHAT_BOTTOM_UI_SAFE, WECHAT_TOP_UI_SAFE,
-    _centered_lines, _footer_layout, _information_layout, _sequential_rail_windows,
-    _wrapped_lines, compose_information_frame, render_github_cold_open_frames,
+    _centered_lines, _footer_layout, _information_layout, _wrapped_lines, render_github_cold_open_frames,
     render_information_frame,
 )
-from video_factory.media import VideoProbe
 from video_factory.llm import OpenAICompatibleStoryWriter, _compile_evidence_shot_kind
 from video_factory.models import (
     AttentionStrategy, Candidate, ContentType, EditorialBrief, Evidence, EvidenceShot,
     ContextGraph, DirectorBrief, EditorialOpportunity, EvidenceShotKind, MaterialRole, Scene,
-    RenderManifest, SelectionReason, SourceType, StoryArcBeat, StorySubject, TopicType,
+    SelectionReason, SourceType, StoryArcBeat, StorySubject, TopicType,
 )
 from video_factory.quality import _quantity_supported, validate_manifest
 from video_factory.storage import Workspace
@@ -152,41 +150,6 @@ class EditorialContractTests(unittest.TestCase):
                 footer_band = image.crop((0, 1920 - WECHAT_BOTTOM_UI_SAFE - 230, 1080, 1920 - WECHAT_BOTTOM_UI_SAFE))
                 self.assertGreater(len(set(title_band.getdata())), 1)
                 self.assertGreater(len(set(footer_band.getdata())), 1)
-
-    def test_directed_composition_shows_hook_and_conclusion_sequentially(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            visual = root / "visual.mp4"
-            output = root / "directed.mp4"
-            visual.write_bytes(b"video")
-            evidence = Evidence("e-1", "candidate-1", "https://example.com", "claim", "web")
-            manifest = RenderManifest(
-                "render-1", "candidate-1", ContentType.FLASH,
-                [Scene("s-1", 0, 8, "n", "caption", [evidence.id], MaterialRole.PROOF, "show")],
-                [evidence], [evidence.url], fixed_title="开场观点", fixed_footer="最终结论",
-            )
-
-            def create_output(command, **_kwargs):
-                Path(command[-1]).write_bytes(b"rendered")
-
-            with (
-                patch("video_factory.compositor.probe_video", return_value=VideoProbe(
-                    visual, 8.0, 1384, 1602, "h264", "yuv420p", None,
-                )),
-                patch("video_factory.compositor.subprocess.run", side_effect=create_output) as run,
-            ):
-                compose_information_frame(manifest, visual, output)
-
-            command = run.call_args.args[0]
-            filters = command[command.index("-filter_complex") + 1]
-            hook_end, conclusion_start = _sequential_rail_windows(8.0)
-            self.assertIn(f"between(t,0,{hook_end:.3f})", filters)
-            self.assertIn(f"between(t,{conclusion_start:.3f},8.000)", filters)
-            self.assertIn(f"pad=1080:1920:0:{WECHAT_TOP_UI_SAFE}", filters)
-            direction = json.loads(output.with_suffix(".direction.json").read_text(encoding="utf-8"))
-            self.assertEqual(direction["mode"], "sequential_single_focus")
-            self.assertEqual(direction["source_pane"]["height"], 1400)
-            self.assertLess(hook_end, conclusion_start)
 
     def test_balanced_footer_never_splits_an_ascii_word(self):
         from PIL import Image, ImageDraw, ImageFont

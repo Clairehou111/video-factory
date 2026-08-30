@@ -285,13 +285,13 @@
   },
   {
     "id": "VF-20260830-025",
-    "title": "Hook, evidence, and conclusion competed on screen for the entire video",
-    "stage": "composition",
-    "reproduction": "Watch an information-frame final cut on a phone and try to follow the fixed upper hook, moving source evidence and fixed lower conclusion at the same time.",
-    "impact": "Three simultaneous reading targets split attention, reduced the browser evidence to a short pane, and made technical screenshots illegible even after WeChat-safe margins were added.",
+    "title": "Equal shot timing ignored visible text density",
+    "stage": "storyboard_director",
+    "reproduction": "Generate a BGM-only story whose evidence shots all receive the same duration even though one screen contains several times more visible Chinese and technical text than another.",
+    "impact": "Dense evidence disappeared before viewers could finish reading it, while sparse shots consumed the same amount of the fixed runtime. The persistent upper hook and lower conclusion are intentional and remain pinned.",
     "status": "fixed",
     "tests": [
-      "tests/test_editorial.py::EditorialContractTests::test_directed_composition_shows_hook_and_conclusion_sequentially"
+      "tests/test_quality.py::QualityTest::test_director_gives_dense_screens_more_of_the_fixed_runtime"
     ]
   }
 ]

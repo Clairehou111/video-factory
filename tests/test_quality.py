@@ -345,6 +345,49 @@ class QualityTest(unittest.TestCase):
         self.assertEqual(storyboard.scenes[0].start, 0)
         self.assertEqual(storyboard.fixed_footer, "固定结论")
 
+    def test_director_gives_dense_screens_more_of_the_fixed_runtime(self) -> None:
+        candidate = Candidate("candidate-density", SourceType.TWEET, "https://x.com/example/status/3", "example")
+        evidence = Evidence("e-density", candidate.id, candidate.source_url, "claim", "tweet")
+        proposals = [
+            SceneProposal(
+                "密集证据", "note", "价格与性能证据", MaterialRole.PROOF, "show source",
+                [evidence.id], ["author_claim"],
+                recording_cues=[CaptureCue(CueAction.WAIT, "hold", wait_ms=2800)],
+                duration_hint=2.8,
+                screen_fact="原厂与第三方线路的输入输出价格、首字延迟、吞吐速度和可用率需要放在同一屏比较",
+                screen_interpretation="生产选择不能只看折扣，还要同时检查延迟、稳定性与量化方式",
+            ),
+            SceneProposal(
+                "短证据", "note", "已发布", MaterialRole.PROOF, "show source",
+                [evidence.id], ["evidence_context"],
+                recording_cues=[CaptureCue(CueAction.WAIT, "hold", wait_ms=2800)],
+                duration_hint=2.8, screen_fact="模型已发布",
+            ),
+            SceneProposal(
+                "中等证据", "note", "适用边界", MaterialRole.EXPLANATION, "show source",
+                [evidence.id], ["scope"],
+                recording_cues=[CaptureCue(CueAction.WAIT, "hold", wait_ms=2800)],
+                duration_hint=2.8,
+                screen_fact="低价线路适合批处理，交互式编码仍要检查延迟",
+            ),
+        ]
+        storyboard = StoryboardDirector().direct(StoryboardRequest(
+            "render-density", candidate, TopicType.PRACTICE_POST, ContentType.FLASH,
+            [evidence], "固定结论",
+            [
+                NarrativeAnswer("author_claim", "作者给出事实", [evidence.id]),
+                NarrativeAnswer("evidence_context", "原帖提供上下文", [evidence.id]),
+                NarrativeAnswer("scope", "结论只覆盖原帖个案", [evidence.id]),
+            ],
+            proposals, 8.4,
+        ))
+
+        self.assertAlmostEqual(storyboard.duration, 8.4)
+        self.assertGreater(storyboard.scenes[0].duration, storyboard.scenes[2].duration)
+        self.assertGreater(storyboard.scenes[2].duration, storyboard.scenes[1].duration)
+        self.assertGreater(proposals[0].recording_cues[0].wait_ms, 2800)
+        self.assertLess(proposals[1].recording_cues[0].wait_ms, 2800)
+
     def test_director_accepts_decimal_schedule_equal_to_target(self) -> None:
         candidate = Candidate("candidate-decimal", SourceType.TWEET, "https://x.com/example/status/2", "example")
         evidence = Evidence("e-decimal", candidate.id, candidate.source_url, "claim", "tweet")

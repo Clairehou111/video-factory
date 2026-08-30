@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .models import (
@@ -101,6 +102,7 @@ class StoryboardDirector:
         # non-GitHub topics and never exposes Scene fields to the model.
 
         self._pad_editorial_runtime(request)
+        self._balance_visible_reading_time(request)
 
         scenes: list[Scene] = []
         cursor = 0.0
@@ -231,6 +233,76 @@ class StoryboardDirector:
 
             if request.editorial_brief and index < len(request.editorial_brief.evidence_shots):
                 request.editorial_brief.evidence_shots[index].duration = updated
+
+    @classmethod
+    def _balance_visible_reading_time(cls, request: StoryboardRequest) -> None:
+        """Give denser screens a little more time without changing total runtime."""
+        if len(request.scenes) < 2:
+            return
+        base = [
+            float(scene.duration_hint or max(2.0, len(scene.narration) / cls.words_per_second))
+            for scene in request.scenes
+        ]
+        if any(duration < 2.0 or duration > 5.0 for duration in base):
+            return
+        units = [cls._visible_reading_units(scene) for scene in request.scenes]
+        if not units or max(units) - min(units) < 8:
+            return
+        mean_units = sum(units) / len(units)
+        scores = [
+            duration * (0.75 + 0.25 * reading_units / mean_units)
+            for duration, reading_units in zip(base, units)
+        ]
+        budget = sum(base)
+        adjusted = [budget * score / sum(scores) for score in scores]
+        adjusted = [min(5.0, max(2.0, value)) for value in adjusted]
+        for _ in range(8):
+            difference = budget - sum(adjusted)
+            if abs(difference) < 0.0005:
+                break
+            eligible = [
+                index for index, value in enumerate(adjusted)
+                if (difference > 0 and value < 5.0) or (difference < 0 and value > 2.0)
+            ]
+            if not eligible:
+                return
+            share = difference / len(eligible)
+            for index in eligible:
+                adjusted[index] = min(5.0, max(2.0, adjusted[index] + share))
+        rounded = [round(value, 3) for value in adjusted]
+        rounding_delta = round(budget - sum(rounded), 3)
+        if rounding_delta:
+            index = max(range(len(rounded)), key=lambda item: units[item])
+            rounded[index] = round(rounded[index] + rounding_delta, 3)
+
+        timed_actions = {CueAction.WAIT, CueAction.SCROLL, CueAction.HIGHLIGHT, CueAction.ZOOM}
+        for index, (proposal, old_duration, new_duration) in enumerate(zip(request.scenes, base, rounded)):
+            delta = new_duration - old_duration
+            proposal.duration_hint = new_duration
+            cue = next((item for item in reversed(proposal.recording_cues) if item.action in timed_actions), None)
+            if cue is not None and abs(delta) >= 0.001:
+                cue.wait_ms = max(300, int(cue.wait_ms or 1000) + round(delta * 1000))
+            if request.editorial_brief and index < len(request.editorial_brief.evidence_shots):
+                request.editorial_brief.evidence_shots[index].duration = new_duration
+
+    @staticmethod
+    def _visible_reading_units(proposal: SceneProposal) -> int:
+        texts = [
+            proposal.screen_fact or proposal.caption,
+            proposal.screen_interpretation or "",
+            proposal.highlight_translation or "",
+        ]
+        texts.extend(
+            str(cue.target or "").strip().strip('"')
+            for cue in proposal.recording_cues
+            if cue.action in {CueAction.SCROLL, CueAction.HIGHLIGHT}
+        )
+        unique = [text for text in dict.fromkeys(item.strip() for item in texts) if text]
+        units = 0
+        for text in unique:
+            units += len(re.findall(r"[\u3400-\u9fff]", text))
+            units += len(re.findall(r"[A-Za-z0-9][A-Za-z0-9._+/$%:-]*", text))
+        return max(1, units)
 
     @staticmethod
     def _validate_github_walkthrough(

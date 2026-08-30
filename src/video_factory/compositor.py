@@ -250,54 +250,6 @@ def render_information_frame(hook: str, footer: str, output: Path, font_path: Pa
     return output
 
 
-def _render_sequential_rail(
-    text: str, output: Path, *, position: str, font_path: Path | None = None,
-) -> Path:
-    """Render one rail at a time so evidence never competes with two persistent summaries."""
-    from PIL import Image, ImageDraw, ImageFont
-
-    if position not in {"hook", "conclusion"}:
-        raise ValueError("sequential rail position must be hook or conclusion")
-    if not text.strip():
-        raise ValueError("sequential rail text is required")
-    canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(canvas)
-    if position == "hook":
-        height, size, max_lines = _information_layout(text, font_path)
-        rail_bottom = WECHAT_TOP_UI_SAFE + height
-        draw.rectangle((0, 0, 1080, rail_bottom), fill="#031126ff")
-        box = (68, WECHAT_TOP_UI_SAFE + 28, 1012, rail_bottom - 24)
-        gap = 12
-    else:
-        height, size, max_lines = _footer_layout(text, font_path)
-        rail_top = 1920 - WECHAT_BOTTOM_UI_SAFE - height
-        draw.rectangle((0, rail_top, 1080, 1920), fill="#031126ff")
-        box = (78, rail_top + 28, 1002, 1920 - WECHAT_BOTTOM_UI_SAFE - 28)
-        gap = 14
-    _draw_centered(
-        draw, text, box=box,
-        font=ImageFont.truetype(str(_font_path(font_path)), size),
-        fill="#f4f8ff", max_lines=max_lines, line_gap=gap,
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output)
-    return output
-
-
-def _sequential_rail_windows(duration: float) -> tuple[float, float]:
-    """Return hook end and conclusion start without letting rails dominate a short cut."""
-    if duration <= 0:
-        raise ValueError("video duration must be positive")
-    hook_duration = min(1.5, max(0.8, duration * 0.14))
-    conclusion_duration = min(1.6, max(0.9, duration * 0.16))
-    maximum_rail_time = duration * 0.42
-    if hook_duration + conclusion_duration > maximum_rail_time:
-        scale = maximum_rail_time / (hook_duration + conclusion_duration)
-        hook_duration *= scale
-        conclusion_duration *= scale
-    return round(hook_duration, 3), round(duration - conclusion_duration, 3)
-
-
 def _split_hook_fact(text: str) -> tuple[str, str]:
     compact = text.strip()
     for marker in ("，", "；", "但", "却"):
@@ -558,18 +510,19 @@ def overlay_fixed_footer(visual_track: Path, footer_png: Path, output: Path) -> 
 
 
 def compose_information_frame(manifest: RenderManifest, visual_track: Path, output: Path, font_path: Path | None = None) -> Path:
-    """Direct hook, evidence, and conclusion sequentially inside WeChat-safe bounds."""
+    """Place a dedicated browser pane between persistent rails; never mask the source."""
     title = (manifest.fixed_title or manifest.scenes[0].caption).strip()
-    footer = (manifest.fixed_footer or "").strip()
-    if not title or not footer:
-        raise ValueError("information composition requires a hook and conclusion")
-    pane_top = WECHAT_TOP_UI_SAFE
-    bottom_top = 1920 - WECHAT_BOTTOM_UI_SAFE
+    top_height, _, _ = _information_layout(title, font_path)
+    bottom_height, _, _ = _footer_layout(manifest.fixed_footer or "", font_path)
+    pane_top = WECHAT_TOP_UI_SAFE + top_height
+    bottom_top = 1920 - WECHAT_BOTTOM_UI_SAFE - bottom_height
     content_height = bottom_top - pane_top
+    if content_height < 620:
+        raise ValueError("WeChat UI-safe rails leave less than 620px for source evidence")
     with TemporaryDirectory(prefix="video-factory-frame-") as temp:
         temp_root = Path(temp)
-        inputs = ["-i", str(visual_track)]
-        input_count = 1
+        static = render_information_frame(title, manifest.fixed_footer or "", temp_root / "fixed.png", font_path)
+        inputs = ["-i", str(visual_track), "-loop", "1", "-i", str(static)]
         probe = probe_video(visual_track)
         if (probe.width, probe.height) == (1080, content_height):
             content_filter = "[0:v]setsar=1[content]"
@@ -578,8 +531,9 @@ def compose_information_frame(manifest: RenderManifest, visual_track: Path, outp
         filters = [
             content_filter,
             f"[content]pad=1080:1920:0:{pane_top}:color=0x020815[base]",
+            "[base][1:v]overlay=0:0:format=auto[v1]",
         ]
-        previous = "[base]"
+        previous = "[v1]"
         duration = manifest.duration
         sidecar = visual_track.with_suffix(".capture.json")
         if sidecar.is_file():
@@ -591,39 +545,17 @@ def compose_information_frame(manifest: RenderManifest, visual_track: Path, outp
                 if not translation:
                     continue
                 gloss = render_adjacent_gloss(
-                    translation, temp_root / f"gloss-{input_count}.png", font_path,
+                    translation, temp_root / f"gloss-{len(inputs)}.png", font_path,
                     highlight_box=shot.get("highlight_box"), source_size=source_size,
                     pane_top=pane_top, pane_height=content_height,
                 )
-                input_index = input_count
+                input_index = len(inputs) // 4 + 1
                 inputs.extend(["-loop", "1", "-i", str(gloss)])
-                input_count += 1
                 output_label = f"[vg{input_index}]"
                 filters.append(
                     f"{previous}[{input_index}:v]overlay=0:0:format=auto:enable='between(t,{float(shot['start']):.3f},{float(shot['end']):.3f})'{output_label}"
                 )
                 previous = output_label
-        hook_end, conclusion_start = _sequential_rail_windows(duration)
-        if not (manifest.github_brief and manifest.fixed_hook):
-            hook_rail = _render_sequential_rail(
-                title, temp_root / "hook-rail.png", position="hook", font_path=font_path,
-            )
-            hook_index = input_count
-            inputs.extend(["-loop", "1", "-i", str(hook_rail)])
-            input_count += 1
-            filters.append(
-                f"{previous}[{hook_index}:v]overlay=0:0:format=auto:enable='between(t,0,{hook_end:.3f})'[vhook]"
-            )
-            previous = "[vhook]"
-        conclusion_rail = _render_sequential_rail(
-            footer, temp_root / "conclusion-rail.png", position="conclusion", font_path=font_path,
-        )
-        conclusion_index = input_count
-        inputs.extend(["-loop", "1", "-i", str(conclusion_rail)])
-        filters.append(
-            f"{previous}[{conclusion_index}:v]overlay=0:0:format=auto:enable='between(t,{conclusion_start:.3f},{duration:.3f})'[vclose]"
-        )
-        previous = "[vclose]"
         filters.append(f"{previous}scale=in_range=pc:out_range=tv,format=pix_fmts=yuv420p[vout]")
         output.parent.mkdir(parents=True, exist_ok=True)
         browser_output = temp_root / "browser-framed.mp4"
@@ -645,15 +577,4 @@ def compose_information_frame(manifest: RenderManifest, visual_track: Path, outp
             ], check=True)
         else:
             shutil.copy2(browser_output, output)
-        direction = {
-            "version": 1,
-            "mode": "sequential_single_focus",
-            "source_pane": {"top": pane_top, "bottom": bottom_top, "height": content_height},
-            "hook_end": 0.0 if manifest.github_brief and manifest.fixed_hook else hook_end,
-            "conclusion_start": conclusion_start,
-            "source_duration": duration,
-        }
-        output.with_suffix(".direction.json").write_text(
-            json.dumps(direction, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
-        )
     return output
