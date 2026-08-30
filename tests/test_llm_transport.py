@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from video_factory.llm import LLMSettings, OpenAICompatibleStoryWriter
+from video_factory.llm import LLMSettings, OpenAICompatibleStoryWriter, _coerce_model_float
 from video_factory.models import Candidate, ContentType, Evidence, SourceType, TopicType
 from video_factory.writer import StoryWriterPacket
 
@@ -22,6 +22,11 @@ class _Response:
 
 
 class LLMTransportTests(unittest.TestCase):
+    def test_model_numeric_fields_ignore_trailing_sentence_punctuation(self) -> None:
+        self.assertEqual(_coerce_model_float("0.605.", 3.0), 0.605)
+        self.assertEqual(_coerce_model_float("about 2.8 seconds", 3.0), 2.8)
+        self.assertEqual(_coerce_model_float("unknown", 3.0), 3.0)
+
     def test_visible_copy_review_returns_structured_semantic_issues(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(
             "openrouter", "https://openrouter.example/api/v1", "test-key", "cheap-model",

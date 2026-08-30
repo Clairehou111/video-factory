@@ -468,6 +468,7 @@ Markdown Content:
             (Candidate("company", SourceType.WEB, "https://example.com/team", "New founding team"), "The seed round backs a new company", TopicType.COMPANY_OR_TEAM, ContentType.FLASH),
             (Candidate("paper", SourceType.PAPER, "https://example.com/report.pdf", "Technical report"), "Benchmark methodology and dataset", TopicType.RESEARCH_OR_BENCHMARK, ContentType.DEEP_DIVE),
             (Candidate("announcement", SourceType.WEB, "https://vendor.com/news/change", "API migration"), "Old endpoint is retired; migration effective tomorrow", TopicType.OFFICIAL_ANNOUNCEMENT, ContentType.FLASH),
+            (Candidate("prices", SourceType.WEB, "https://openrouter.ai/models?discount=true", "Models and benchmarks"), "Benchmark filters, discounted prompt pricing, and model evaluations", TopicType.MODEL_OR_PRODUCT, ContentType.FLASH),
         ]
         for candidate, text, topic, content_type in cases:
             with self.subTest(candidate=candidate.id):

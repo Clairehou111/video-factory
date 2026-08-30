@@ -109,17 +109,28 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
     if brief.category_label not in RADAR_CATEGORY_LABELS:
         brief.category_label = ""
 
+    subject_names = [item.name.strip() for item in brief.subjects if item.name.strip()]
+
+    def headline_copy(value: str) -> str:
+        has_subject = any(name.casefold() in value.casefold() for name in subject_names)
+        clipped = _clip_radar_copy(value, 28 if has_subject else 20)
+        if copy_width(clipped) > 20 and not any(
+            name.casefold() in clipped.casefold() for name in subject_names
+        ):
+            clipped = _clip_radar_copy(clipped, 20)
+        return clipped
+
     original_candidates = list(strategy.hook_candidates)
-    strategy.hook_candidates = [_clip_radar_copy(item, 28) for item in original_candidates]
+    strategy.hook_candidates = [headline_copy(item) for item in original_candidates]
     if strategy.selected_hook in original_candidates:
         strategy.selected_hook = strategy.hook_candidates[original_candidates.index(strategy.selected_hook)]
     elif strategy.hook_candidates:
         strategy.selected_hook = strategy.hook_candidates[0]
-    strategy.selected_hook = _clip_radar_copy(strategy.selected_hook, 28)
+    strategy.selected_hook = headline_copy(strategy.selected_hook)
     if strategy.hook_candidates and strategy.selected_hook not in strategy.hook_candidates:
         strategy.hook_candidates[0] = strategy.selected_hook
 
-    brief.headline = _clip_radar_copy(brief.headline, 28)
+    brief.headline = headline_copy(brief.headline)
     brief.fixed_conclusion = _clip_radar_copy(brief.fixed_conclusion, 40)
     for index, shot in enumerate(brief.evidence_shots):
         shot.narrative_beat = (
@@ -132,7 +143,8 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
         shot.audience_copy = _clip_radar_copy(shot.audience_copy, remaining) if remaining >= 4 else ""
         if shot.full_translation:
             shot.full_translation = _clip_radar_copy(
-                shot.full_translation, 120 if index == 0 else 40,
+                shot.full_translation,
+                120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else 40,
             )
         if shot.translation:
             shot.translation = _clip_radar_copy(shot.translation, 40)
@@ -539,9 +551,14 @@ def route_content(
         ),
     ]).casefold()
     url = candidate.source_url.casefold()
+    openrouter_discount_page = (
+        "openrouter.ai/models" in url and "discount=true" in url
+    )
     if topic_override:
         topic = topic_override
         reason = "explicit topic override"
+    elif openrouter_discount_page:
+        topic, reason = TopicType.MODEL_OR_PRODUCT, "OpenRouter discounted-model price monitor"
     elif candidate.source_type == SourceType.PAPER or url.endswith(".pdf") or any(
         marker in url for marker in ("arxiv.org", "openreview.net")
     ):
@@ -601,7 +618,9 @@ def route_content(
 
     if format_override:
         content_type = format_override
-    elif topic in {TopicType.PRACTICE_POST, TopicType.COMPANY_OR_TEAM, TopicType.OFFICIAL_ANNOUNCEMENT}:
+    elif openrouter_discount_page or topic in {
+        TopicType.PRACTICE_POST, TopicType.COMPANY_OR_TEAM, TopicType.OFFICIAL_ANNOUNCEMENT,
+    }:
         content_type = ContentType.FLASH
     elif topic == TopicType.RESEARCH_OR_BENCHMARK:
         content_type = ContentType.DEEP_DIVE
@@ -652,13 +671,16 @@ def _validate_radar_contract(brief: EditorialBrief, evidence: list[Evidence]) ->
 
     if copy_width(brief.fixed_conclusion) > 40:
         errors.append("Radar fixed_conclusion must fit the 40-equivalent screen budget")
-    for shot in brief.evidence_shots:
+    for index, shot in enumerate(brief.evidence_shots):
         compact_copy = "".join(filter(None, (shot.fact.strip(), shot.audience_copy.strip())))
         if copy_width(compact_copy) > 40:
             errors.append(f"Radar shot {shot.id} fact plus audience_copy exceeds 40 equivalents")
         gloss = (shot.full_translation or shot.translation).strip()
-        if gloss and copy_width(gloss) > 40:
-            errors.append(f"Radar shot {shot.id} Chinese gloss must fit at most 40 equivalents")
+        gloss_limit = 120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else 40
+        if gloss and copy_width(gloss) > gloss_limit:
+            errors.append(
+                f"Radar shot {shot.id} Chinese gloss must fit at most {gloss_limit} equivalents"
+            )
     beats = [shot.narrative_beat.strip() for shot in brief.evidence_shots]
     if beats:
         if beats[0] != "opening" or beats[-1] != "takeaway":

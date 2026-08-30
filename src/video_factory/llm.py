@@ -25,6 +25,21 @@ from .editorial import canonicalize_editorial_brief, compile_evidence_shots
 from .translation import IT_TRANSLATION_CONTRACT, PLAIN_CHINESE_CONTRACT
 
 
+def _coerce_model_float(value: object, default: float) -> float:
+    """Accept one model-written number while ignoring surrounding prose punctuation."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", str(value).replace(",", ""))
+    if not match:
+        return default
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return default
+
+
 def _same_source_document(left: str, right: str) -> bool:
     return left.split("#", 1)[0].rstrip("/") == right.split("#", 1)[0].rstrip("/")
 
@@ -1077,7 +1092,7 @@ class OpenAICompatibleStoryWriter:
                 # Ignore a model-supplied material kind. The compiler derives
                 # it from cited evidence plus semantic visual_family.
                 shot["kind"] = _compile_evidence_shot_kind(shot, evidence_by_id)
-                shot["duration"] = float(shot.get("duration", 3))
+                shot["duration"] = _coerce_model_float(shot.get("duration", 3), 3.0)
                 shots.append(EvidenceShot(**shot))
             director_data = editorial_data.get("director_brief") or draft.get("director_brief")
             director_brief = None
@@ -1090,7 +1105,10 @@ class OpenAICompatibleStoryWriter:
                     emotion_intensity=int(director_data.get("emotion_intensity", 1)),
                     selected_context_ids=[str(item) for item in director_data.get("selected_context_ids", [])],
                     story_arc=[StoryArcBeat(**item) for item in director_data.get("story_arc", [])],
-                    recommended_duration=float(director_data.get("recommended_duration", packet.target_duration)),
+                    recommended_duration=_coerce_model_float(
+                        director_data.get("recommended_duration", packet.target_duration),
+                        packet.target_duration,
+                    ),
                     attention_trigger=str(director_data.get("attention_trigger", "")),
                 )
             context_events: list[ContextEvent] = []
@@ -1116,7 +1134,9 @@ class OpenAICompatibleStoryWriter:
                 subjects=[StorySubject(**item) for item in editorial_data.get("subjects", draft.get("subjects", []))],
                 context_events=context_events,
                 evidence_shots=shots,
-                duration_target=float(editorial_data.get("duration_target", packet.target_duration)),
+                duration_target=_coerce_model_float(
+                    editorial_data.get("duration_target", packet.target_duration), packet.target_duration,
+                ),
                 opportunity=packet.opportunity,
                 context_graph=graph,
                 director_brief=director_brief,
@@ -1172,10 +1192,7 @@ class OpenAICompatibleStoryWriter:
                 errors.append(f"github_scenes[{index}] needs message and interpretation")
             evidence_ids = [str(value) for value in item.get("evidence_ids", [])]
             beat_ids = [str(value) for value in item.get("beat_ids", [])]
-            try:
-                duration = float(item.get("duration_hint", 0))
-            except (TypeError, ValueError):
-                duration = 0
+            duration = _coerce_model_float(item.get("duration_hint", 0), 0.0)
             if duration <= 0 or duration > 5:
                 errors.append(f"github_scenes[{index}].duration_hint must be >0 and <=5")
             focus_id = item.get("focus_id")

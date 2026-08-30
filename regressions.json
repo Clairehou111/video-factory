@@ -420,5 +420,60 @@
     "tests": [
       "tests/test_radar.py::RadarV2Test::test_radar_canonicalizer_repairs_mechanical_contract_errors_without_llm"
     ]
+  },
+  {
+    "id": "VF-20260830-037",
+    "title": "Radar validators disagreed on complete root-tweet translation length",
+    "stage": "content_agent",
+    "reproduction": "Generate a Radar X story whose complete first-post translation is valid under the 40–120 character root-card rule but exceeds the 40-character evidence-chip limit.",
+    "impact": "Both primary and fallback writers were rejected for a translation that another contract explicitly required, making successful X generation impossible for substantive posts.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_canonicalizer_repairs_mechanical_contract_errors_without_llm"
+    ]
+  },
+  {
+    "id": "VF-20260830-038",
+    "title": "Web opening inherited the complete-tweet translation budget",
+    "stage": "content_agent",
+    "reproduction": "Generate an OpenRouter Radar story whose first browser shot contains a translation longer than 40 equivalents.",
+    "impact": "The canonicalizer retained up to 120 equivalents as if the browser shot were a complete root tweet, while validation rejected it and exhausted both primary and fallback writers.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_web_opening_does_not_get_tweet_translation_budget"
+    ]
+  },
+  {
+    "id": "VF-20260831-039",
+    "title": "Subject-free Radar hooks incorrectly received the extended headline budget",
+    "stage": "content_agent",
+    "reproduction": "Generate a Radar hook longer than 20 equivalents that does not preserve any exact subject name.",
+    "impact": "Canonicalization kept the hook under the 28-equivalent exception while validation correctly allowed that exception only for an exact model, project, or actor name, triggering an unnecessary fallback model.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_hook_only_gets_extended_budget_when_subject_survives_clipping"
+    ]
+  },
+  {
+    "id": "VF-20260831-040",
+    "title": "Trailing punctuation in a model numeric field aborted the whole repair",
+    "stage": "content_agent",
+    "reproduction": "Receive a duration-like JSON string such as '0.605.' from a model repair response.",
+    "impact": "A harmless sentence-ending period caused float conversion to fail after several successful calls, discarding the entire grounded draft and starting an expensive fallback model.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_model_numeric_fields_ignore_trailing_sentence_punctuation"
+    ]
+  },
+  {
+    "id": "VF-20260831-041",
+    "title": "OpenRouter discount monitor was routed as a 50-second benchmark deep dive",
+    "stage": "content_agent",
+    "reproduction": "Route https://openrouter.ai/models?discount=true after the page text mentions benchmarks and evaluations.",
+    "impact": "A price/news Radar request became a 25–50 second deep dive with the wrong single-header layout instead of a ten-second pinned-rail flash.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_source_kind_and_story_topic_are_routed_independently"
+    ]
   }
 ]

@@ -123,11 +123,44 @@ class RadarV2Test(unittest.TestCase):
             copy_width(brief.evidence_shots[0].fact + brief.evidence_shots[0].audience_copy), 40,
         )
         self.assertLessEqual(copy_width(brief.evidence_shots[0].full_translation), 120)
+        self.assertFalse(any(
+            "Chinese gloss" in error for error in _validate_radar_contract(
+                brief, [_manifest().evidence[0]],
+            )
+        ))
         self.assertEqual(
             [shot.narrative_beat for shot in brief.evidence_shots],
             ["opening", "proof", "takeaway"],
         )
         self.assertEqual(brief.editorial_inference, "")
+
+    def test_radar_web_opening_does_not_get_tweet_translation_budget(self) -> None:
+        brief = _brief()
+        brief.evidence_shots[0].kind = EvidenceShotKind.BROWSER_SECTION
+        brief.evidence_shots[0].full_translation = "折扣页当前展示多个模型与供应商价格变化" * 10
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+        self.assertLessEqual(copy_width(brief.evidence_shots[0].full_translation), 40)
+        self.assertFalse(any(
+            "Chinese gloss" in error for error in _validate_radar_contract(
+                brief, [_manifest().evidence[0]],
+            )
+        ))
+
+    def test_radar_hook_only_gets_extended_budget_when_subject_survives_clipping(self) -> None:
+        brief = _brief()
+        brief.attention_strategy.hook_candidates = [
+            "同一折扣页的价格差距为什么会突然拉开一个数量级",
+            "开发者调用模型前应该先检查真实输入输出价格",
+            "批量线路把调用成本直接压低但适用条件不同",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 20)
+        self.assertFalse(any(
+            "Radar headline" in error for error in _validate_radar_contract(
+                brief, [_manifest().evidence[0]],
+            )
+        ))
 
     def test_radar_rejects_marketing_category_and_unsupported_identifier(self) -> None:
         brief = _brief(category_label="开源神器", direct_identifier="pip install invented")
