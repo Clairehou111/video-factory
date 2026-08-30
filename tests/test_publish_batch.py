@@ -17,6 +17,7 @@ from video_factory.publish import (
     SocialAutoUploadBackend,
     SocialAutoUploadSettings,
     _apply_upstream_compatibility_patches,
+    _is_definitive_pre_submit_failure,
     _redact_output,
     create_publish_batch,
     targets_from_spec,
@@ -262,6 +263,50 @@ class PublishBatchTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "only failed_pre_submit"):
                 service.retry(batch, PublishPlatform.TENCENT)
 
+    def test_expired_cookie_rejection_is_safe_to_reconcile_and_retry(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(temp, [PublishPlatform.TENCENT])
+            service = PublishBatchService(workspace, FakeBackend())
+            service.approve(batch, "editor")
+            target = batch.targets[0]
+            target.state = PublishTargetState.UNCERTAIN
+            target.last_error = "Tencent cookie is missing or expired before upload"
+            batch.state = PublishBatchState.FAILED
+            service.save(batch)
+
+            service.confirm_pre_submit_failure(batch, PublishPlatform.TENCENT, "operator")
+
+            self.assertEqual(target.state, PublishTargetState.FAILED_PRE_SUBMIT)
+            attempts = list((workspace.publish_dir / batch.id / "attempts").glob("*.json"))
+            self.assertEqual(len(attempts), 1)
+
+    def test_backend_classifies_expired_cookie_as_not_started(self) -> None:
+        self.assertTrue(_is_definitive_pre_submit_failure(
+            ["tencent", "upload-video"], "", "cookie is missing or expired",
+        ))
+        self.assertTrue(_is_definitive_pre_submit_failure(
+            ["tencent", "upload-video"], "", "无法确认视频号原创声明已勾选，停止发表",
+        ))
+        self.assertFalse(_is_definitive_pre_submit_failure(
+            ["tencent", "upload-video"], "", "browser closed after final publish click",
+        ))
+
+    def test_wechat_upload_uses_headed_browser(self) -> None:
+        with TemporaryDirectory() as temp:
+            runtime = Path(temp) / "runtime"
+            settings = SocialAutoUploadSettings(runtime_home=runtime)
+            settings.source_dir.mkdir(parents=True)
+            settings.executable.parent.mkdir(parents=True)
+            settings.executable.write_bytes(b"executable")
+            video = Path(temp) / "video.mp4"
+            video.write_bytes(b"video")
+            target = PublishTarget(PublishPlatform.TENCENT, "main", "标题")
+            completed = subprocess.CompletedProcess([], 0, "submitted", "")
+            with patch("video_factory.publish.subprocess.run", return_value=completed) as run:
+                result = SocialAutoUploadBackend(settings).submit_video(target, video)
+            self.assertIn("--headed", run.call_args.args[0])
+            self.assertTrue(result.succeeded)
+
     def test_backend_exception_after_submitting_state_is_uncertain_and_redacted(self) -> None:
         with TemporaryDirectory() as temp:
             workspace, batch = self.make_batch(temp, [PublishPlatform.TENCENT])
@@ -333,27 +378,73 @@ class PublishBatchTest(unittest.TestCase):
             self.assertIn("from patchright.async_api", legacy.read_text())
             self.assertEqual(metadata["compatibility_patches"], "uploader/legacy.py")
 
-    def test_publisher_policy_patch_disables_ai_label_and_uses_creator_auth_check(self) -> None:
+    def test_publisher_policy_patch_requires_verified_wechat_original_declaration(self) -> None:
         with TemporaryDirectory() as temp:
             source = Path(temp)
             tencent = source / "uploader" / "tencent_uploader" / "main.py"
             tencent.parent.mkdir(parents=True)
             tencent.write_text(
+                "async def cookie_auth(account_file):\n"
+                "    async with async_playwright() as playwright:\n"
+                "        if account_file:\n"
+                "            browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))\n"
+                "            context = await browser.new_context()\n"
+                "            tencent_logger.success(_msg(\"🥳\", \"cookie 有效\"))\n"
+                "            return True\n\n"
+                "class TencentUploader:\n"
+                "    async def validate_base_args(self):\n"
+                "        if not os.path.exists(self.account_file):\n"
+                "            raise RuntimeError('missing')\n"
+                "        if not await cookie_auth(self.account_file):\n"
+                "            raise RuntimeError(f\"cookie文件已失效，请先完成视频号登录: {self.account_file}\")\n\n"
                 "    async def apply_original_statement(self, page: Page) -> None:\n"
-                "        label_text = '含AI生成内容'\n",
+                "        label_text = '含AI生成内容'\n\n"
+                "    async def upload(self, page: Page) -> None:\n"
+                "        try:\n"
+                "            pass\n"
+                "        finally:\n"
+                "            await context.close()\n",
                 encoding="utf-8",
             )
             cli = source / "sau_cli.py"
             cli.write_text(
-                'result = run_biliup_command(["-u", str(account_file), "renew"])\n',
+                'result = run_biliup_command(["-u", str(account_file), "renew"])\n\n'
+                "async def upload_tencent_video(request):\n"
+                '    account_file = resolve_account_file("tencent", request.account_name)\n'
+                "    is_ready = await tencent_setup(str(account_file), handle=False)\n"
+                "    if not is_ready:\n"
+                "        raise RuntimeError(\n"
+                '            f"Tencent cookie is missing or expired: {account_file}. "\n'
+                '            f"Run login for {request.account_name} first."\n'
+                "        )\n"
+                "    return account_file\n",
                 encoding="utf-8",
             )
 
             changed = _apply_upstream_compatibility_patches(source)
 
             self.assertEqual(changed, ["sau_cli.py", "uploader/tencent_uploader/main.py"])
-            self.assertIn("return None", tencent.read_text(encoding="utf-8"))
-            self.assertIn('"list", "--max-pages", "1"', cli.read_text(encoding="utf-8"))
+            patched = tencent.read_text(encoding="utf-8")
+            compile(patched, str(tencent), "exec")
+            self.assertIn("_build_launch_kwargs(headless=False)", patched)
+            self.assertIn("await context.storage_state(path=account_file)", patched)
+            self.assertIn("verified pre-submit guard stops the run", patched)
+            self.assertIn("await context.storage_state(path=self.account_file)", patched)
+            self.assertIn("open_upload_page verifies login before file selection", patched)
+            self.assertNotIn("if not await cookie_auth(self.account_file)", patched)
+            self.assertIn('get_by_text("声明原创", exact=True)', patched)
+            self.assertIn(".declare-original-checkbox input.ant-checkbox-input", patched)
+            self.assertIn(".original-proto-wrapper input.ant-checkbox-input", patched)
+            self.assertIn('button:has-text("声明原创")', patched)
+            self.assertIn('get_by_role("checkbox", name="声明原创")', patched)
+            self.assertIn("无法确认视频号原创声明已勾选，停止发表", patched)
+            self.assertIn("debug_tencent_original_statement.html", patched)
+            self.assertNotIn("Video Factory republishes edited source material", patched)
+            patched_cli = cli.read_text(encoding="utf-8")
+            self.assertIn('"list", "--max-pages", "1"', patched_cli)
+            self.assertIn("Batch preflight already checked credentials", patched_cli)
+            self.assertNotIn("is_ready = await tencent_setup", patched_cli)
+            self.assertEqual(_apply_upstream_compatibility_patches(source), [])
 
     def test_setup_installs_managed_chromium_when_local_chrome_is_unavailable(self) -> None:
         with TemporaryDirectory() as temp:

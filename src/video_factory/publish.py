@@ -510,6 +510,9 @@ class SocialAutoUploadBackend:
             target.platform.value, "upload-video", "--account", target.account_name,
             "--file", str(video_path.resolve()), "--title", target.title,
         ]
+        if target.platform == PublishPlatform.TENCENT:
+            # WeChat intermittently serves a login iframe to headless Chrome even for a fresh session.
+            command.append("--headed")
         if target.description:
             command.extend(["--desc", target.description])
         if target.tags:
@@ -709,7 +712,9 @@ class SocialAutoUploadBackend:
                 completed.returncode,
                 _redact_output(completed.stdout or "", self.settings.runtime_home),
                 _redact_output(completed.stderr or "", self.settings.runtime_home),
-                started=True,
+                started=not _is_definitive_pre_submit_failure(
+                    arguments, completed.stdout or "", completed.stderr or "",
+                ),
             )
         except subprocess.TimeoutExpired as error:
             return BackendResult(
@@ -910,6 +915,33 @@ class PublishBatchService:
         self.save(batch)
         return self.run(batch)
 
+    def confirm_pre_submit_failure(
+        self, batch: PublishBatch, platform: PublishPlatform, actor: str,
+    ) -> PublishBatch:
+        target = next((item for item in batch.targets if item.platform == platform), None)
+        if target is None:
+            raise KeyError(f"batch has no {platform.value} target")
+        if target.state != PublishTargetState.UNCERTAIN:
+            raise ValueError("only an uncertain target can be reconciled")
+        if not actor.strip():
+            raise ValueError("reconciliation actor must not be empty")
+        if not _is_definitive_pre_submit_failure(
+            [platform.value, "upload-video"], "", target.last_error or "",
+        ):
+            raise ValueError("target does not contain definitive evidence of a pre-submit failure")
+        target.state = PublishTargetState.FAILED_PRE_SUBMIT
+        self.workspace.append_publish_attempt(
+            batch.id, platform.value, "reconcile_pre_submit",
+            {
+                "actor": actor.strip(),
+                "reason": "publisher provided definitive evidence that the final publish click was not reached",
+                "recorded_at": now_iso(),
+            },
+        )
+        batch.updated_at = now_iso()
+        self._finish(batch)
+        return batch
+
     def _record(self, batch: PublishBatch, target: PublishTarget, action: str, result: BackendResult) -> None:
         try:
             runtime_metadata = self.backend.runtime_metadata() if hasattr(self.backend, "runtime_metadata") else {"commit": self.backend.commit}
@@ -961,6 +993,22 @@ def _final_video_checks(path: Path, content_type: ContentType) -> list[CheckResu
 
 def _redact_output(value: str, runtime_home: Path) -> str:
     return _redact_secret_values(value.replace(str(runtime_home), "<sau-runtime>"))[-4000:]
+
+
+def _is_definitive_pre_submit_failure(arguments: list[str], stdout: str, stderr: str) -> bool:
+    """Recognize evidence proving the final platform publish click was not reached."""
+    if "upload-video" not in arguments:
+        return False
+    evidence = f"{stdout}\n{stderr}".lower()
+    markers = (
+        "cookie is missing or expired",
+        "account file is missing",
+        "cookie文件不存在",
+        "cookie文件已失效",
+        "cookie 失效",
+        "无法确认视频号原创声明已勾选，停止发表",
+    )
+    return any(marker in evidence for marker in markers)
 
 
 def _redact_secret_values(value: str) -> str:
@@ -1032,15 +1080,130 @@ def _apply_upstream_compatibility_patches(source: Path) -> list[str]:
         patched = original
         for before, after in replacements.items():
             patched = patched.replace(before, after)
-        label_marker = "Video Factory republishes edited source material and leaves this optional label unset."
-        label_signature = "    async def apply_original_statement(self, page: Page) -> None:\n"
-        if label_signature in patched and label_marker not in patched:
-            patched = patched.replace(
-                label_signature,
-                label_signature
-                + f"        # {label_marker}\n"
-                + "        return None\n",
+        if path == cli_path:
+            duplicate_tencent_setup = re.compile(
+                r'(?m)^(    account_file = resolve_account_file\("tencent", request\.account_name\)\n)'
+                r'    is_ready = await tencent_setup\(str\(account_file\), handle=False\)\n'
+                r'    if not is_ready:\n'
+                r'        raise RuntimeError\(\n'
+                r'(?:            .*\n)+?'
+                r'        \)\n'
             )
+            patched = duplicate_tencent_setup.sub(
+                r'\1    # Batch preflight already checked credentials; the real upload page verifies them again.\n',
+                patched,
+                count=1,
+            )
+        if path.as_posix().endswith("uploader/tencent_uploader/main.py"):
+            patched = patched.replace(
+                "browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))",
+                "browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=False))",
+                1,
+            )
+            cookie_success = '            tencent_logger.success(_msg("🥳", "cookie 有效"))\n            return True'
+            cookie_refresh = (
+                "            # Persist server-refreshed session cookies so the next browser does not reuse a stale token.\n"
+                "            await context.storage_state(path=account_file)\n"
+                f"{cookie_success}"
+            )
+            if "Persist server-refreshed session cookies" not in patched:
+                patched = patched.replace(cookie_success, cookie_refresh, 1)
+            close_context = "        finally:\n            await context.close()"
+            persist_context = (
+                "        finally:\n"
+                "            # Preserve refreshed WeChat credentials even when a verified pre-submit guard stops the run.\n"
+                "            try:\n"
+                "                await context.storage_state(path=self.account_file)\n"
+                "            except Exception:\n"
+                "                pass\n"
+                "            await context.close()"
+            )
+            if "verified pre-submit guard stops the run" not in patched:
+                patched = patched.replace(close_context, persist_context)
+            duplicate_base_check = (
+                "        if not await cookie_auth(self.account_file):\n"
+                "            raise RuntimeError(f\"cookie文件已失效，请先完成视频号登录: {self.account_file}\")\n"
+            )
+            real_page_check = (
+                "        # Avoid a third browser-only cookie probe; open_upload_page verifies login before file selection.\n"
+            )
+            patched = patched.replace(duplicate_base_check, real_page_check, 1)
+        original_statement_marker = "Video Factory requires a verified WeChat original-content declaration."
+        original_statement = (
+            "    async def apply_original_statement(self, page: Page) -> None:\n"
+            f"        # {original_statement_marker}\n"
+            "        text = page.get_by_text(\"声明原创\", exact=True).first\n"
+            "        await text.wait_for(state=\"visible\", timeout=10000)\n"
+            "        main_checkbox = page.locator('.declare-original-checkbox input.ant-checkbox-input').first\n"
+            "        if await main_checkbox.count():\n"
+            "            if not await main_checkbox.is_checked():\n"
+            "                await main_checkbox.click(force=True)\n"
+            "                dialog = page.locator('.declare-original-dialog .weui-desktop-dialog__wrp').first\n"
+            "                await dialog.wait_for(state=\"visible\", timeout=5000)\n"
+            "                agreement = dialog.locator('.original-proto-wrapper input.ant-checkbox-input').first\n"
+            "                if not await agreement.is_checked():\n"
+            "                    await agreement.check(force=True)\n"
+            "                if not await agreement.is_checked():\n"
+            "                    raise RuntimeError(\"无法确认原创声明协议已勾选，停止发表\")\n"
+            "                confirm = dialog.locator('button:has-text(\"声明原创\")').first\n"
+            "                for _ in range(20):\n"
+            "                    confirm_class = (await confirm.get_attribute(\"class\")) or \"\"\n"
+            "                    if \"disabled\" not in confirm_class:\n"
+            "                        break\n"
+            "                    await page.wait_for_timeout(250)\n"
+            "                await confirm.click()\n"
+            "                await dialog.wait_for(state=\"hidden\", timeout=5000)\n"
+            "            wrapper_class = (await main_checkbox.locator(\"..\").get_attribute(\"class\")) or \"\"\n"
+            "            if await main_checkbox.is_checked() or \"ant-checkbox-checked\" in wrapper_class:\n"
+            "                tencent_logger.success(_msg(\"✅\", \"已勾选原创声明\"))\n"
+            "                return\n"
+            "        checkbox = page.get_by_role(\"checkbox\", name=\"声明原创\").first\n"
+            "        if await checkbox.count():\n"
+            "            if not await checkbox.is_checked():\n"
+            "                await checkbox.check(force=True)\n"
+            "            if await checkbox.is_checked():\n"
+            "                tencent_logger.success(_msg(\"✅\", \"已勾选原创声明\"))\n"
+            "                return\n"
+            "        input_box = page.locator('label:has-text(\"声明原创\") input[type=\"checkbox\"]').first\n"
+            "        if await input_box.count():\n"
+            "            if not await input_box.is_checked():\n"
+            "                await input_box.check(force=True)\n"
+            "            if await input_box.is_checked():\n"
+            "                tencent_logger.success(_msg(\"✅\", \"已勾选原创声明\"))\n"
+            "                return\n"
+            "        label = page.locator('label:has-text(\"声明原创\")').first\n"
+            "        if await label.count():\n"
+            "            await label.click()\n"
+            "            await page.wait_for_timeout(500)\n"
+            "            class_name = (await label.get_attribute(\"class\")) or \"\"\n"
+            "            aria_checked = await label.get_attribute(\"aria-checked\")\n"
+            "            nested = label.locator('input[type=\"checkbox\"]').first\n"
+            "            nested_checked = await nested.count() and await nested.is_checked()\n"
+            "            if nested_checked or aria_checked == \"true\" or \"is-checked\" in class_name:\n"
+            "                tencent_logger.success(_msg(\"✅\", \"已勾选原创声明\"))\n"
+            "                return\n"
+            "        debug_dom = Path(BASE_DIR) / \"debug_tencent_original_statement_dom.html\"\n"
+            "        ancestors = await text.evaluate(\"(el) => { const out = []; for (let n = el; n && out.length < 8; n = n.parentElement) out.push(n.outerHTML); return out; }\")\n"
+            "        debug_dom.write_text(\"\\\\n\\\\n<!-- ancestor -->\\\\n\\\\n\".join(ancestors), encoding=\"utf-8\")\n"
+            "        for index, frame in enumerate(page.frames):\n"
+            "            try:\n"
+            "                frame_path = Path(BASE_DIR) / f\"debug_tencent_original_statement_frame_{index}.html\"\n"
+            "                frame_path.write_text(await frame.content(), encoding=\"utf-8\")\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "        debug_html = Path(BASE_DIR) / \"debug_tencent_original_statement.html\"\n"
+            "        debug_png = Path(BASE_DIR) / \"debug_tencent_original_statement.png\"\n"
+            "        debug_html.write_text(await page.content(), encoding=\"utf-8\")\n"
+            "        await page.screenshot(path=str(debug_png), full_page=True)\n"
+            "        tencent_logger.error(_msg(\"📸\", f\"原创声明控件现场已保存: {debug_html} / {debug_png}\"))\n"
+            "        raise RuntimeError(\"无法确认视频号原创声明已勾选，停止发表\")\n\n"
+        )
+        original_statement_pattern = re.compile(
+            r"(?ms)^    async def apply_original_statement\(self, page: Page\) -> None:\n"
+            r".*?(?=^    (?:async )?def |\Z)"
+        )
+        if original_statement_pattern.search(patched):
+            patched = original_statement_pattern.sub(original_statement, patched, count=1)
         if patched != original:
             path.write_text(patched, encoding="utf-8")
             changed.append(str(path.relative_to(source)))

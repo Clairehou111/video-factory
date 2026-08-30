@@ -160,6 +160,13 @@ def main() -> None:
     publish_retry = subcommands.add_parser("publish-retry", help="仅重试明确未进入提交阶段的平台")
     publish_retry.add_argument("batch")
     publish_retry.add_argument("--platform", required=True, choices=[item.value for item in PublishPlatform])
+    publish_reconcile = subcommands.add_parser(
+        "publish-confirm-pre-submit-failure",
+        help="凭明确的上传前鉴权拒绝证据，将不确定状态恢复为可安全重试",
+    )
+    publish_reconcile.add_argument("batch")
+    publish_reconcile.add_argument("--platform", required=True, choices=[item.value for item in PublishPlatform])
+    publish_reconcile.add_argument("--actor", required=True)
     publish_collection_retry = subcommands.add_parser("publish-collection-retry-link", help="只重试已上传 Bilibili 视频的合集关联，绝不重复上传")
     publish_collection_retry.add_argument("batch")
     publish_collection_retry.add_argument("--item", required=True)
@@ -619,6 +626,14 @@ def main() -> None:
         print(json.dumps(batch.to_dict(), ensure_ascii=False, indent=2))
         if batch.state.value not in {"succeeded", "partial_success"}:
             sys.exit(1)
+    elif args.command == "publish-confirm-pre-submit-failure":
+        batch = workspace.load_publish_batch(args.batch)
+        if isinstance(batch, CollectionPublishBatch):
+            raise ValueError("collection batches use publish-collection-confirm-pre-submit-failure")
+        PublishBatchService(workspace, SocialAutoUploadBackend()).confirm_pre_submit_failure(
+            batch, PublishPlatform(args.platform), args.actor,
+        )
+        print(json.dumps(batch.to_dict(), ensure_ascii=False, indent=2))
     elif args.command == "publish-collection-retry-link":
         batch = workspace.load_publish_batch(args.batch)
         if not isinstance(batch, CollectionPublishBatch):

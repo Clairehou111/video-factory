@@ -212,5 +212,40 @@
     "tests": [
       "tests/test_editorial.py::EditorialContractTests::test_information_frame_keeps_wechat_ui_safe_bands_free_of_text"
     ]
+  },
+  {
+    "id": "VF-20260830-019",
+    "title": "WeChat publisher silently left the original-content declaration unchecked",
+    "stage": "publishing",
+    "reproduction": "Submit a Tencent/WeChat Channels video through the pinned social-auto-upload runtime and inspect the original-content checkbox before the final publish click.",
+    "impact": "The publisher reported success without applying the creator's required original-content declaration.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_publish_batch.py::PublishBatchTest::test_publisher_policy_patch_requires_verified_wechat_original_declaration"
+    ]
+  },
+  {
+    "id": "VF-20260830-020",
+    "title": "Expired WeChat cookie was misclassified as an uncertain submission",
+    "stage": "publishing",
+    "reproduction": "Let Tencent upload-video reject an expired cookie before constructing the uploader after a stale preflight check reported valid.",
+    "impact": "A definitely safe pre-submit failure became non-retryable, forcing manual batch repair and delaying publication.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_publish_batch.py::PublishBatchTest::test_expired_cookie_rejection_is_safe_to_reconcile_and_retry",
+      "tests/test_publish_batch.py::PublishBatchTest::test_backend_classifies_expired_cookie_as_not_started",
+      "tests/test_publish_batch.py::PublishBatchTest::test_wechat_upload_uses_headed_browser"
+    ]
+  },
+  {
+    "id": "VF-20260830-021",
+    "title": "One WeChat publish attempt opened the creator page four times",
+    "stage": "publishing",
+    "reproduction": "Run an approved Tencent publish batch and count browser launches from batch preflight, CLI setup, uploader validation, and the real upload page.",
+    "impact": "Redundant login probes slowed every publish, confused the operator, and repeatedly rotated the WeChat session cookie.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_publish_batch.py::PublishBatchTest::test_publisher_policy_patch_requires_verified_wechat_original_declaration"
+    ]
   }
 ]
