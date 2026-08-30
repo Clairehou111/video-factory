@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
@@ -10,6 +12,87 @@ from .models import RenderManifest, TopicType
 FACTUAL_CATEGORY_LABELS = {
     "模型发布", "价格变化", "开源项目", "论文结果", "工具更新", "行业公告",
 }
+
+
+class AdvisoryRecoveryAction(StrEnum):
+    RETRY_BACKOFF = "retry_backoff"
+    SPLIT_ATTACHMENTS = "split_attachments"
+    USE_STORYBOARD = "use_storyboard"
+    START_CLEAN_SESSION = "start_clean_session"
+    NEEDS_HUMAN_AUTHORIZATION = "needs_human_authorization"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class AdvisoryRecoveryDecision:
+    action: AdvisoryRecoveryAction
+    delay_seconds: int = 0
+    next_attachment_count: int = 0
+    reason: str = ""
+
+
+def plan_advisory_recovery(
+    error: str, *, attachment_count: int, media_kind: str, attempt: int,
+) -> AdvisoryRecoveryDecision:
+    """Choose a bounded fallback for an external visual-review provider.
+
+    This deliberately never enables billing, links a paid key, or retries an
+    ambiguous chargeable action.  UI integrations can execute the returned
+    action and persist it in their run trace without embedding provider-specific
+    click logic in the editorial pipeline.
+    """
+    detail = error.casefold()
+    kind = media_kind.casefold().strip()
+    delay = min(30, 2 ** max(1, attempt + 1))
+    if any(marker in detail for marker in (
+        "paid api key", "set up billing", "billing required", "permission denied",
+    )):
+        return AdvisoryRecoveryDecision(
+            AdvisoryRecoveryAction.NEEDS_HUMAN_AUTHORIZATION,
+            reason="provider requires an explicitly authorized paid credential",
+        )
+    if any(marker in detail for marker in ("file types are not supported", "unsupported file type")):
+        if kind in {"video", "gif", "animated_image"}:
+            return AdvisoryRecoveryDecision(
+                AdvisoryRecoveryAction.USE_STORYBOARD,
+                reason="provider rejected motion media; preserve shot order in a contact sheet",
+            )
+        return AdvisoryRecoveryDecision(
+            AdvisoryRecoveryAction.STOP,
+            reason="provider rejected the already-degraded review artifact",
+        )
+    if "internal error" in detail or "unexpected error" in detail:
+        if attachment_count > 1:
+            return AdvisoryRecoveryDecision(
+                AdvisoryRecoveryAction.SPLIT_ATTACHMENTS,
+                delay_seconds=delay,
+                next_attachment_count=max(1, (attachment_count + 1) // 2),
+                reason="reduce a failing multimodal payload without dropping review coverage",
+            )
+        if attachment_count == 1 and kind == "video":
+            return AdvisoryRecoveryDecision(
+                AdvisoryRecoveryAction.USE_STORYBOARD,
+                delay_seconds=delay,
+                next_attachment_count=1,
+                reason="single-video review failed; preserve visual sequence as a storyboard",
+            )
+        if attachment_count == 0 and attempt < 2:
+            return AdvisoryRecoveryDecision(
+                AdvisoryRecoveryAction.START_CLEAN_SESSION,
+                delay_seconds=delay,
+                reason="text-only failure after media errors indicates contaminated session state",
+            )
+    if attempt < 2:
+        return AdvisoryRecoveryDecision(
+            AdvisoryRecoveryAction.RETRY_BACKOFF,
+            delay_seconds=delay,
+            next_attachment_count=max(0, attachment_count),
+            reason="transient provider failure within the bounded retry budget",
+        )
+    return AdvisoryRecoveryDecision(
+        AdvisoryRecoveryAction.STOP,
+        reason="bounded advisory recovery budget exhausted",
+    )
 
 
 def extract_direct_identifier(manifest: RenderManifest) -> str:

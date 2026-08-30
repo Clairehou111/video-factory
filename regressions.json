@@ -373,5 +373,18 @@
     "tests": [
       "tests/test_radar.py::RadarV2Test::test_story_without_identifier_or_fact_label_gets_no_empty_metadata_rail"
     ]
+  },
+  {
+    "id": "VF-20260830-033",
+    "title": "External visual critic retried failing media payloads without a bounded fallback ladder",
+    "stage": "advisory_review",
+    "reproduction": "Send four videos to an AI Studio app, retry the same internal error, split to two videos, then encounter a paid-key requirement in the multimodal playground.",
+    "impact": "A production agent could loop on a broken session, repeatedly upload the same assets, or implicitly cross a billing boundary instead of degrading safely and asking for authorization.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_advisory_recovery_splits_payload_then_degrades_video",
+      "tests/test_radar.py::RadarV2Test::test_advisory_recovery_never_enables_paid_key_implicitly",
+      "tests/test_radar.py::RadarV2Test::test_advisory_recovery_uses_clean_session_then_stops_boundedly"
+    ]
   }
 ]

@@ -21,7 +21,10 @@ from video_factory.models import (
     EvidenceShotKind, InformationRenderProfile, MaterialRole, RenderManifest, Scene,
     SourceType, StorySubject, TopicType,
 )
-from video_factory.radar import build_tencent_radar_copy, extract_direct_identifier
+from video_factory.radar import (
+    AdvisoryRecoveryAction, build_tencent_radar_copy, extract_direct_identifier,
+    plan_advisory_recovery,
+)
 from video_factory.quality import validate_manifest
 from video_factory.tracks import TrackSegment, build_dip_to_color_track
 from video_factory.tweetcard import tweet_card_video
@@ -227,6 +230,35 @@ class RadarV2Test(unittest.TestCase):
         self.assertIn("direct_fact|conflict|counter_intuitive|developer_roi", prompt)
         self.assertIn("category_label is optional", prompt)
         self.assertIn("do not force shock", prompt)
+
+    def test_advisory_recovery_splits_payload_then_degrades_video(self) -> None:
+        batch = plan_advisory_recovery(
+            "An internal error occurred", attachment_count=4, media_kind="video", attempt=0,
+        )
+        self.assertEqual(batch.action, AdvisoryRecoveryAction.SPLIT_ATTACHMENTS)
+        self.assertEqual(batch.next_attachment_count, 2)
+        single = plan_advisory_recovery(
+            "An internal error occurred", attachment_count=1, media_kind="video", attempt=1,
+        )
+        self.assertEqual(single.action, AdvisoryRecoveryAction.USE_STORYBOARD)
+
+    def test_advisory_recovery_never_enables_paid_key_implicitly(self) -> None:
+        decision = plan_advisory_recovery(
+            "permission denied; link a paid API key and set up billing",
+            attachment_count=1, media_kind="video", attempt=0,
+        )
+        self.assertEqual(decision.action, AdvisoryRecoveryAction.NEEDS_HUMAN_AUTHORIZATION)
+        self.assertEqual(decision.delay_seconds, 0)
+
+    def test_advisory_recovery_uses_clean_session_then_stops_boundedly(self) -> None:
+        clean = plan_advisory_recovery(
+            "An unexpected error occurred", attachment_count=0, media_kind="text", attempt=1,
+        )
+        self.assertEqual(clean.action, AdvisoryRecoveryAction.START_CLEAN_SESSION)
+        stopped = plan_advisory_recovery(
+            "An unexpected error occurred", attachment_count=1, media_kind="storyboard", attempt=2,
+        )
+        self.assertEqual(stopped.action, AdvisoryRecoveryAction.STOP)
 
 
 if __name__ == "__main__":
