@@ -282,5 +282,16 @@
     "tests": [
       "tests/test_quality.py::QualityTest::test_font_resolution_falls_back_after_invalid_local_configuration"
     ]
+  },
+  {
+    "id": "VF-20260830-025",
+    "title": "Hook, evidence, and conclusion competed on screen for the entire video",
+    "stage": "composition",
+    "reproduction": "Watch an information-frame final cut on a phone and try to follow the fixed upper hook, moving source evidence and fixed lower conclusion at the same time.",
+    "impact": "Three simultaneous reading targets split attention, reduced the browser evidence to a short pane, and made technical screenshots illegible even after WeChat-safe margins were added.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_directed_composition_shows_hook_and_conclusion_sequentially"
+    ]
   }
 ]
