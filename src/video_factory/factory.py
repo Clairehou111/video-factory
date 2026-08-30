@@ -494,7 +494,8 @@ class VideoFactory:
             "duration": options.duration, "provider": options.provider, "model": options.model,
             "research": options.research, "linked_sources": options.linked_sources,
             "supplemental_context": options.supplemental_context,
-            "price_event_metadata": options.price_event_metadata, "schema": 44,
+            "price_event_metadata": options.price_event_metadata,
+            "render_profile": options.render_profile, "schema": 45,
         }, sort_keys=True, ensure_ascii=False)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return self.cache_dir / "generations" / f"{digest}.manifest.json"

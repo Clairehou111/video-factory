@@ -186,6 +186,18 @@ class VideoFactoryTest(unittest.TestCase):
                 "stored",
             )
 
+    def test_generation_cache_isolated_by_render_profile(self) -> None:
+        with TemporaryDirectory() as temp:
+            factory = VideoFactory(Workspace(Path(temp) / "workspace"))
+            classic = factory._generation_cache_path(
+                "https://x.com/example/status/1", GenerateOptions(render=False),
+            )
+            radar = factory._generation_cache_path(
+                "https://x.com/example/status/1",
+                GenerateOptions(render=False, render_profile="radar_v2"),
+            )
+            self.assertNotEqual(classic, radar)
+
     def test_github_render_applies_license_and_budgets_cold_open(self) -> None:
         with TemporaryDirectory() as temp:
             factory = VideoFactory(Workspace(Path(temp) / "workspace"))
