@@ -19,7 +19,7 @@ from .agent import (
     AgentBudget, ArchivedEvidenceTool, BoundedContentAgent, ContentAgentError,
     LinkedSourceResearchTool,
 )
-from .models import ContentType, TopicType, now_iso
+from .models import ContentType, InformationRenderProfile, TopicType, now_iso
 from .serde import load_collection_manifest
 from .youtube import (
     DiscoveryConfig, YouTubeCollectionRenderer, YouTubeDiscoveryService, validate_collection,
@@ -129,6 +129,7 @@ def main() -> None:
     frame.add_argument("manifest")
     frame.add_argument("visual_track")
     frame.add_argument("--out", required=True)
+    frame.add_argument("--render-profile", choices=[item.value for item in InformationRenderProfile])
     assemble = subcommands.add_parser("assemble-mpt", help="用 MPT 将无旁白视觉轨与背景音乐编码为最终 MP4")
     assemble.add_argument("manifest")
     assemble.add_argument("visual_track")
@@ -240,6 +241,11 @@ def main() -> None:
     generate.add_argument("--no-render", action="store_true", help="只生成可验收的内容清单，不录屏和合成")
     generate.add_argument("--refresh-prices", action="store_true", help="忽略当日 OpenRouter 缓存并重新查价")
     generate.add_argument("--refresh", action="store_true", help="忽略该 URL 已缓存的采集与内容清单")
+    generate.add_argument(
+        "--render-profile", choices=[item.value for item in InformationRenderProfile],
+        default=InformationRenderProfile.CLASSIC.value,
+        help="classic 保持稳定样式；radar_v2 启用分层视口、聚光灯与微动态",
+    )
     generate.add_argument("--youtube-media", help="YouTube web 媒体不可取时，显式提供已获准使用的本地源视频")
     generate.add_argument(
         "--youtube-subtitles",
@@ -388,6 +394,7 @@ def main() -> None:
             youtube_subtitles=args.youtube_subtitles,
             youtube_translation_plan=args.youtube_translation_plan,
             youtube_editorial_mode=args.youtube_editorial_mode,
+            render_profile=args.render_profile,
         ))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "rerender":
@@ -563,6 +570,8 @@ def main() -> None:
         print(overlay_fixed_footer(Path(args.visual_track), footer_png, output))
     elif args.command == "frame-video":
         manifest = load_manifest(Path(args.manifest))
+        if args.render_profile:
+            manifest.render_profile = args.render_profile
         print(compose_information_frame(manifest, Path(args.visual_track), Path(args.out)))
     elif args.command == "assemble-mpt":
         manifest = load_manifest(Path(args.manifest))

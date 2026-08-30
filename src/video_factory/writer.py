@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 
-from .models import Candidate, ContentType, ContextGraph, EditorialOpportunity, Evidence, TopicType
+from .models import (
+    Candidate, ContentType, ContextGraph, EditorialOpportunity, Evidence,
+    InformationRenderProfile, TopicType,
+)
 from .narrative import requirements_for
 from .translation import IT_TRANSLATION_CONTRACT, PLAIN_CHINESE_CONTRACT
 
@@ -25,8 +28,10 @@ class StoryWriterPacket:
     )
     opportunity: EditorialOpportunity | None = None
     context_graph: ContextGraph | None = None
+    render_profile: str = InformationRenderProfile.CLASSIC.value
 
     def prompt(self) -> str:
+        radar = self.render_profile == InformationRenderProfile.RADAR_V2.value
         requirements = requirements_for(self.topic_type, self.content_type)
         # Evidence remains archived in full. The writing model receives a
         # bounded, source-aware excerpt so a malformed web extraction cannot
@@ -56,8 +61,8 @@ class StoryWriterPacket:
             schema.pop("hook", None)
             schema["github_brief"] = {
                 "project_kind": "tool|cli_sdk|agent_framework|model_research|infrastructure|security_privacy|template_ui|other",
-                "hook_strategy": "conflict|surprise|practical_win|warning|counterintuitive|verdict",
-                "hook_opening": "10–28 Chinese characters: a complete first-screen event hook containing the concrete subject/job plus a specific contrast, friction, reversal, relief, or consequence; a neutral 项目名：功能 summary is identity copy, not a hook; never a bare reaction such as 太快了/太狠了",
+                "hook_strategy": "direct_fact|conflict|surprise|practical_win|warning|counterintuitive|verdict",
+                "hook_opening": "10–28 Chinese characters: a complete first-screen statement of what happened; use direct_fact when the repository action itself is important, otherwise use only an evidence-backed contrast, friction, reversal, relief, or consequence; never a bare reaction such as 太快了/太狠了",
                 "hook_reveal": "10–34 Chinese characters: a new, evidence-backed capability/result that answers the opening; never repeat or merely rephrase hook_opening",
                 "hook_verdict": "8–30 Chinese characters: our distinctive, value-forward judgment or consequence; for a maintained/popular repository, default to what becomes possible or worth trying, never force a ritual caveat",
                 "hook_evidence_ids": ["evidence id supporting hook_fact"],
@@ -115,14 +120,27 @@ class StoryWriterPacket:
                 " Preserve verb strength exactly for security/privacy tools: strip/remove/clean/detect/inspect does not mean bypass, crack, defeat, break, or evade an official detector. Never upgrade 去除/清理/检测 into 绕过、破解、攻破、干碎、失效 unless the repository's opening claim explicitly makes that stronger claim. Class-level support is not proof against a vendor's private official detector."
                 " Preserve scope and novelty exactly. Chinese absolutes and superlatives such as 全面、全部、所有、任何、彻底、完全、首次、第一次、唯一 are factual claims, not harmless emotional wording. Use one only when the cited evidence proves the same actor, object, time, and coverage. Phrases such as supported models, where supported, new models, or across products do not prove 全面/全部; a newly visible repository does not prove 首次/第一次/唯一. Build energy from a verified actor-action reversal or workflow payoff instead of enlarging scope."
                 " Treat a maintained, widely adopted open-source repository with constructive enthusiasm: lead with the useful work it already makes possible. Popularity is not proof that every output is perfect, but external APIs, configurable providers, local installation, an open-source license, or the need to choose materials are normal engineering choices—not an automatic negative verdict. For such a repository, hook_verdict and footer should normally be affirmative and adoption-oriented, without a ritual 但/不过/然而 clause. Never write 只/仅适合原型、而非成品交付、不适合生产、不能用于正式项目、质量仍需人工把关, or an equivalent downgrade unless the repository explicitly states that exact limitation. Put concrete source-backed limitations in the relevant evidence scene instead of forcing them into the last word."
-                " For the opening, do not return a top-level hook and do not return one sentence for the program to split. Fill hook_strategy, hook_opening, hook_reveal, hook_verdict, hook_evidence_ids, and project_title. The three hook texts are three independent screens: pressure/tension → repository response → concrete payoff/opinion. Each must be a complete sentence fragment, introduce new information, and remain understandable alone. The first screen must say what is happening; emotion is integrated into that sentence instead of being a generic exclamation. Merely writing 项目名：能力列表, 项目名可以做某事, or an accurate README summary is not enough for hook_opening: make the existing pain, vendor move, workflow contrast, or surprising result visible without inventing facts. If a repository removes, counters, audits, bypasses, or reverses a capability introduced by a named vendor/ecosystem in the evidence, prefer conflict or counterintuitive and name both sides. For an automation tool, practical_win or surprise should contrast the former workflow with the new input/output, then end on the real adoption payoff. project_title is calmer and remains above the real GitHub walkthrough after the cold open. Length limits are Chinese-character equivalents: Han characters count 1, ASCII letters/digits about 0.55, spaces about 0.35. Keep the real repository name; shorter than the stated limit is better."
+                " For the opening, do not return a top-level hook and do not return one sentence for the program to split. Fill hook_strategy, hook_opening, hook_reveal, hook_verdict, hook_evidence_ids, and project_title. The three hook texts are three independent screens: what happened → repository proof/response → concrete payoff/opinion. Each must be complete, introduce new information, and remain understandable alone. Shock is optional. Choose direct_fact when the named repository action is already the reason to stop; use conflict/counterintuitive/practical_win only when evidence earns it. If a repository genuinely removes, counters, audits, bypasses, or reverses a named vendor capability, conflict may name both sides. project_title is calmer and remains above the real walkthrough. Length limits are Chinese-character equivalents: Han characters count 1, ASCII letters/digits about 0.55, spaces about 0.35. Keep the real repository name; shorter than the stated limit is better."
             )
         else:
+            opening_contract = (
+                "Treat attention as a factual layer, not decoration. Use Hook/What happened → Proof → Takeaway; do not force shock. Select exactly one opening_mode: direct_fact when the verified event itself is important, conflict only for a real comparison, counter_intuitive only when evidence violates a common expectation, or developer_roi only for an explicit cost/time/performance/workflow gain. Never fabricate opposition, an incumbent comparison, or an ROI number. "
+                if radar else
+                "Treat attention as a factual layer, not decoration. Find a concrete tension, surprise, record scale, or high-stakes change, but never fabricate opposition or a cost conflict. "
+            )
+            radar_copy_contract = (
+                "Radar visible-copy contract: ordinary headlines fit at most 20 Chinese-character-equivalents; when preserving an exact subject/model/project name makes that impossible, at most 28 and never more than two rendered lines. A highlighted Chinese gloss is 16–24 equivalents. Every concise narrative sentence contains at least one concrete metric, action verb, or named entity. Avoid 项目发布了、关于…的探讨、作者表示 as ownerless openings and ban vague phrases such as 反映了…的深度、体现了生态多样性、提供了新思考. A competitor or causal association absent from direct evidence may appear only as an explicit question and must be copied into editorial_inference; proof and takeaway must not assert it. category_label is optional UI metadata, not a judgment. Use only 模型发布、价格变化、开源项目、论文结果、工具更新、行业公告 when the source clearly fits; otherwise return empty. Never invent 神器、平替、突破、必看 as a category. direct_identifier must be copied exactly from supplied evidence or remain empty. "
+                if radar else ""
+            )
             schema["editorial_brief"] = {
                 "headline": "specific adaptive upper-rail headline naming the actor and conflict; keep the exact entity even when it needs a smaller font or extra line",
                 "subheadline": "new information: consequence, technical change, or open loop",
                 "fixed_conclusion": "distinctive evidence-backed stance that resolves the opening",
                 "duration_target": self.target_duration,
+                "opening_mode": "direct_fact|conflict|counter_intuitive|developer_roi; choose from evidence and default to direct_fact when the event itself is enough",
+                "category_label": "optional neutral factual label: 模型发布|价格变化|开源项目|论文结果|工具更新|行业公告; empty when none fits exactly",
+                "direct_identifier": "optional exact HF:, pip install, docker pull, or github.com/org/repo identifier copied from evidence; empty otherwise",
+                "editorial_inference": "the exact question-form inference used by the hook, or empty when every hook claim is directly proved",
                 "attention_strategy": {
                     "hook_fact": "the concrete event/result that earns the first second",
                     "conflict": "named actor/action versus old workflow, incumbent, expectation, price, or migration cost",
@@ -159,6 +177,7 @@ class StoryWriterPacket:
                     "selection_reason_ids": ["selection reason id this shot advances"],
                     "context_event_ids": ["context event id this shot explains"],
                     "full_translation": "for a non-Chinese root post: 40–120 Chinese characters covering decisive actor/action/scope/numbers without handles/URL; empty otherwise",
+                    "narrative_beat": "opening|proof|takeaway",
                 }],
                 "director_brief": {
                     "editorial_thesis": "the specific evidence-backed point of this story",
@@ -176,10 +195,18 @@ class StoryWriterPacket:
                     "recommended_duration": self.target_duration,
                 },
             }
+            if not radar:
+                for name in (
+                    "opening_mode", "category_label", "direct_identifier", "editorial_inference",
+                ):
+                    schema["editorial_brief"].pop(name, None)
+                for shot in schema["editorial_brief"]["evidence_shots"]:
+                    shot.pop("narrative_beat", None)
             github_contract = (
                 "Non-GitHub editorial contract: return editorial_brief, never scenes, kind, material_role, visual_action, recording_cues, selectors, pointer tracks, zoom tracks, duration schedules, trial as a material, or boundary as a material. The execution layer compiles cited evidence plus visual_family into browser/render scenes and schedules flash timing deterministically. "
-                "Treat attention as a factual layer, not decoration. Find a concrete tension: new workflow versus old labor, architecture innovation versus prior paradigms, capability breakthrough versus trade-offs, named vendor action versus community response, key people versus incumbent organization, result versus prior expectation, or announcement versus migration deadline. If no honest conflict exists, use a concrete surprise, record scale, or high-stakes change; never fabricate opposition or cost conflicts when the source does not focus on cost. "
+                + opening_contract +
                 "Return exactly three materially different hook_candidates and select one verbatim. The chosen hook, headline, and subheadline must name the actor/product/company/paper and say what happened. Do not merely add emotional adjectives to a summary. The payoff must answer the opening with a distinct judgment. "
+                + radar_copy_contract +
                 "The audience includes vibe coders, not only AI researchers. When the hook or a visible metric uses a specialist term, its first evidence shot must immediately add a short plain-Chinese explanation of what the term measures or means in practice. For example, a refusal rate means the share of prompts the model declines to answer; explain the concept without assuming familiarity, while keeping the exact sourced number. Do not waste space defining common words such as API or model. "
                 "Never shorten a title by deleting the exact person, company, project, model, or product name. The renderer owns title fitting and may reduce font size, add a line, and increase the fixed upper rail; preserve identity and meaning first. "
                 "For short video, at least two hook candidates must exploit a real evidence-backed contradiction, surprise, consequence, or unresolved tension rather than a neutral topic label. Use direct emotional Chinese when the facts earn it. Phrases such as 引发讨论、值得关注、注意风险 or 生态竞争 cannot carry the hook or payoff by themselves. The fixed conclusion must give the viewer a memorable stance or consequence, not a ritual compliance reminder. "
@@ -243,6 +270,12 @@ class StoryWriterPacket:
             "Every answer and proof/explanation scene must cite evidence_ids. If evidence is missing, say unknown.",
             "For GitHub, return exactly four github_scenes using the dedicated schema above. For other topics, return the dedicated editorial_brief and never return generic scenes. Do not cut causal logic merely to fit the duration. Each evidence shot must make sense with sound off.",
             self.visual_policy,
+            (
+                "Radar V2 is opt-in for this job. Enforce the compact opening/proof/takeaway, factual-label, "
+                "identifier, and visible-copy contracts above."
+                if radar else
+                "Classic profile is active. Do not add Radar-only metadata fields."
+            ),
             github_contract,
             topic_contract,
             IT_TRANSLATION_CONTRACT,

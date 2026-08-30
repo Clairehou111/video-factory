@@ -43,6 +43,31 @@ class ContentType(StrEnum):
     DEEP_DIVE = "deep_dive"
 
 
+class InformationRenderProfile(StrEnum):
+    """Presentation profile for generated information shorts.
+
+    ``classic`` remains the compatibility default. ``radar_v2`` opts into
+    the evidence-focused layout and motion system without changing archived
+    manifests when they are loaded again.
+    """
+
+    CLASSIC = "classic"
+    RADAR_V2 = "radar_v2"
+
+
+class OpeningMode(StrEnum):
+    DIRECT_FACT = "direct_fact"
+    CONFLICT = "conflict"
+    COUNTER_INTUITIVE = "counter_intuitive"
+    DEVELOPER_ROI = "developer_roi"
+
+
+class NarrativeBeat(StrEnum):
+    OPENING = "opening"
+    PROOF = "proof"
+    TAKEAWAY = "takeaway"
+
+
 class TopicType(StrEnum):
     PRACTICE_POST = "practice_post"
     GITHUB_PROJECT = "github_project"
@@ -584,6 +609,7 @@ class EvidenceShot:
     # must never be rendered. Keeping the audience field explicit prevents a
     # model's editorial instructions from leaking into the finished video.
     audience_copy: str = ""
+    narrative_beat: str = ""
 
 
 @dataclass(slots=True)
@@ -601,6 +627,13 @@ class EditorialBrief:
     opportunity: EditorialOpportunity | None = None
     context_graph: ContextGraph | None = None
     director_brief: DirectorBrief | None = None
+    # Radar V2 fields are optional for archived/classic manifests. New
+    # writers fill them; deterministic validation then enforces the compact
+    # sound-off contract.
+    opening_mode: str = ""
+    category_label: str = ""
+    direct_identifier: str = ""
+    editorial_inference: str = ""
 
 
 @dataclass(slots=True)
@@ -639,6 +672,7 @@ class RenderManifest:
     video_path: str | None = None
     license_records: list[dict[str, Any]] = field(default_factory=list)
     quality_checks: list[dict[str, Any]] = field(default_factory=list)
+    render_profile: str = InformationRenderProfile.CLASSIC.value
     created_at: str = field(default_factory=now_iso)
 
     @property

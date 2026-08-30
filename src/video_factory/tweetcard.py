@@ -169,11 +169,30 @@ def render_tweet_card(
     return output
 
 
-def tweet_card_video(card: Path, duration: float, output: Path, fps: int = 25) -> Path:
-    """Turn the card into a native MP4 with no zoom or synthetic camera move."""
+def tweet_card_video(
+    card: Path, duration: float, output: Path, fps: int = 25, *, motion: bool = False,
+) -> Path:
+    """Turn a static card into MP4; Radar V2 may opt into a slow push-in."""
+    if not motion:
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1",
+            "-t", f"{duration:.3f}", "-i", str(card),
+            "-vf", f"fps={fps},format=yuv420p", "-an", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-r", str(fps), str(output),
+        ], check=True)
+        return output
+    from PIL import Image
+
+    with Image.open(card) as image:
+        width, height = image.size
+    zoom_step = 0.03 / max(1.0, duration * fps)
     subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-t", f"{duration:.3f}",
-        "-i", str(card), "-vf", f"fps={fps},format=yuv420p", "-an", "-c:v", "libx264",
+        "-i", str(card), "-vf",
+        f"zoompan=z='min(zoom+{zoom_step:.8f},1.03)':"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={width}x{height}:fps={fps},"
+        "format=yuv420p",
+        "-an", "-c:v", "libx264",
         "-pix_fmt", "yuv420p", "-r", str(fps), str(output),
     ], check=True)
     return output

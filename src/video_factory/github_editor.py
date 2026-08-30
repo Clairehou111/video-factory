@@ -252,7 +252,7 @@ def select_github_focuses(brief: GitHubProjectBrief) -> list[GitHubFocusCandidat
 
 
 HOOK_STRATEGIES = {
-    "conflict", "surprise", "practical_win", "warning", "counterintuitive", "verdict",
+    "direct_fact", "conflict", "surprise", "practical_win", "warning", "counterintuitive", "verdict",
 }
 SUBJECTIVE_STANCE_SIGNAL = re.compile(
     r"太|真|够|别|先|值得|有意思|漂亮|解气|可惜|意外|警惕|谨慎|好消息|坏消息|"

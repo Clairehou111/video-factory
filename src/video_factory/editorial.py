@@ -14,6 +14,12 @@ from .models import (
 
 INTERNAL_LABELS = ("证据带读", "关键结论", "仓库描述", "README声明", "trial", "boundary", "翻译：", "译为：")
 EMPTY_HYPE = ("炸锅了", "彻底炸锅", "颠覆一切", "改写一切", "历史性时刻")
+RADAR_OPENING_MODES = {"direct_fact", "conflict", "counter_intuitive", "developer_roi"}
+RADAR_CATEGORY_LABELS = {"模型发布", "价格变化", "开源项目", "论文结果", "工具更新", "行业公告"}
+RADAR_BANNED_COPY = (
+    "反映了对齐机制的深度", "体现了生态多样性", "为从业者提供了新思考",
+    "关于这一问题的探讨", "值得关注",
+)
 
 # Explain one decision-critical specialist term at its first relevant shot.
 # Definitions are audience UI copy, not claims about the selected source.
@@ -99,6 +105,14 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
         shot.evidence_ids = linked
 
     strategy = brief.attention_strategy
+    if brief.opening_mode:
+        for index, shot in enumerate(brief.evidence_shots):
+            if not shot.narrative_beat:
+                shot.narrative_beat = (
+                    "opening" if index == 0 else
+                    "takeaway" if index == len(brief.evidence_shots) - 1 else
+                    "proof"
+                )
     if not strategy.selected_hook and strategy.hook_candidates:
         strategy.selected_hook = strategy.hook_candidates[0]
     root_actor_markers = {
@@ -541,11 +555,77 @@ def route_content(
     return RouteDecision(topic, content_type, duration, reason)
 
 
+def _validate_radar_contract(brief: EditorialBrief, evidence: list[Evidence]) -> list[str]:
+    """Validate only opted-in Radar copy; archived briefs remain compatible."""
+    if not brief.opening_mode.strip():
+        return []
+    errors: list[str] = []
+    mode = brief.opening_mode.strip()
+    if mode not in RADAR_OPENING_MODES:
+        errors.append("opening_mode must be direct_fact, conflict, counter_intuitive, or developer_roi")
+    label = brief.category_label.strip()
+    if label and label not in RADAR_CATEGORY_LABELS:
+        errors.append("category_label must be an optional neutral factual Radar label")
+
+    strategy = brief.attention_strategy
+    headline = (strategy.selected_hook or brief.headline).strip()
+    width = copy_width(headline)
+    exact_subject = any(
+        subject.name.strip() and subject.name.casefold() in headline.casefold()
+        for subject in brief.subjects
+    )
+    if width > 28 or (width > 20 and not exact_subject):
+        errors.append("Radar headline must fit 20 equivalents, or 28 only to preserve an exact subject name")
+    visible_fields = [
+        brief.headline, brief.subheadline, brief.fixed_conclusion,
+        strategy.selected_hook, *strategy.hook_candidates,
+        *(shot.fact for shot in brief.evidence_shots),
+        *(shot.audience_copy for shot in brief.evidence_shots),
+        *(shot.translation for shot in brief.evidence_shots),
+        *(shot.full_translation for shot in brief.evidence_shots),
+    ]
+    for phrase in RADAR_BANNED_COPY:
+        if any(phrase in value for value in visible_fields):
+            errors.append(f"Radar visible copy contains banned vague phrase: {phrase}")
+
+    if copy_width(brief.fixed_conclusion) > 40:
+        errors.append("Radar fixed_conclusion must fit the 40-equivalent screen budget")
+    for shot in brief.evidence_shots:
+        compact_copy = "".join(filter(None, (shot.fact.strip(), shot.audience_copy.strip())))
+        if copy_width(compact_copy) > 40:
+            errors.append(f"Radar shot {shot.id} fact plus audience_copy exceeds 40 equivalents")
+        gloss = (shot.full_translation or shot.translation).strip()
+        if gloss and not 16 <= copy_width(gloss) <= 40:
+            errors.append(f"Radar shot {shot.id} Chinese gloss must fit 16–40 equivalents")
+    beats = [shot.narrative_beat.strip() for shot in brief.evidence_shots]
+    if beats:
+        if beats[0] != "opening" or beats[-1] != "takeaway":
+            errors.append("Radar evidence shots must start with opening and end with takeaway")
+        if any(beat not in {"opening", "proof", "takeaway"} for beat in beats):
+            errors.append("Radar narrative_beat must be opening, proof, or takeaway")
+        if len(beats) >= 3 and not any(beat == "proof" for beat in beats[1:-1]):
+            errors.append("Radar story needs at least one proof beat between opening and takeaway")
+
+    inference = brief.editorial_inference.strip()
+    if inference and (
+        inference != strategy.selected_hook.strip() or not inference.endswith(("?", "？"))
+    ):
+        errors.append("editorial_inference must exactly match a question-form selected_hook")
+    identifier = brief.direct_identifier.strip()
+    if identifier:
+        corpus = "\n".join([*(item.url for item in evidence), *(item.quote for item in evidence)])
+        needle = re.sub(r"^(?:HF:\s*|pip install\s+|docker pull\s+)", "", identifier, flags=re.IGNORECASE)
+        if not needle or needle.casefold() not in corpus.casefold():
+            errors.append("direct_identifier must be copied from archived evidence")
+    return errors
+
+
 def validate_editorial_brief(
     brief: EditorialBrief, candidate: Candidate, evidence: list[Evidence],
     topic: TopicType, content_type: ContentType,
 ) -> list[str]:
     errors: list[str] = []
+    errors.extend(_validate_radar_contract(brief, evidence))
     evidence_ids = {item.id for item in evidence}
     strategy = brief.attention_strategy
     required_attention = {
@@ -954,6 +1034,7 @@ def validate_editorial_structure(
     permanent execution logic.
     """
     errors: list[str] = []
+    errors.extend(_validate_radar_contract(brief, evidence))
     evidence_ids = {item.id for item in evidence}
     strategy = brief.attention_strategy
     for name, value in {

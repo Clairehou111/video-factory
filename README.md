@@ -187,8 +187,24 @@ video-factory --workspace workspace generate \
   https://arxiv.org/pdf/2501.12948 \
   --topic research_or_benchmark --format deep_dive
 
+# 实验性 Radar V2：classic 仍是默认，可随时回退
+video-factory --workspace workspace generate \
+  https://x.com/JeffDean/status/2085034604172603724 \
+  --render-profile radar_v2
+
 # 录屏、FFmpeg 或 MPT 偶发失败时复用清单，不重新采集、不调用 LLM
 video-factory --workspace workspace rerender workspace/jobs/<job-id>/manifest.json
+```
+
+`radar_v2` 对快讯保留固定上下栏，对 GitHub、论文和架构内容移除底栏；同时启用证据聚光灯、密集表格/代码局部放大、事实分类胶囊、精准代号和静态卡片微动态。复杂 Spotlight/Crop 或转场失败时会自动退回简化渲染，并在成片旁写入 `*.render-fallback.json` 或 `*.transition-fallback.json`。旧清单和未指定 profile 的新任务继续使用 `classic`。
+
+已有视觉轨可做无 LLM 的 A/B 构图测试：
+
+```bash
+video-factory --workspace workspace frame-video \
+  workspace/jobs/<job-id>/manifest.json \
+  workspace/jobs/<job-id>/evidence-browser.mp4 \
+  --render-profile radar_v2 --out workspace/jobs/<job-id>/radar-v2-visual.mp4
 ```
 
 每次运行会在 `workspace/jobs/<job-id>/result.json` 持久化阶段、路由结果、模型选择、清单、成片和质量门结果。自动路由后仍可用 `--topic`、`--format` 和 `--duration` 覆盖；信息快报会被硬限制在 15 秒内。`--no-render` 只运行采集与内容 Agent，`--research off` 关闭上下文扩展，`--refresh` 同时跳过采集与生成缓存，`--refresh-prices` 强制重新查价。采集缓存与生成缓存相互独立：内容 Schema 变化导致旧清单失效时，已经归档的 X/网页原始证据仍会复用，不会再次打开登录浏览器；相同 URL 与配置的有效清单则直接渲染，不再研究和调用模型。

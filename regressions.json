@@ -293,5 +293,74 @@
     "tests": [
       "tests/test_quality.py::QualityTest::test_director_gives_dense_screens_more_of_the_fixed_runtime"
     ]
+  },
+  {
+    "id": "VF-20260830-026",
+    "title": "Experimental Radar styling silently replaced the stable compositor",
+    "stage": "composition",
+    "reproduction": "Load an archived manifest after adding expanded layouts, glass glosses, crop zoom, badges, and camera motion directly to the default render path.",
+    "impact": "Every existing video changed at once, making regressions indistinguishable from intentional redesign and removing the known-good rollback path.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_classic_profile_never_enables_expanded_radar_layout",
+      "tests/test_radar.py::RadarV2Test::test_static_card_motion_is_opt_in_for_radar"
+    ]
+  },
+  {
+    "id": "VF-20260830-027",
+    "title": "Radar effects had no bounded render fallback",
+    "stage": "composition",
+    "reproduction": "A platform FFmpeg build rejects the focus-crop or animated transition filter graph.",
+    "impact": "A cosmetic enhancement could abort the entire agent instead of returning a readable stable video and recording the degraded path.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_transition_failure_records_hard_cut_fallback",
+      "tests/test_radar.py::RadarV2Test::test_compositor_failure_retries_without_complex_radar_effects"
+    ]
+  },
+  {
+    "id": "VF-20260830-028",
+    "title": "Retention prompt forced conflict when a direct fact was the better opening",
+    "stage": "content_agent",
+    "reproduction": "Generate a short for a strong technical announcement whose evidence contains no honest incumbent conflict or surprising comparison.",
+    "impact": "The writer could manufacture drama, competitor framing, or ROI instead of quickly reporting what happened.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_contract_uses_direct_fact_without_forcing_shock",
+      "tests/test_radar.py::RadarV2Test::test_writer_prompt_exposes_four_opening_modes_and_optional_factual_label"
+    ]
+  },
+  {
+    "id": "VF-20260830-029",
+    "title": "Radar density routing crashed on the first real capture",
+    "stage": "composition",
+    "reproduction": "Frame an archived OpenRouter capture with radar_v2 so the compositor classifies a highlighted price-table shot.",
+    "impact": "The renderer raised NameError before FFmpeg because density matching depended on an unimported regular-expression module.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_density_detection_handles_real_capture_metadata"
+    ]
+  },
+  {
+    "id": "VF-20260830-030",
+    "title": "Radar identifier badge covered the first evidence lines",
+    "stage": "composition",
+    "reproduction": "Inspect the first OpenRouter Radar frame with a category pill and long model identifier at the top of the evidence pane.",
+    "impact": "The badge overlapped the page headline and price proof, reducing readability while trying to add navigation metadata.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_identifier_and_category_stay_in_reserved_metadata_rail"
+    ]
+  },
+  {
+    "id": "VF-20260830-031",
+    "title": "Hugging Face thumbnail URL became a fake model identifier",
+    "stage": "composition",
+    "reproduction": "Render a model story whose archived image URL under /social-thumbnails/models appears before the actual Hugging Face repository URL.",
+    "impact": "The on-screen direct badge displayed HF: social-thumbnails/models instead of the real owner/model path.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_identifier_skips_huggingface_social_thumbnail_paths"
+    ]
   }
 ]

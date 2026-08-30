@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-from .models import ContentType, MaterialRole, RenderManifest
+from .models import ContentType, InformationRenderProfile, MaterialRole, RenderManifest
 from .github_editor import compose_github_hook, select_github_focuses, validate_github_brief
 from .github_editor import normalize_source_text
 from .narrative import requirements_for
@@ -26,6 +26,12 @@ def validate_manifest(manifest: RenderManifest, workspace: Path | None = None) -
     """Validate publish-blocking provenance and basic edit constraints."""
     evidence_ids = {item.id for item in manifest.evidence}
     checks: list[CheckResult] = []
+    allowed_profiles = {item.value for item in InformationRenderProfile}
+    checks.append(CheckResult(
+        "render_profile", manifest.render_profile in allowed_profiles,
+        f"渲染配置：{manifest.render_profile}" if manifest.render_profile in allowed_profiles
+        else "未知渲染配置；只能使用 classic 或 radar_v2",
+    ))
     checks.append(CheckResult("source_urls", bool(manifest.source_urls), "至少保留一个可追溯来源 URL"))
     checks.append(CheckResult(
         "footer_policy",

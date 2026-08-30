@@ -22,7 +22,9 @@ from .github_context import enrich_github_context
 from .github_editor import canonicalize_github_brief
 from .llm import LLMSettings, OpenAICompatibleStoryWriter
 from .media import probe_video, validate_wechat_mp4
-from .models import ContentType, CueAction, Evidence, EvidenceShotKind, Scene, TopicType
+from .models import (
+    ContentType, CueAction, Evidence, EvidenceShotKind, InformationRenderProfile, Scene, TopicType,
+)
 from .mpt import MPTAssemblyAdapter, MPTSettings, NativeFFmpegAssemblyAdapter
 from .multimodal import OpenRouterVisualAnalyst, find_high_value_visuals
 from .openrouter import ModelQuote, ModelRequirements, OpenRouterCatalog
@@ -32,7 +34,7 @@ from .storage import Workspace
 from .serde import load_manifest
 from .webcapture import WebCaptureRequest, WebScrollVideoAdapter, WebScrollVideoSettings
 from .writer import StoryWriterPacket
-from .tracks import TrackSegment, build_crossfade_track
+from .tracks import TrackSegment, build_crossfade_track, build_dip_to_color_track
 from .tweetcard import render_editorial_card, render_source_image, render_tweet_card, tweet_card_video
 
 
@@ -55,6 +57,7 @@ class GenerateOptions:
     linked_sources: tuple[str, ...] = ()
     supplemental_context: str | None = None
     price_event_metadata: dict[str, object] | None = None
+    render_profile: str = InformationRenderProfile.CLASSIC.value
 
 
 def _now() -> str:
@@ -549,6 +552,14 @@ class VideoFactory:
         route = route_content(
             candidate, evidence, options.topic, options.content_type, options.duration,
         )
+        if (
+            options.render_profile == InformationRenderProfile.RADAR_V2.value
+            and options.duration is None and route.content_type == ContentType.FLASH
+        ):
+            route = replace(
+                route, target_duration=10.0,
+                reason=route.reason + "; Radar V2 flash target",
+            )
         result["routing"] = {
             "source_kind": self._classify(url), "topic_type": route.topic_type.value,
             "content_type": route.content_type.value, "target_duration": route.target_duration,
@@ -621,7 +632,12 @@ class VideoFactory:
         packet = StoryWriterPacket(
             candidate, evidence, route.topic_type, route.content_type, route.target_duration,
             editorial_direction=(
-                "先发现可验证的冲突、反差或高风险变化。第一镜必须承担钩子并同时展示来源证据；"
+                (
+                    "先判断核心事实本身是否足够重要；不足时才使用有证据的冲突、反差或开发者收益。"
+                    if options.render_profile == InformationRenderProfile.RADAR_V2.value else
+                    "先发现可验证的冲突、反差或高风险变化。"
+                )
+                + "第一镜必须承担钩子并同时展示来源证据；"
                 "结尾必须回答开头。X 原帖完整放在第一镜，不拆段。"
                 + self._causal_uncertainty_direction(evidence)
                 + self._source_identity_direction(evidence)
@@ -637,7 +653,7 @@ class VideoFactory:
                     "metadata.required_headline_zh、metadata.editorial_verdict_zh，不得扩写。"
                     if options.supplemental_context else ""
                 )
-            ),
+            ), render_profile=options.render_profile,
         )
         try:
             run = self._run_editorial_agent_with_fallback(
@@ -657,6 +673,7 @@ class VideoFactory:
             result["content_agent_error"] = str(trace_path)
             raise
         manifest = run.manifest
+        manifest.render_profile = options.render_profile
         if options.price_event_metadata:
             retained_ids = {item.id for item in manifest.evidence}
             manifest.evidence.extend(
@@ -946,12 +963,12 @@ class VideoFactory:
             raise ValueError("segmented editorial rendering needs one evidence_shot per compiled scene")
         evidence_by_id = {item.id: item for item in manifest.evidence}
         derived_families = {"quote_card", "timeline", "impact_card", "stat_card"}
+        radar = manifest.render_profile == InformationRenderProfile.RADAR_V2.value
         segments: list[TrackSegment] = []
         sidecar_parts: list[dict[str, object]] = []
-        # Evidence and tweet cards contain dense text. Direct crossfades make
-        # both cards readable at once for several frames, so editorial tracks
-        # use clean cuts; motion remains inside real browser captures.
-        fade = 0.0
+        # A 150ms micro-crossfade removes hard flashes without lingering long
+        # enough to make two dense evidence cards compete for attention.
+        transition = 0.15 if radar else 0.0
         for index, (scene, shot) in enumerate(zip(manifest.scenes, brief.evidence_shots), start=1):
             cited = next((evidence_by_id[item] for item in scene.evidence_ids if item in evidence_by_id), None)
             if cited is None:
@@ -969,7 +986,9 @@ class VideoFactory:
                     raise ValueError(f"source image {image_evidence.id} has no archived asset")
                 asset = self.workspace.root / image_evidence.captured_asset
                 frame = render_source_image(scene, image_evidence, asset, job / f"source-image-{index}.png")
-                part = tweet_card_video(frame, scene.duration, job / f"source-image-{index}.mp4")
+                part = tweet_card_video(
+                    frame, scene.duration, job / f"source-image-{index}.mp4", motion=radar,
+                )
                 duration = scene.duration
                 local_shots = [{
                     "id": scene.id, "action": "source_image", "start": 0, "end": duration,
@@ -979,7 +998,9 @@ class VideoFactory:
                 family == "code" and cited.source_kind == "x:referenced_context_post"
             ):
                 frame = render_editorial_card(scene, cited, job / f"editorial-card-{index}.png", family)
-                part = tweet_card_video(frame, scene.duration, job / f"editorial-card-{index}.mp4")
+                part = tweet_card_video(
+                    frame, scene.duration, job / f"editorial-card-{index}.mp4", motion=radar,
+                )
                 duration = scene.duration
                 local_shots = [{
                     "id": scene.id, "action": family, "start": 0, "end": duration,
@@ -989,7 +1010,9 @@ class VideoFactory:
                 if not cited.source_kind.startswith("x:"):
                     raise ValueError(f"tweet_card {scene.id} must cite archived X evidence")
                 frame = render_tweet_card(candidate, cited, scene, job / f"tweet-card-{index}.png")
-                part = tweet_card_video(frame, scene.duration, job / f"tweet-card-{index}.mp4")
+                part = tweet_card_video(
+                    frame, scene.duration, job / f"tweet-card-{index}.mp4", motion=radar,
+                )
                 duration = scene.duration
                 local_shots = [{
                     "id": scene.id, "action": "tweet_card", "start": 0, "end": duration,
@@ -1010,16 +1033,19 @@ class VideoFactory:
                 duration = float(metadata.get("duration") or scene.duration)
                 local_shots = list(metadata.get("shots", []))
             segments.append(TrackSegment(part, duration))
-            offset = sum(item.duration for item in segments[:-1]) - fade * max(0, len(segments) - 1)
+            offset = sum(item.duration for item in segments[:-1])
             for local in local_shots:
                 shifted = dict(local)
                 shifted["start"] = round(float(local.get("start", 0)) + offset, 3)
                 shifted["end"] = round(float(local.get("end", duration)) + offset, 3)
                 sidecar_parts.append(shifted)
-        build_crossfade_track(segments, output, fade_seconds=fade)
+        if radar:
+            build_dip_to_color_track(segments, output, transition_seconds=transition)
+        else:
+            build_crossfade_track(segments, output, fade_seconds=0)
         sidecar = {
             "version": 1, "width": 1384, "height": 1602,
-            "duration": round(sum(item.duration for item in segments) - fade * max(0, len(segments) - 1), 3),
+            "duration": round(sum(item.duration for item in segments), 3),
             "shots": sidecar_parts,
         }
         output.with_suffix(".capture.json").write_text(
@@ -1094,6 +1120,7 @@ class VideoFactory:
         packet = StoryWriterPacket(
             ingest.candidate, evidence, TopicType.GITHUB_PROJECT, ContentType.EXPLAINER,
             options.duration or 20.0, editorial_direction=visual_context,
+            render_profile=options.render_profile,
         )
         def github_agent(
             active_writer: OpenAICompatibleStoryWriter,
@@ -1150,6 +1177,7 @@ class VideoFactory:
                 result["content_agent_error"] = str(trace_path)
                 raise
         manifest = run.manifest
+        manifest.render_profile = options.render_profile
         manifest_path = self.workspace.save_manifest(manifest)
         job_manifest = job / "manifest.json"
         shutil.copy2(manifest_path, job_manifest)

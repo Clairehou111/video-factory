@@ -66,6 +66,10 @@ def manifest_from_dict(data: dict[str, Any]) -> RenderManifest:
             opportunity=opportunity,
             context_graph=context_graph,
             director_brief=director_brief,
+            opening_mode=str(editorial_data.get("opening_mode", "")),
+            category_label=str(editorial_data.get("category_label", "")),
+            direct_identifier=str(editorial_data.get("direct_identifier", "")),
+            editorial_inference=str(editorial_data.get("editorial_inference", "")),
         )
         canonicalize_editorial_brief(editorial_brief, evidence)
     scenes = []

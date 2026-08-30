@@ -16,8 +16,9 @@ from urllib.request import Request, urlopen
 
 from .collection_publish import create_collection_publish_batch
 from .discovery import ChannelRun, DiscoveryChannel, ResourceDiscoveryRun
-from .models import RenderManifest, TopicType, VideoCollectionManifest
+from .models import InformationRenderProfile, RenderManifest, TopicType, VideoCollectionManifest
 from .publish import PublishBatchState, PublishPlatform, PublishTarget, create_publish_batch
+from .radar import build_tencent_radar_copy
 from .serde import load_collection_manifest, load_manifest
 
 
@@ -139,9 +140,15 @@ class DiscoveryPublishBridge:
         if not path_value:
             return PreparedPublishBatch(channel, candidate.id, "", reason="generated result has no manifest")
         manifest = load_manifest(Path(path_value))
-        title = (manifest.fixed_title or manifest.fixed_hook or candidate.title).strip()[:30]
         publisher = (candidate.publisher or candidate.author or "原始来源").strip()
-        description = f"来源：{publisher}｜{candidate.url}"
+        if getattr(manifest, "render_profile", "classic") == InformationRenderProfile.RADAR_V2.value:
+            title, description = build_tencent_radar_copy(
+                manifest, fallback_title=candidate.title, publisher=publisher,
+                source_url=candidate.url,
+            )
+        else:
+            title = (manifest.fixed_title or manifest.fixed_hook or candidate.title).strip()[:30]
+            description = f"来源：{publisher}｜{candidate.url}"
         topic = manifest.topic_type or candidate.topic_type or TopicType.LINKED_EXTERNAL_SOURCE
         tags = list(dict.fromkeys([*self.config.tencent_tags, *TOPIC_TAGS[topic]]))[:10]
         target = PublishTarget(

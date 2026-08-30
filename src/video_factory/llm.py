@@ -213,12 +213,15 @@ class OpenAICompatibleStoryWriter:
             "headline": editorial.get("headline"),
             "subheadline": editorial.get("subheadline"),
             "fixed_conclusion": editorial.get("fixed_conclusion") or draft.get("footer"),
+            "opening_mode": editorial.get("opening_mode"),
+            "category_label": editorial.get("category_label"),
+            "editorial_inference": editorial.get("editorial_inference"),
             "attention_strategy": editorial.get("attention_strategy"),
             "subjects": editorial.get("subjects"),
             "evidence_shots": [{
                 key: item.get(key) for key in (
                     "id", "fact", "audience_copy", "target", "translation",
-                    "full_translation", "evidence_ids", "context_event_ids",
+                    "full_translation", "evidence_ids", "context_event_ids", "narrative_beat",
                 )
             } for item in editorial.get("evidence_shots", []) if isinstance(item, dict)],
             "github_brief": github or None,
@@ -293,7 +296,8 @@ class OpenAICompatibleStoryWriter:
                 "A field path ending in .target is the exact source-language proof the browser will highlight, not Chinese copy. Ignore Chinese naturalness for targets. Pass it only when it is an exact contiguous substring of its cited evidence and directly supports that same shot's fact; topical proximity elsewhere on the page is insufficient. If the page supports the fact but this target points at a different claim, fail source_support and instruct replacement with the smallest exact supporting excerpt from the same cited evidence.",
                 "Reject when an actor, action, object, recipient, chronology, causal strength, or certainty differs from the evidence; when a concrete technical name is replaced by a vague category that makes the event harder to understand; when Chinese reads like literal translation, a report, or abstract consultant language; or when a screen cannot explain itself without narration. For a model/product story, reject a selected hook that omits the exact model/product name and names only its vendor, publisher, host, or benchmark.",
                 "For each field, first extract actor-action-object-recipient and certainty, then compare them with evidence. A naturalness score below 4 is fail. Unexplained English technical nouns inside Chinese prose are fail when the evidence lets you explain the concrete action. Keeping an official English feature name does not exempt it: the first audience-facing occurrence must immediately explain what the feature concretely gives or does in natural Chinese. The same rule applies to specialist Chinese metrics: if a hook/fact says 拒绝率、幻觉率、激活参数、上下文窗口 or a similarly non-obvious metric, the first relevant evidence shot must say in plain Chinese what it measures or means in practice; numbers alone are not an explanation. Preserve quantity, duration, recurrence, permission, and guarantee strength exactly: a one-time credit, reset, trial, exception, or temporary rollout cannot become permanent freedom from recurring limits or costs; free availability or free use does not prove commercial-use permission; support does not prove a guarantee; and an open-source repository does not transfer third-party asset licenses. Unsupported mechanisms, policies, risks, permissions, or advice are fail.",
-                "For headline, selected_hook, fixed_conclusion, GitHub hook_opening, and GitHub footer, also judge short-video attention. A score below 4 is fail. GitHub hook_reveal and hook_verdict must add a clear new capability and payoff, but they do not each need to manufacture another standalone conflict after hook_opening has earned attention. Calibrate strictly: 1 is vague filler; 2 is a generic topic; 3 is an accurate actor-plus-event or project-plus-capability summary that gives little reason to watch the next screen; 4 adds a specific evidence-backed contradiction, workflow contrast, surprise, consequence, relief, scale, or open question and is materially more compelling than the stable project title; 5 is both immediately clear and unusually memorable. A GitHub opening written as 项目名：功能, 项目名能做某事, or a feature list is capped at 3 even when accurate. A strong hook creates an information gap without hiding the event. A headline copied into selected_hook with only a colon or minor wording change cannot score 4. Generic phrases such as 引发讨论、值得关注、注意风险、生态竞争 or a neutral topic label are not a payoff. The fixed conclusion or GitHub footer must deliver a clear evidence-backed view or memorable consequence, not merely repeat the event or give ritual caution.",
+                "For headline, selected_hook, fixed_conclusion, GitHub hook_opening, and GitHub footer, also judge short-video attention. A score below 4 is fail. Do not require shock: when opening_mode is direct_fact, a crisp named actor + important concrete change can score 4 without conflict or an information gap. conflict, counter_intuitive, and developer_roi must be earned by evidence. GitHub hook_reveal and hook_verdict must add a clear new capability and payoff, but they do not each need another standalone conflict. Calibrate strictly: 1 is vague filler; 2 is a generic topic; 3 is an accurate but low-stakes label; 4 is immediately clear and gives the intended audience a concrete reason to keep watching through the event itself, a verified contrast, surprise, consequence, relief, scale, ROI, or honest open question; 5 is unusually memorable without enlarging the claim. Generic phrases such as 引发讨论、值得关注、注意风险、生态竞争 or a neutral topic label are not a payoff. The fixed conclusion or GitHub footer must deliver a clear evidence-backed view or memorable consequence, not merely repeat the event or give ritual caution.",
+                "If editorial_inference is non-empty, it must be the selected question-form hook. Judge the proof and takeaway as false if they silently promote that question into a fact. category_label is optional factual navigation only; never demand one and reject evaluative labels that are not source facts.",
                 "Every repair_instruction is evidence-bound too. Never propose an example sentence containing a date, quantity, rollout scope, default behavior, first/only/all/complete superlative, licensing permission, official policy, mechanism, or capability absent from the supplied evidence. If stronger attention cannot be earned by another verified fact, improve the stance and concrete wording around the existing fact instead of inventing one.",
                 "For a fixed_conclusion repair, end on the strongest verified impact, payoff, or concrete action. Never instruct the writer to append 未知、有待观察、有待验证、进一步研究、需关注后续 or an equivalent ritual caveat; move a decision-critical scope limit to its own evidence field instead.",
                 "Treat Chinese scope and novelty words as claims that require exact support. 全面、全部、所有、任何、彻底、完全、首次、第一次、唯一 must fail when the cited evidence does not prove the same actor, object, time, and coverage. In particular, supported models, where supported, new models, or across products cannot be broadened to 全面/全部, and a newly visible repository cannot become 首次/第一次/唯一. Do not excuse these words as emotion or style.",
@@ -634,6 +638,10 @@ class OpenAICompatibleStoryWriter:
             "headline": "corrected concrete Chinese headline",
             "subheadline": "new source-backed information",
             "fixed_conclusion": "assertive verified payoff, no unknown/missing-detail clause",
+            "opening_mode": "direct_fact|conflict|counter_intuitive|developer_roi",
+            "category_label": "optional factual label or empty",
+            "direct_identifier": "exact evidence-backed identifier or empty",
+            "editorial_inference": "question-form inference or empty",
             "hook_fact": "verified event", "conflict": "verified tension or rollout sequence",
             "surprise": "verified surprising detail or empty", "stakes": "verified affected audience/scope",
             "stance": "specific evidence-backed view", "payoff": "distinct verified answer",
@@ -670,7 +678,7 @@ class OpenAICompatibleStoryWriter:
                 "Every shot must add a different fact. Do not paraphrase the same scope or result twice. "
                 "Keep production metadata separate from visible copy. question, interpretation, relation_to_previous, retention_job, and director_brief are internal. audience_copy is the only optional second line shown to viewers: make it a declarative subject/fact/comparison/impact sentence, or return an empty string. Never put reading guidance, viewing guidance, learning advice, expected-weight instructions, or editor commands in audience_copy. "
                 "When the root quotes an earlier post, shot 2 relation_to_previous must explicitly say 此前先预告/承诺, so the current root reads as 随后落地. "
-                "Retain energy through specificity and named actors—not mystery about absent details. For retention_hook/payoff issues, rebuild headline, selected_hook, and fixed_conclusion around the strongest verified contradiction, surprise, consequence, or unresolved tension. Use a direct evidence-backed stance; generic 引发讨论、值得关注、注意风险 and neutral topic labels are not a hook or payoff. Do not manufacture outrage or certainty.",
+                "Retain energy through specificity and named actors—not mystery about absent details. For retention_hook/payoff issues, choose direct_fact when the event itself is strong; otherwise use only a verified contradiction, surprise, consequence, ROI, or an explicit unresolved question. Do not manufacture outrage, an incumbent comparison, or certainty. Preserve opening_mode/category_label/direct_identifier/editorial_inference using the Radar contract.",
                 (
                     "The last changing shot currently ends on an unknown or caution. Rewrite it to the strongest completed, verified event/result already in evidence (named actor + action + result). Do not mention pending appeals, missing policy, risk advice, or wait-and-see language in the final shot."
                     if "final changing shot" in validation_error else ""
@@ -715,6 +723,9 @@ class OpenAICompatibleStoryWriter:
         for name in ("headline", "subheadline", "fixed_conclusion"):
             if patch.get(name):
                 repaired_editorial[name] = patch[name]
+        for name in ("opening_mode", "category_label", "direct_identifier", "editorial_inference"):
+            if name in patch:
+                repaired_editorial[name] = str(patch.get(name) or "")
         repaired_editorial["attention_strategy"] = {
             name: patch[name] for name in (
                 "hook_fact", "conflict", "surprise", "stakes", "stance", "payoff",
@@ -1109,6 +1120,10 @@ class OpenAICompatibleStoryWriter:
                 opportunity=packet.opportunity,
                 context_graph=graph,
                 director_brief=director_brief,
+                opening_mode=str(editorial_data.get("opening_mode", "")),
+                category_label=str(editorial_data.get("category_label", "")),
+                direct_identifier=str(editorial_data.get("direct_identifier", "")),
+                editorial_inference=str(editorial_data.get("editorial_inference", "")),
             )
             canonicalize_editorial_brief(editorial_brief, packet.evidence)
         if packet.topic_type == TopicType.GITHUB_PROJECT and brief:
