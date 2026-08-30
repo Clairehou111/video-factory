@@ -279,6 +279,57 @@ class LLMTransportTests(unittest.TestCase):
         self.assertEqual(issues, [])
         self.assertEqual(requested.call_count, 2)
         self.assertTrue(provenance["review_retried"])
+        retry_prompt = requested.call_args_list[1].args[0][-1]["content"]
+        fields_payload = retry_prompt.split("Fields: ", 1)[1].split("\nVisible copy:", 1)[0]
+        self.assertEqual(
+            set(json.loads(fields_payload)), {"editorial_brief.fixed_conclusion"},
+        )
+
+    def test_visible_copy_review_accepts_short_evidence_shot_field_aliases(self) -> None:
+        writer = OpenAICompatibleStoryWriter(LLMSettings(
+            "openrouter", "https://openrouter.example/api/v1", "test-key", "cheap-model",
+        ))
+        candidate = Candidate(
+            "tweet-1", SourceType.TWEET, "https://x.com/vendor/status/1", "Update",
+        )
+        evidence = Evidence(
+            "evidence-1", candidate.id, candidate.source_url,
+            "Vendor shipped a concrete update.", "x:thread_post",
+        )
+        packet = StoryWriterPacket(
+            candidate, [evidence], TopicType.PRACTICE_POST, ContentType.FLASH, 12,
+        )
+
+        def review(messages, max_tokens):
+            fields_line = next(
+                line for line in messages[-1]["content"].splitlines() if line.startswith("Fields: ")
+            )
+            paths = json.loads(fields_line.removeprefix("Fields: "))
+            rows = []
+            for path in paths:
+                if path.endswith(".translation"):
+                    returned_path = "shot-1.translation"
+                else:
+                    returned_path = path.removeprefix("editorial_brief.") if "evidence_shots[" in path else path
+                rows.append({
+                    "field_path": returned_path, "verdict": "pass",
+                    "actor_action_object_recipient": "", "certainty": "fact",
+                    "naturalness_score": 5, "attention_score": 4,
+                    "evidence_ids": [evidence.id], "category": "none",
+                    "problem": "", "repair_instruction": "",
+                })
+            return {"approved": True, "field_reviews": rows}, {"model": "critic"}
+
+        with patch.object(writer, "_request_json", side_effect=review) as requested:
+            issues, _ = writer.review_visible_copy(packet, {
+                "editorial_brief": {"evidence_shots": [{
+                    "id": "shot-1", "fact": "厂商交付具体更新",
+                    "translation": "厂商已经交付这项更新", "evidence_ids": [evidence.id],
+                }]},
+            })
+
+        self.assertEqual(issues, [])
+        self.assertEqual(requested.call_count, 1)
 
     def test_http_200_invalid_json_is_retried(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(

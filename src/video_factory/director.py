@@ -139,7 +139,15 @@ class StoryboardDirector:
         # 12.000000000000002. Treat that as the requested 12.0 seconds rather
         # than sending a valid story back through another expensive LLM loop.
         if cursor > request.target_duration + 0.001:
-            raise ValueError(f"proposal needs {cursor:.1f}s but target is {request.target_duration:.1f}s; choose a longer format instead of deleting causality")
+            if request.content_type == ContentType.FLASH and cursor <= 15.0:
+                # A ten-second Radar target is a pacing goal, not permission to
+                # crush readable evidence. Keep the Flash format and extend
+                # only as far as the already-selected shots require.
+                request.target_duration = round(cursor, 3)
+                if request.editorial_brief:
+                    request.editorial_brief.duration_target = request.target_duration
+            else:
+                raise ValueError(f"proposal needs {cursor:.1f}s but target is {request.target_duration:.1f}s; choose a longer format instead of deleting causality")
         if scenes[0].start > 0 or not scenes[0].caption.strip():
             raise ValueError("the first scene must state the topic, source, or result immediately")
 

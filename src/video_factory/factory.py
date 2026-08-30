@@ -157,7 +157,11 @@ class VideoFactory:
             return
 
         job_manifest = job / "manifest.json"
-        shutil.copy2(cache, job_manifest)
+        serialized = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        job_manifest.write_text(serialized, encoding="utf-8")
+        cache_tmp = cache.with_suffix(cache.suffix + ".tmp")
+        cache_tmp.write_text(serialized, encoding="utf-8")
+        cache_tmp.replace(cache)
         result["stages"].append({"name": "generation_cache", "status": "hit", "manifest": str(cache)})
         result["manifest"] = str(job_manifest)
         if options.render:
@@ -1226,6 +1230,12 @@ class VideoFactory:
         self, writer: OpenAICompatibleStoryWriter, options: GenerateOptions,
     ) -> tuple[OpenAICompatibleStoryWriter, dict[str, object]]:
         """Choose an independent low-cost critic; never let the writer grade itself when avoidable."""
+        if writer.settings.provider == "openrouter" and os.environ.get("DEEPSEEK_API_KEY"):
+            settings = LLMSettings.from_environment("deepseek", None)
+            return OpenAICompatibleStoryWriter(settings), {
+                "provider": "deepseek", "model": settings.model,
+                "reason": "cross-provider critic avoids a shared OpenRouter failure domain",
+            }
         if os.environ.get("OPENROUTER_API_KEY"):
             try:
                 quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(

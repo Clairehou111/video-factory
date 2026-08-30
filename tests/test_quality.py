@@ -170,6 +170,34 @@ class QualityTest(unittest.TestCase):
         duration_check = next(item for item in validate_manifest(manifest) if item.name == "duration_band")
         self.assertTrue(duration_check.passed)
 
+    def test_flash_extends_to_readable_runtime_without_changing_format(self) -> None:
+        candidate = Candidate(
+            "flash-1", SourceType.OFFICIAL_ANNOUNCEMENT,
+            "https://example.com/update", "Update",
+        )
+        evidence = Evidence("e-1", candidate.id, candidate.source_url, "Verified update", "web:page")
+        proposals = [
+            SceneProposal(
+                f"shot-{index}", "note", f"fact-{index}", MaterialRole.PROOF,
+                "show source", [evidence.id], ["event"], duration_hint=duration,
+            )
+            for index, duration in enumerate((3.8, 3.9, 3.9), start=1)
+        ]
+        request = StoryboardRequest(
+            "m-flash", candidate, TopicType.OFFICIAL_ANNOUNCEMENT, ContentType.FLASH,
+            [evidence], "结论", [
+                NarrativeAnswer(beat, beat, [evidence.id])
+                for beat in ("event", "official_change", "impact", "effective_scope")
+            ],
+            proposals, 10,
+        )
+
+        manifest = StoryboardDirector().direct(request)
+
+        self.assertEqual(manifest.content_type, ContentType.FLASH)
+        self.assertAlmostEqual(manifest.duration, 11.6)
+        self.assertAlmostEqual(request.target_duration, 11.6)
+
     def test_github_quality_rejects_unsupported_prototype_downgrade(self) -> None:
         candidate = Candidate("c", SourceType.GITHUB, "https://github.com/a/b", "a/b")
         evidence = Evidence("e", "c", candidate.source_url, "A useful production workflow", "github:readme")

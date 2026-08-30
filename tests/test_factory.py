@@ -119,6 +119,29 @@ class VideoFactoryTest(unittest.TestCase):
             self.assertEqual(editorial_agent.call_args_list[0].kwargs["max_llm_calls"], 6)
             self.assertEqual(editorial_agent.call_args_list[1].kwargs["max_llm_calls"], 14)
 
+    def test_openrouter_writer_uses_cross_provider_deepseek_critic(self) -> None:
+        with TemporaryDirectory() as temp:
+            factory = VideoFactory(Workspace(Path(temp) / "workspace"))
+            writer = MagicMock()
+            writer.settings.provider = "openrouter"
+            writer.settings.model = "google/gemini-3.7-flash"
+            deepseek_settings = MagicMock()
+            deepseek_settings.provider = "deepseek"
+            deepseek_settings.model = "deepseek-chat"
+
+            with (
+                patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=False),
+                patch("video_factory.factory.LLMSettings.from_environment", return_value=deepseek_settings),
+                patch("video_factory.factory.OpenAICompatibleStoryWriter") as reviewer_class,
+                patch("video_factory.factory.OpenRouterCatalog.select") as select,
+            ):
+                reviewer, selection = factory._copy_reviewer(writer, GenerateOptions())
+
+            self.assertIs(reviewer, reviewer_class.return_value)
+            self.assertEqual(selection["provider"], "deepseek")
+            self.assertIn("failure domain", selection["reason"])
+            select.assert_not_called()
+
     def test_explicit_trigger_uncertainty_requires_adjacent_visible_qualification(self) -> None:
         evidence = [Evidence(
             "e-uncertain", "tweet-1", "https://x.com/example/status/1",
@@ -197,6 +220,34 @@ class VideoFactoryTest(unittest.TestCase):
                 GenerateOptions(render=False, render_profile="radar_v2"),
             )
             self.assertNotEqual(classic, radar)
+
+    def test_generation_cache_hit_persists_loaded_manifest_migrations(self) -> None:
+        with TemporaryDirectory() as temp:
+            factory = VideoFactory(Workspace(Path(temp) / "workspace"))
+            factory.workspace.initialize()
+            options = GenerateOptions(render=False)
+            url = "https://github.com/acme/demo"
+            cache = factory._generation_cache_path(url, options)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text('{"stale": true}\n', encoding="utf-8")
+            job = Path(temp) / "job"
+            job.mkdir()
+            result: dict[str, object] = {"stages": []}
+
+            with (
+                patch("video_factory.factory.load_manifest", return_value=basic_manifest()),
+                patch("video_factory.factory.validate_manifest", return_value=[]),
+            ):
+                factory._generate_cached_manifest("github", url, job, options, result)
+
+            self.assertEqual(
+                json.loads((job / "manifest.json").read_text(encoding="utf-8"))["fixed_footer"],
+                "conclusion",
+            )
+            self.assertEqual(
+                json.loads(cache.read_text(encoding="utf-8"))["fixed_footer"],
+                "conclusion",
+            )
 
     def test_github_render_applies_license_and_budgets_cold_open(self) -> None:
         with TemporaryDirectory() as temp:

@@ -475,5 +475,148 @@
     "tests": [
       "tests/test_editorial.py::EditorialContractTests::test_source_kind_and_story_topic_are_routed_independently"
     ]
+  },
+  {
+    "id": "VF-20260831-042",
+    "title": "Copy critic re-reviewed the entire script when only a few fields were missing",
+    "stage": "content_agent",
+    "reproduction": "Have the critic omit several translation fields from an otherwise complete review, then repeat the same full review request.",
+    "impact": "The second call was slower, could omit the same fields again, and forced a grounded Radar draft into the expensive fallback writer instead of completing the missing checks.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_retries_when_critic_omits_a_field"
+    ]
+  },
+  {
+    "id": "VF-20260831-043",
+    "title": "Radar width canonicalization severed a conclusion mid-claim",
+    "stage": "content_agent",
+    "reproduction": "Return a fixed conclusion longer than 40 equivalents whose width boundary falls inside a final named item such as Boris Cherny.",
+    "impact": "The persistent takeaway rail displayed an incomplete name and could claim that there were three facts while showing only two, reducing both readability and factual integrity.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_conclusion_uses_complete_existing_stance_instead_of_severing_name"
+    ]
+  },
+  {
+    "id": "VF-20260831-044",
+    "title": "Audience glossary injection could overflow a canonical Radar shot",
+    "stage": "content_agent",
+    "reproduction": "Canonicalize a 40-equivalent Radar fact, then inject the required plain-language definition of refusal rate.",
+    "impact": "A deterministic readability enhancement made the same shot fail the deterministic screen budget and triggered repeated semantic repair calls.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_reapplies_width_budget_after_glossary_injection"
+    ]
+  },
+  {
+    "id": "VF-20260831-045",
+    "title": "Radar hook required an entire delivery-suffixed model artifact name",
+    "stage": "content_agent",
+    "reproduction": "Use a model subject such as GLM-5.3-Flash-Uncensored-FP8 while the mobile hook names the exact base model GLM-5.3-Flash.",
+    "impact": "The validator rejected a factual, readable title because the full artifact suffix could not fit the mobile headline budget.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_model_hook_accepts_evidence_preserving_artifact_base_name"
+    ]
+  },
+  {
+    "id": "VF-20260831-046",
+    "title": "A context event could be both required and discarded",
+    "stage": "content_agent",
+    "reproduction": "Receive a context graph that places the same event ID in required_context_ids and discarded_context_ids.",
+    "impact": "Canonicalization selected the required event while validation simultaneously treated it as leaked discarded research, making the brief impossible to satisfy.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_required_context_wins_over_conflicting_discarded_label"
+    ]
+  },
+  {
+    "id": "VF-20260831-047",
+    "title": "Readable Flash timing was rejected for exceeding an aspirational ten-second target",
+    "stage": "director",
+    "reproduction": "Generate a complete three-shot Flash whose balanced evidence holds need 11.6 seconds against a 10-second target.",
+    "impact": "The factory discarded a valid concise story and invoked a rate-limited fallback model instead of honoring the product rule to hold denser screens slightly longer.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_flash_extends_to_readable_runtime_without_changing_format"
+    ]
+  },
+  {
+    "id": "VF-20260831-048",
+    "title": "Copy critic shorthand paths looked like omitted translation reviews",
+    "stage": "content_agent",
+    "reproduction": "Have the semantic critic return evidence_shots[0].translation instead of the requested editorial_brief.evidence_shots[0].translation path.",
+    "impact": "All translation checks were present but discarded as unknown aliases, so the agent repeated the review and then abandoned both primary and fallback drafts.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_accepts_short_evidence_shot_field_aliases"
+    ]
+  },
+  {
+    "id": "VF-20260831-049",
+    "title": "Generation cache validated migrations but copied stale JSON into the job",
+    "stage": "content_agent",
+    "reproduction": "Load a cached manifest that is normalized by the current serializer, pass validation, and then create a new job from that cache hit.",
+    "impact": "The in-memory fixed conclusion passed validation while the new job still received the old truncated conclusion from disk.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_generation_cache_hit_persists_loaded_manifest_migrations"
+    ]
+  },
+  {
+    "id": "VF-20260831-050",
+    "title": "Direct-fact openings were forced to manufacture a conflict",
+    "stage": "content_agent",
+    "reproduction": "Return a grounded Radar brief with opening_mode=direct_fact and an intentionally empty attention_strategy.conflict.",
+    "impact": "The validator contradicted the adaptive opening contract and sent a complete factual update into semantic repair solely to invent tension.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_direct_fact_does_not_invent_a_conflict"
+    ]
+  },
+  {
+    "id": "VF-20260831-051",
+    "title": "Multi-model price monitor was forced into a single-model headline",
+    "stage": "content_agent",
+    "reproduction": "Generate the OpenRouter discount index while its brief contains several model subjects and the hook correctly describes the cross-provider price page.",
+    "impact": "The generic model validator selected one batch model as the mandatory subject and rejected the more accurate price-monitor story angle.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_multi_model_price_monitor_does_not_require_one_model_in_hook"
+    ]
+  },
+  {
+    "id": "VF-20260831-052",
+    "title": "Copy critic shot-ID field paths were discarded as unknown",
+    "stage": "content_agent",
+    "reproduction": "Have the critic return shot-1.translation rather than editorial_brief.evidence_shots[0].translation.",
+    "impact": "Valid per-shot semantic reviews were treated as omissions, causing a redundant supplemental review and eventual fallback failure.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_accepts_short_evidence_shot_field_aliases"
+    ]
+  },
+  {
+    "id": "VF-20260831-053",
+    "title": "Fallback writer and critic shared the same OpenRouter failure domain",
+    "stage": "content_agent",
+    "reproduction": "Escalate from a DeepSeek writer to an OpenRouter Gemini writer while the reviewer selector also chooses another OpenRouter model.",
+    "impact": "An OpenRouter timeout or malformed review could take down both fallback generation and independent review, discarding an otherwise recoverable draft.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_openrouter_writer_uses_cross_provider_deepseek_critic"
+    ]
+  },
+  {
+    "id": "VF-20260831-054",
+    "title": "Radar screen budget rendered optional copy as sentence fragments",
+    "stage": "content_agent",
+    "reproduction": "Place a near-40-equivalent fact above an optional audience line such as 'OpenRouter 模型库可直接筛选折扣线路'.",
+    "impact": "The canonicalizer filled the few remaining equivalents with fragments such as 'OpenRouter 模' or '单价降至每秒', making the finished frame look broken.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_drops_optional_second_line_instead_of_showing_a_fragment"
+    ]
   }
 ]

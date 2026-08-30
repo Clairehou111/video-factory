@@ -15,12 +15,14 @@ from video_factory.compositor import (
     _radar_metadata, compose_information_frame, render_direct_identifier_badge,
     render_spotlight_overlay,
 )
-from video_factory.editorial import _validate_radar_contract, canonicalize_editorial_brief
+from video_factory.editorial import (
+    _validate_radar_contract, canonicalize_editorial_brief, validate_editorial_structure,
+)
 from video_factory.github_editor import copy_width
 from video_factory.models import (
-    AttentionStrategy, Candidate, ContentType, EditorialBrief, Evidence, EvidenceShot,
-    EvidenceShotKind, InformationRenderProfile, MaterialRole, RenderManifest, Scene,
-    SourceType, StorySubject, TopicType,
+    AttentionStrategy, Candidate, ContentType, ContextGraph, DirectorBrief, EditorialBrief,
+    Evidence, EvidenceShot, EvidenceShotKind, InformationRenderProfile, MaterialRole,
+    RenderManifest, Scene, SourceType, StorySubject, TopicType,
 )
 from video_factory.radar import (
     AdvisoryRecoveryAction, TechnicalArtifactKind, build_tencent_radar_copy,
@@ -119,6 +121,7 @@ class RadarV2Test(unittest.TestCase):
         self.assertIn(brief.attention_strategy.selected_hook, brief.attention_strategy.hook_candidates)
         self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 28)
         self.assertLessEqual(copy_width(brief.fixed_conclusion), 40)
+
         self.assertLessEqual(
             copy_width(brief.evidence_shots[0].fact + brief.evidence_shots[0].audience_copy), 40,
         )
@@ -133,6 +136,168 @@ class RadarV2Test(unittest.TestCase):
             ["opening", "proof", "takeaway"],
         )
         self.assertEqual(brief.editorial_inference, "")
+
+    def test_radar_conclusion_uses_complete_existing_stance_instead_of_severing_name(self) -> None:
+        brief = _brief()
+        brief.fixed_conclusion = (
+            "截图能证明的只有三件事：封号申诉公开发生、Tibo 否认自己是 Anthropic 员工、"
+            "Boris Cherny 发布招聘回复，但三者没有已证实的因果关系"
+        )
+        brief.attention_strategy.stance = (
+            "截图只证明申诉、否认和招聘回复同时出现，不代表三者有因果"
+        )
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(
+            brief.fixed_conclusion,
+            "截图只证明申诉、否认和招聘回复同时出现，不代表三者有因果",
+        )
+        self.assertLessEqual(copy_width(brief.fixed_conclusion), 40)
+
+        brief.fixed_conclusion = (
+            "截图能证明的只有三件事：封号申诉公开发生、Tibo 否认自己是 Anthropic 员工、Boris"
+        )
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+        self.assertEqual(
+            brief.fixed_conclusion,
+            "截图只证明申诉、否认和招聘回复同时出现，不代表三者有因果",
+        )
+
+    def test_radar_reapplies_width_budget_after_glossary_injection(self) -> None:
+        brief = _brief()
+        brief.evidence_shots[0].fact = "GLM-5.3-Flash 拒答率从 96% 降至 11%"
+        brief.evidence_shots[0].audience_copy = ""
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertIn("拒绝回答", brief.evidence_shots[0].audience_copy)
+        self.assertLessEqual(
+            copy_width(brief.evidence_shots[0].fact + brief.evidence_shots[0].audience_copy),
+            40,
+        )
+
+        fp8_brief = _brief()
+        fp8_brief.evidence_shots[0].fact = "GLM-5.3-Flash 发布原生 FP8 权重"
+        fp8_brief.evidence_shots[0].audience_copy = ""
+        fp8_brief.evidence_shots[0].translation = ""
+        fp8_brief.evidence_shots[0].full_translation = ""
+        fp8_brief.evidence_shots = fp8_brief.evidence_shots[:1]
+        fp8_brief.attention_strategy.hook_candidates = [
+            "GLM-5.3-Flash 发布 FP8 权重",
+            "OrcaRouter 开放模型权重",
+            "模型权重进入安全研究",
+        ]
+        fp8_brief.attention_strategy.selected_hook = fp8_brief.attention_strategy.hook_candidates[0]
+        canonicalize_editorial_brief(fp8_brief, [_manifest().evidence[0]])
+        self.assertIn("低数值精度", fp8_brief.evidence_shots[0].audience_copy)
+        self.assertLessEqual(
+            copy_width(
+                fp8_brief.evidence_shots[0].fact + fp8_brief.evidence_shots[0].audience_copy
+            ),
+            40,
+        )
+
+    def test_radar_drops_optional_second_line_instead_of_showing_a_fragment(self) -> None:
+        brief = _brief()
+        brief.evidence_shots[0].fact = (
+            "OpenRouter 模型库上线 Discounted 筛选标签，支持按折扣状态查找模型"
+        )
+        brief.evidence_shots[0].audience_copy = "OpenRouter 模型库可直接筛选折扣线路"
+        brief.evidence_shots[0].translation = ""
+        brief.evidence_shots[0].full_translation = ""
+        brief.evidence_shots = brief.evidence_shots[:1]
+        brief.attention_strategy.hook_candidates = [
+            "OpenRouter 新增折扣筛选",
+            "模型库直接显示优惠线路",
+            "调用前先查折扣状态",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(brief.evidence_shots[0].audience_copy, "")
+
+        for fragment in ("OpenRouter 模", "调用单价降至每秒", "视频生成模型直接"):
+            with self.subTest(fragment=fragment):
+                cached = _brief()
+                cached.evidence_shots[0].fact = "OpenRouter 显示折扣模型"
+                cached.evidence_shots[0].audience_copy = fragment
+                cached.evidence_shots[0].translation = ""
+                cached.evidence_shots[0].full_translation = ""
+                cached.evidence_shots = cached.evidence_shots[:1]
+                cached.attention_strategy.hook_candidates = [
+                    "OpenRouter 新增折扣筛选", "模型库显示优惠线路", "调用前查看折扣状态",
+                ]
+                cached.attention_strategy.selected_hook = cached.attention_strategy.hook_candidates[0]
+                canonicalize_editorial_brief(cached, [_manifest().evidence[0]])
+                self.assertEqual(cached.evidence_shots[0].audience_copy, "")
+
+    def test_radar_model_hook_accepts_evidence_preserving_artifact_base_name(self) -> None:
+        brief = _brief()
+        brief.subjects = [
+            StorySubject(
+                "GLM-5.3-Flash-Uncensored-FP8", "model", "发布权重", "开放研究", ["e-1"],
+            )
+        ]
+        brief.attention_strategy.hook_candidates = [
+            "GLM-5.3-Flash 拒答率降至 11%",
+            "OrcaRouter 发布原生 FP8 权重",
+            "拒答未归零暴露更复杂对齐机制",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+        candidate = Candidate("c-1", SourceType.WEB, "https://example.com/model", "Model")
+        errors = validate_editorial_structure(
+            brief, candidate, [_manifest().evidence[0]], TopicType.MODEL_OR_PRODUCT,
+            ContentType.FLASH,
+        )
+        self.assertFalse(any("concrete model subject" in error for error in errors))
+
+    def test_radar_direct_fact_does_not_invent_a_conflict(self) -> None:
+        brief = _brief(opening_mode="direct_fact")
+        brief.attention_strategy.conflict = ""
+        candidate = Candidate("c-1", SourceType.WEB, "https://example.com/update", "Update")
+        errors = validate_editorial_structure(
+            brief, candidate, [_manifest().evidence[0]], TopicType.MODEL_OR_PRODUCT,
+            ContentType.FLASH,
+        )
+        self.assertFalse(any("attention_strategy.conflict" in error for error in errors))
+
+    def test_multi_model_price_monitor_does_not_require_one_model_in_hook(self) -> None:
+        brief = _brief(opening_mode="direct_fact")
+        brief.subjects = [
+            StorySubject("Gemini 3.7 Flash (batch)", "model", "参与折扣", "价格变化", ["e-1"]),
+        ]
+        brief.attention_strategy.hook_candidates = [
+            "OpenRouter 折扣页列出多条低价线路",
+            "同一模型不同线路价格拉开",
+            "调用前先核对折扣线路",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        evidence = _manifest().evidence[0]
+        evidence.url = "https://openrouter.ai/models?discount=true"
+        candidate = Candidate("c-1", SourceType.WEB, evidence.url, "Discount models")
+        canonicalize_editorial_brief(brief, [evidence])
+        errors = validate_editorial_structure(
+            brief, candidate, [evidence], TopicType.MODEL_OR_PRODUCT, ContentType.FLASH,
+        )
+        self.assertFalse(any("concrete model subject" in error for error in errors))
+        self.assertIn("OpenRouter", brief.attention_strategy.selected_hook)
+
+    def test_radar_required_context_wins_over_conflicting_discarded_label(self) -> None:
+        brief = _brief()
+        brief.context_graph = ContextGraph(
+            required_context_ids=["ctx-1"], discarded_context_ids=["ctx-1"],
+        )
+        brief.director_brief = DirectorBrief(
+            "thesis", "tension", "neutral", 1, [], [], 10, "trigger",
+        )
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertIn("ctx-1", brief.director_brief.selected_context_ids)
+        self.assertNotIn("ctx-1", brief.context_graph.discarded_context_ids)
 
     def test_radar_web_opening_does_not_get_tweet_translation_budget(self) -> None:
         brief = _brief()

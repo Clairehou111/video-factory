@@ -346,6 +346,16 @@ class OpenAICompatibleStoryWriter:
                 "fixed_conclusion": "editorial_brief.fixed_conclusion",
                 "selected_hook": "editorial_brief.attention_strategy.selected_hook",
             }
+            if not github:
+                for index, shot in enumerate(visible["evidence_shots"]):
+                    shot_id = str(shot.get("id") or "").strip()
+                    if not shot_id:
+                        continue
+                    for name in ("fact", "audience_copy", "target", "translation", "full_translation"):
+                        canonical = f"editorial_brief.evidence_shots[{index}].{name}"
+                        editorial_aliases[f"{shot_id}.{name}"] = canonical
+                        editorial_aliases[f"evidence_shots[{shot_id}].{name}"] = canonical
+                        editorial_aliases[f"editorial_brief.evidence_shots[{shot_id}].{name}"] = canonical
             aliases = github_aliases if github else editorial_aliases
             for item in payload.get("field_reviews") or []:
                 if not isinstance(item, dict):
@@ -353,6 +363,8 @@ class OpenAICompatibleStoryWriter:
                 row = dict(item)
                 path = str(row.get("field_path") or "")
                 row["field_path"] = aliases.get(path, path)
+                if not github and re.fullmatch(r"evidence_shots\[\d+\]\.[a-z_]+", row["field_path"]):
+                    row["field_path"] = "editorial_brief." + row["field_path"]
                 rows.append(row)
             return rows
 
@@ -362,27 +374,41 @@ class OpenAICompatibleStoryWriter:
         # response, so 3.6K can end with finish_reason=length and no JSON.
         review, provenance = self._request_json(review_messages, max_tokens=7200)
         field_reviews = normalized_field_reviews(review)
-        returned_paths = {str(item.get("field_path") or "") for item in field_reviews}
-        if returned_paths != set(fields):
+        reviews_by_path = {
+            str(item.get("field_path") or ""): item for item in field_reviews
+            if str(item.get("field_path") or "") in fields
+        }
+        missing_paths = set(fields) - set(reviews_by_path)
+        if missing_paths:
             first_provenance = provenance
-            review, provenance = self._request_json(review_messages, max_tokens=7200)
+            missing_fields = {path: fields[path] for path in fields if path in missing_paths}
+            retry_messages = deepcopy(review_messages)
+            original_fields = "Fields: " + json.dumps(fields, ensure_ascii=False)
+            retry_fields = "Fields: " + json.dumps(missing_fields, ensure_ascii=False)
+            retry_messages[-1]["content"] = retry_messages[-1]["content"].replace(
+                original_fields, retry_fields,
+            )
+            review, provenance = self._request_json(retry_messages, max_tokens=3600)
             provenance = {
                 **provenance,
                 "review_retried": True,
+                "missing_fields": sorted(missing_paths),
                 "first_attempt": first_provenance,
             }
-            field_reviews = normalized_field_reviews(review)
-            returned_paths = {str(item.get("field_path") or "") for item in field_reviews}
-            if returned_paths != set(fields):
-                missing = sorted(set(fields) - returned_paths)
-                extra = sorted(returned_paths - set(fields))
+            for item in normalized_field_reviews(review):
+                path = str(item.get("field_path") or "")
+                if path in missing_paths:
+                    reviews_by_path[path] = item
+            unresolved = sorted(set(fields) - set(reviews_by_path))
+            if unresolved:
                 raise StoryDraftError(
                     review,
                     ValueError(
-                        "copy critic must review every viewer-facing field exactly once; "
-                        f"missing={missing}; extra={extra}"
+                        "copy critic omitted viewer-facing fields after one supplemental review; "
+                        f"missing={unresolved}"
                     ),
                 )
+        field_reviews = [reviews_by_path[path] for path in fields]
         issues = [{
             "field_path": item.get("field_path"), "category": item.get("category"),
             "problem": item.get("problem"), "evidence_ids": item.get("evidence_ids") or [],

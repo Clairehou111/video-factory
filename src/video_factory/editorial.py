@@ -21,6 +21,28 @@ RADAR_BANNED_COPY = (
     "关于这一问题的探讨", "值得关注",
 )
 
+
+def _model_subject_aliases(name: str) -> tuple[str, ...]:
+    """Return evidence-preserving display aliases for a model artifact name."""
+    normalized = name.strip()
+    if not normalized:
+        return ()
+    base = re.sub(
+        r"(?:[-_/](?:uncensored|abliterated|fp\d+|int\d+|gguf|mlx|awq|gptq|bnb))+$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip("-_/ ")
+    return tuple(dict.fromkeys(value for value in (normalized, base) if value))
+
+
+def _is_multi_model_price_evidence(evidence: list[Evidence]) -> bool:
+    return any(
+        "openrouter.ai/models" in item.url.casefold()
+        and "discount=true" in item.url.casefold()
+        for item in evidence
+    )
+
 # Explain one decision-critical specialist term at its first relevant shot.
 # Definitions are audience UI copy, not claims about the selected source.
 AUDIENCE_GLOSSARY: tuple[tuple[tuple[str, ...], str, str], ...] = (
@@ -102,6 +124,35 @@ def _clip_radar_copy(value: str, limit: float) -> str:
     return clipped
 
 
+def _complete_radar_conclusion(brief: EditorialBrief, limit: float = 40) -> str:
+    """Prefer a complete model-written takeaway over a severed long sentence.
+
+    Radar canonicalization is allowed to select existing copy, not invent new
+    claims.  A raw width clip can silently change meaning (for example, "only
+    three things" followed by two items) or leave an ASCII name hanging at the
+    rail edge.  The writer already supplies stance and payoff alternatives, so
+    use the first complete candidate that fits before falling back to clipping.
+    """
+    candidates = (
+        brief.fixed_conclusion,
+        brief.attention_strategy.stance,
+        brief.attention_strategy.payoff,
+    )
+    for index, candidate in enumerate(candidates):
+        normalized = re.sub(r"\s+", " ", candidate).strip().rstrip("。！？!?；;")
+        severed_list_name = index == 0 and bool(re.search(r"、[A-Z][A-Za-z0-9._-]*$", normalized))
+        if severed_list_name:
+            continue
+        if normalized and copy_width(normalized) <= limit:
+            return normalized
+    return _clip_radar_copy(brief.fixed_conclusion, limit)
+
+
+def _looks_like_radar_fragment(value: str) -> bool:
+    compact = re.sub(r"\s+", " ", value).strip().rstrip("，,：:")
+    return bool(re.search(r"(?:模|直接|每秒|从|至|为|在|与|和|或|的|把|将)$", compact))
+
+
 def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
     strategy = brief.attention_strategy
     if brief.opening_mode not in RADAR_OPENING_MODES:
@@ -131,16 +182,31 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
         strategy.hook_candidates[0] = strategy.selected_hook
 
     brief.headline = headline_copy(brief.headline)
-    brief.fixed_conclusion = _clip_radar_copy(brief.fixed_conclusion, 40)
+    brief.fixed_conclusion = _complete_radar_conclusion(brief, 40)
     for index, shot in enumerate(brief.evidence_shots):
         shot.narrative_beat = (
             "opening" if index == 0 else
             "takeaway" if index == len(brief.evidence_shots) - 1 else
             "proof"
         )
-        shot.fact = _clip_radar_copy(shot.fact, 40)
-        remaining = max(0.0, 40 - copy_width(shot.fact))
-        shot.audience_copy = _clip_radar_copy(shot.audience_copy, remaining) if remaining >= 4 else ""
+        audience_is_glossary = is_audience_glossary_definition(shot.audience_copy)
+        if audience_is_glossary and copy_width(shot.audience_copy) <= 32:
+            # The one plain-language definition is more valuable than a
+            # repeated long fact line. Reserve its full wording, then compact
+            # the evidence headline into the remaining screen budget.
+            audience_width = copy_width(shot.audience_copy)
+            shot.fact = _clip_radar_copy(shot.fact, max(8.0, 40 - audience_width))
+            shot.audience_copy = re.sub(r"\s+", " ", shot.audience_copy).strip()
+        else:
+            shot.fact = _clip_radar_copy(shot.fact, 40)
+            remaining = max(0.0, 40 - copy_width(shot.fact))
+            audience = re.sub(r"\s+", " ", shot.audience_copy).strip()
+            shot.audience_copy = (
+                audience
+                if remaining >= 4 and copy_width(audience) <= remaining
+                and not _looks_like_radar_fragment(audience)
+                else ""
+            )
         if shot.full_translation:
             shot.full_translation = _clip_radar_copy(
                 shot.full_translation,
@@ -150,6 +216,10 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
             shot.translation = _clip_radar_copy(shot.translation, 40)
 
     if brief.director_brief and brief.context_graph:
+        required = set(brief.context_graph.required_context_ids)
+        brief.context_graph.discarded_context_ids = [
+            item for item in brief.context_graph.discarded_context_ids if item not in required
+        ]
         brief.director_brief.selected_context_ids = list(dict.fromkeys([
             *brief.director_brief.selected_context_ids,
             *brief.context_graph.required_context_ids,
@@ -207,16 +277,17 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
         return score
 
     if strategy.hook_candidates and strategy.selected_hook in strategy.hook_candidates:
-        model_names = [
-            subject.name.strip() for subject in brief.subjects
+        model_aliases = [
+            alias for subject in brief.subjects
             if subject.subject_type.strip().casefold() == "model" and subject.name.strip()
+            for alias in _model_subject_aliases(subject.name)
         ]
         model_named_hooks = [
             hook for hook in strategy.hook_candidates
-            if any(name.casefold() in hook.casefold() for name in model_names)
+            if any(name.casefold() in hook.casefold() for name in model_aliases)
         ]
-        if model_named_hooks and not any(
-            name.casefold() in strategy.selected_hook.casefold() for name in model_names
+        if not _is_multi_model_price_evidence(evidence) and model_named_hooks and not any(
+            name.casefold() in strategy.selected_hook.casefold() for name in model_aliases
         ):
             # Select already-written model-specific copy instead of inventing
             # or prefixing prose in the execution layer.
@@ -226,6 +297,12 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
         if candidate_score(strongest) >= selected_score + 2.0:
             strategy.selected_hook = strongest
     _inject_audience_glossary(brief)
+    if brief.opening_mode:
+        # Glossary injection and hook ranking can change visible copy after the
+        # first normalization pass. Re-apply the deterministic width contract
+        # before validation so those useful additions cannot trigger an LLM
+        # repair loop.
+        _canonicalize_radar_contract(brief)
     hook_claims = "\n".join([
         strategy.hook_fact, strategy.conflict, strategy.stakes, strategy.stance,
         strategy.selected_hook, brief.headline, brief.subheadline,
@@ -1122,11 +1199,13 @@ def validate_editorial_structure(
     evidence_ids = {item.id for item in evidence}
     strategy = brief.attention_strategy
     for name, value in {
-        "hook_fact": strategy.hook_fact, "conflict": strategy.conflict,
+        "hook_fact": strategy.hook_fact,
         "stakes": strategy.stakes, "stance": strategy.stance, "payoff": strategy.payoff,
     }.items():
         if not value.strip():
             errors.append(f"attention_strategy.{name} is required")
+    if brief.opening_mode in {"conflict", "counter_intuitive"} and not strategy.conflict.strip():
+        errors.append("attention_strategy.conflict is required for the selected opening_mode")
     if len(strategy.hook_candidates) != 3:
         errors.append("attention_strategy must contain exactly three hook_candidates")
     if not strategy.selected_hook or strategy.selected_hook not in strategy.hook_candidates:
@@ -1140,8 +1219,9 @@ def validate_editorial_structure(
             subject.name.strip() for subject in brief.subjects
             if subject.subject_type.strip().casefold() == "model" and subject.name.strip()
         ]
-        if model_names and not any(
-            name.casefold() in strategy.selected_hook.casefold() for name in model_names
+        model_aliases = [alias for name in model_names for alias in _model_subject_aliases(name)]
+        if not _is_multi_model_price_evidence(evidence) and model_names and not any(
+            name.casefold() in strategy.selected_hook.casefold() for name in model_aliases
         ):
             errors.append(
                 "selected_hook must name the concrete model subject: " + ", ".join(model_names)
