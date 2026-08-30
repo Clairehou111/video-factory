@@ -362,5 +362,16 @@
     "tests": [
       "tests/test_radar.py::RadarV2Test::test_identifier_skips_huggingface_social_thumbnail_paths"
     ]
+  },
+  {
+    "id": "VF-20260830-032",
+    "title": "Empty Radar metadata rail reduced evidence height",
+    "stage": "composition",
+    "reproduction": "Render a tweet story such as Jeff Dean or Sam Altman with no package, repository, model identifier, or factual category label.",
+    "impact": "The compositor still reserved 88 pixels and drew a link-only badge, adding noise while shrinking the real evidence pane.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_story_without_identifier_or_fact_label_gets_no_empty_metadata_rail"
+    ]
   }
 ]

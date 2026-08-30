@@ -35,6 +35,12 @@ RADAR_META_RAIL = 88
 def _is_radar_v2(manifest: RenderManifest) -> bool:
     return str(manifest.render_profile or "classic") == InformationRenderProfile.RADAR_V2.value
 
+
+def _radar_metadata(manifest: RenderManifest) -> tuple[str, str]:
+    if not _is_radar_v2(manifest):
+        return "", ""
+    return extract_direct_identifier(manifest), factual_category_label(manifest)
+
 # Cold-open copy earns attention, but the repository must already feel like
 # the subject—not a small preview pushed below a title card.  Each tuple is
 # ``(screenshot_y, screenshot_height, crop_center_y, copy_y, repo_name_y)``.
@@ -305,10 +311,6 @@ def render_single_header_frame(
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output)
     return output
-
-
-def _direct_identifier(manifest: RenderManifest) -> str:
-    return extract_direct_identifier(manifest)
 
 
 def render_direct_identifier_badge(
@@ -759,16 +761,18 @@ def compose_information_frame(
     """Route flash to pinned rails and deep evidence to an expanded single-header viewport."""
     title = (manifest.fixed_title or manifest.scenes[0].caption).strip()
     radar = _is_radar_v2(manifest)
+    identifier, category_label = _radar_metadata(manifest)
+    metadata_rail = RADAR_META_RAIL if identifier or category_label else 0
     expanded = _expanded_evidence_layout(manifest)
     if expanded:
         header_height, _ = _single_header_layout(title, font_path)
-        pane_top = WECHAT_TOP_UI_SAFE + header_height + RADAR_META_RAIL
+        pane_top = WECHAT_TOP_UI_SAFE + header_height + metadata_rail
         bottom_top = 1920
         layout_profile = "expanded_single_header"
     else:
         top_height, _, _ = _information_layout(title, font_path)
         bottom_height, _, _ = _footer_layout(manifest.fixed_footer or "", font_path)
-        pane_top = WECHAT_TOP_UI_SAFE + top_height + (RADAR_META_RAIL if radar else 0)
+        pane_top = WECHAT_TOP_UI_SAFE + top_height + metadata_rail
         bottom_top = 1920 - WECHAT_BOTTOM_UI_SAFE - bottom_height
         layout_profile = "radar_pinned_rails" if radar else "classic_pinned_rails"
     content_height = bottom_top - pane_top
@@ -861,11 +865,9 @@ def compose_information_frame(
                         f"enable='between(t,{start:.3f},{end:.3f})'{output_label}"
                     )
                     previous = output_label
-        identifier = _direct_identifier(manifest) if radar else ""
-        category_label = factual_category_label(manifest) if radar else ""
-        if radar:
+        if radar and metadata_rail:
             badge = render_direct_identifier_badge(
-                identifier, pane_top - RADAR_META_RAIL,
+                identifier, pane_top - metadata_rail,
                 temp_root / "direct-identifier.png", font_path,
                 category_label=category_label,
             )
@@ -914,7 +916,7 @@ def compose_information_frame(
             json.dumps({
                 "version": 1, "profile": layout_profile,
                 "pane": {"top": pane_top, "bottom": bottom_top, "height": content_height},
-                "metadata_rail": RADAR_META_RAIL if radar else 0,
+                "metadata_rail": metadata_rail,
                 "direct_identifier": identifier,
                 "category_label": category_label,
                 "link_hint": "原帖/仓库链接见文案 ↗",

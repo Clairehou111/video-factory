@@ -12,7 +12,8 @@ from PIL import Image
 
 from video_factory.compositor import (
     RADAR_META_RAIL, _dense_evidence, _expanded_evidence_layout,
-    compose_information_frame, render_direct_identifier_badge, render_spotlight_overlay,
+    _radar_metadata, compose_information_frame, render_direct_identifier_badge,
+    render_spotlight_overlay,
 )
 from video_factory.editorial import _validate_radar_contract, canonicalize_editorial_brief
 from video_factory.models import (
@@ -134,6 +135,15 @@ class RadarV2Test(unittest.TestCase):
             with Image.open(output) as image:
                 alpha = image.getchannel("A")
                 self.assertIsNone(alpha.crop((0, pane_top + 1, 1080, 1920)).getbbox())
+
+    def test_story_without_identifier_or_fact_label_gets_no_empty_metadata_rail(self) -> None:
+        manifest = _manifest(InformationRenderProfile.RADAR_V2.value)
+        manifest.editorial_brief.direct_identifier = ""
+        manifest.editorial_brief.category_label = ""
+        manifest.source_urls = ["https://x.com/example/status/1"]
+        manifest.evidence[0].url = manifest.source_urls[0]
+        manifest.evidence[0].quote = "Jeff Dean announced a new research organization."
+        self.assertEqual(_radar_metadata(manifest), ("", ""))
 
     def test_static_card_motion_is_opt_in_for_radar(self) -> None:
         with TemporaryDirectory() as temp:
