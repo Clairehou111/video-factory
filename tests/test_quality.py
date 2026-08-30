@@ -26,6 +26,7 @@ from video_factory.writer import StoryWriterPacket
 from video_factory.safety import review_evidence
 from video_factory.llm import OpenAICompatibleStoryWriter
 from video_factory.github_editor import canonicalize_github_brief, select_github_focuses, validate_github_brief
+from video_factory.tweetcard import _tweet_translation_copy
 
 
 class QualityTest(unittest.TestCase):
@@ -356,6 +357,95 @@ class QualityTest(unittest.TestCase):
         self.assertIn('highlight text "Quick Start command"', cue)
         self.assertIn('highlight text "Plugin architecture"', cue)
         self.assertNotIn('scroll to bottom', cue)
+
+    def test_multiline_browser_evidence_uses_first_visible_line_as_anchor(self) -> None:
+        request = WebCaptureRequest(
+            "https://example.com", [CaptureCue(
+                CueAction.SCROLL, "find evidence",
+                target='"8x H100 / H200\nTested and recommended\nvLLM + Tensor Parallelism"',
+                wait_ms=500,
+            )], Path("/tmp/out.mp4"), Path("/tmp/frames"),
+        )
+
+        cue = WebScrollVideoAdapter(WebScrollVideoSettings(Path("/web-scroll-video"))).cue_text(request)
+
+        self.assertIn('scroll to "8x H100 / H200"', cue)
+        self.assertNotIn("Tested and recommended", cue)
+
+    def test_github_final_cut_skips_nonvisible_empty_description_placeholder(self) -> None:
+        brief = self.github_brief("meta", "readme")
+        brief.repo_description_target = "No repository description"
+        request = WebScrollVideoAdapter.github_story_request(
+            "https://github.com/acme/demo", brief,
+            Path("/tmp/out.mp4"), Path("/tmp/frames"), 20,
+        )
+
+        cue = WebScrollVideoAdapter(WebScrollVideoSettings(Path("/web-scroll-video"))).cue_text(request)
+
+        self.assertNotIn("No repository description", cue)
+        self.assertAlmostEqual(WebScrollVideoAdapter.capture_metadata(request)["duration"], 20.0)
+
+    def test_missing_browser_text_repairs_to_real_page_hold_without_false_highlight(self) -> None:
+        request = WebCaptureRequest(
+            "https://example.com", [
+                CaptureCue(CueAction.SCROLL, "find claim", target='"Missing claim"', wait_ms=500),
+                CaptureCue(
+                    CueAction.HIGHLIGHT, "show claim", target='"Missing claim"',
+                    wait_ms=1500, shot_id="claim",
+                ),
+            ], Path("/tmp/out.mp4"), Path("/tmp/frames"),
+        )
+
+        repaired = WebScrollVideoAdapter._repair_missing_text_request(request, "Missing claim")
+
+        self.assertEqual(repaired.cues[0].action, CueAction.SCROLL)
+        self.assertEqual(repaired.cues[0].target, "bottom")
+        self.assertEqual(repaired.cues[1].action, CueAction.WAIT)
+        self.assertEqual(repaired.cues[1].shot_id, "claim")
+        self.assertEqual(
+            WebScrollVideoAdapter.capture_metadata(repaired)["duration"],
+            WebScrollVideoAdapter.capture_metadata(request)["duration"],
+        )
+
+    def test_tiny_browser_highlight_repairs_to_source_page_hold(self) -> None:
+        request = WebCaptureRequest(
+            "https://example.com", [
+                CaptureCue(CueAction.SCROLL, "find license", target="License:", wait_ms=500),
+                CaptureCue(
+                    CueAction.HIGHLIGHT, "show license", target="License:",
+                    wait_ms=1500, shot_id="license",
+                ),
+            ], Path("/tmp/out.mp4"), Path("/tmp/frames"),
+        )
+
+        shot_id = WebScrollVideoAdapter._unreadable_highlight_shot(
+            "visual gate: highlight for license is too small (74px); target a readable line"
+        )
+        repaired = WebScrollVideoAdapter._repair_unreadable_highlight_request(request, shot_id)
+
+        self.assertEqual(shot_id, "license")
+        self.assertEqual(repaired.cues[0], request.cues[0])
+        self.assertEqual(repaired.cues[1].action, CueAction.WAIT)
+        self.assertEqual(repaired.cues[1].shot_id, "license")
+        self.assertEqual(
+            WebScrollVideoAdapter.capture_metadata(repaired)["duration"],
+            WebScrollVideoAdapter.capture_metadata(request)["duration"],
+        )
+
+    def test_x_card_renders_the_single_selected_glossary_beside_translation(self) -> None:
+        scene = Scene(
+            "scene-1", 0, 3, "internal", "fact", ["root"], MaterialRole.PROOF,
+            "show tweet", screen_fact="fact",
+            screen_interpretation="拒绝率：模型直接拒绝回答的请求占比。",
+            highlight_translation="完整根帖中文摘要。",
+        )
+        self.assertEqual(
+            _tweet_translation_copy(scene),
+            "完整根帖中文摘要。\n拒绝率：模型直接拒绝回答的请求占比。",
+        )
+
+        scene.screen_interpretation = "普通补充信息不应重复显示。"
+        self.assertEqual(_tweet_translation_copy(scene), "完整根帖中文摘要。")
 
     def test_github_focus_selection_keeps_one_proof_and_one_decision(self) -> None:
         brief = self.github_brief("meta", "readme")

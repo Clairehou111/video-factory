@@ -16,6 +16,7 @@ from video_factory.publish import (
     PublishTargetState,
     SocialAutoUploadBackend,
     SocialAutoUploadSettings,
+    _apply_upstream_compatibility_patches,
     _redact_output,
     create_publish_batch,
     targets_from_spec,
@@ -128,6 +129,26 @@ class PublishBatchTest(unittest.TestCase):
             self.assertEqual(batch.state, PublishBatchState.READY_FOR_REVIEW)
             self.assertEqual(batch.video_path, str(video.resolve()))
             self.assertTrue(batch.video_sha256)
+
+    def test_human_safety_review_is_narrow_and_bound_into_approval(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(temp, [PublishPlatform.TENCENT])
+            batch.state = PublishBatchState.BLOCKED
+            batch.checks = [{
+                "name": "editorial_safety_review", "passed": False,
+                "detail": "Sensitive security terms found: jailbreak",
+            }]
+
+            batch.record_review_override(
+                "editorial_safety_review", "claire", "defensive AI safety analysis only",
+            )
+
+            self.assertEqual(batch.state, PublishBatchState.READY_FOR_REVIEW)
+            self.assertTrue(batch.checks[0]["passed"])
+            self.assertEqual(batch.review_overrides["editorial_safety_review"]["actor"], "claire")
+            approval_before = batch.compute_approval_digest()
+            batch.review_overrides["editorial_safety_review"]["reason"] = "changed"
+            self.assertNotEqual(approval_before, batch.compute_approval_digest())
 
     def test_batch_blocks_corrupt_or_noncompliant_video(self) -> None:
         with TemporaryDirectory() as temp:
@@ -264,6 +285,8 @@ class PublishBatchTest(unittest.TestCase):
             settings.source_dir.mkdir(parents=True)
             settings.executable.parent.mkdir(parents=True)
             settings.executable.write_bytes(b"executable")
+            (settings.venv_dir / "bin" / "python").write_bytes(b"python")
+            settings.biliup_source_dir.mkdir(parents=True)
             video = Path(temp) / "video.mp4"
             cover = Path(temp) / "cover.png"
             video.write_bytes(b"video")
@@ -280,7 +303,6 @@ class PublishBatchTest(unittest.TestCase):
             self.assertIn("249", command)
             self.assertIn("--schedule", command)
             self.assertEqual(run.call_args.kwargs["env"]["HOME"], str(runtime / "home"))
-            self.assertEqual(run.call_args.kwargs["env"]["PLAYWRIGHT_BROWSERS_PATH"], str(runtime / "browsers"))
             self.assertTrue(result.succeeded)
 
     def test_setup_reuses_an_existing_partial_virtual_environment(self) -> None:
@@ -311,6 +333,28 @@ class PublishBatchTest(unittest.TestCase):
             self.assertIn("from patchright.async_api", legacy.read_text())
             self.assertEqual(metadata["compatibility_patches"], "uploader/legacy.py")
 
+    def test_publisher_policy_patch_disables_ai_label_and_uses_creator_auth_check(self) -> None:
+        with TemporaryDirectory() as temp:
+            source = Path(temp)
+            tencent = source / "uploader" / "tencent_uploader" / "main.py"
+            tencent.parent.mkdir(parents=True)
+            tencent.write_text(
+                "    async def apply_original_statement(self, page: Page) -> None:\n"
+                "        label_text = '含AI生成内容'\n",
+                encoding="utf-8",
+            )
+            cli = source / "sau_cli.py"
+            cli.write_text(
+                'result = run_biliup_command(["-u", str(account_file), "renew"])\n',
+                encoding="utf-8",
+            )
+
+            changed = _apply_upstream_compatibility_patches(source)
+
+            self.assertEqual(changed, ["sau_cli.py", "uploader/tencent_uploader/main.py"])
+            self.assertIn("return None", tencent.read_text(encoding="utf-8"))
+            self.assertIn('"list", "--max-pages", "1"', cli.read_text(encoding="utf-8"))
+
     def test_setup_installs_managed_chromium_when_local_chrome_is_unavailable(self) -> None:
         with TemporaryDirectory() as temp:
             runtime = Path(temp) / "runtime"
@@ -338,6 +382,8 @@ class PublishBatchTest(unittest.TestCase):
             settings.source_dir.mkdir(parents=True)
             settings.executable.parent.mkdir(parents=True)
             settings.executable.write_bytes(b"executable")
+            (settings.venv_dir / "bin" / "python").write_bytes(b"python")
+            settings.biliup_source_dir.mkdir(parents=True)
             completed = subprocess.CompletedProcess([], 0, "", "")
             with patch("video_factory.publish.subprocess.run", return_value=completed) as run:
                 SocialAutoUploadBackend(settings).login_account(PublishPlatform.BILIBILI, "main")
@@ -352,32 +398,29 @@ class PublishBatchTest(unittest.TestCase):
             settings.source_dir.mkdir(parents=True)
             settings.executable.parent.mkdir(parents=True)
             settings.executable.write_bytes(b"executable")
+            (settings.venv_dir / "bin" / "python").write_bytes(b"python")
+            settings.biliup_source_dir.mkdir(parents=True)
             completed = subprocess.CompletedProcess([], 0, "valid", "")
             with patch("video_factory.publish.subprocess.run", return_value=completed) as run:
                 result = SocialAutoUploadBackend(settings).check_login(PublishPlatform.BILIBILI, "main")
             self.assertTrue(result.succeeded)
-            self.assertEqual(run.call_args.args[0][-3:], ["check", "--account", "main"])
+            self.assertEqual(run.call_args.args[0][-1], "check")
 
-    def test_bilibili_binary_drift_is_blocked_before_submission(self) -> None:
+    def test_bilibili_direct_runtime_must_be_installed_before_submission(self) -> None:
         with TemporaryDirectory() as temp:
             runtime = Path(temp) / "runtime"
             settings = SocialAutoUploadSettings(runtime_home=runtime)
             settings.source_dir.mkdir(parents=True)
             settings.executable.parent.mkdir(parents=True)
             settings.executable.write_bytes(b"executable")
-            binary = runtime / "home" / ".social-auto-upload" / "tools" / "biliup" / "macos-aarch64" / "biliup"
-            binary.parent.mkdir(parents=True)
-            binary.write_bytes(b"first-version")
             backend = SocialAutoUploadBackend(settings)
-            self.assertEqual(backend.runtime_metadata()["biliup_integrity"], "locked")
-            binary.write_bytes(b"changed-version")
             video = Path(temp) / "video.mp4"
             video.write_bytes(b"video")
             target = PublishTarget(PublishPlatform.BILIBILI, "main", "标题", options={"tid": 249})
             with patch("video_factory.publish.subprocess.run") as run:
                 result = backend.submit_video(target, video)
             self.assertFalse(result.started)
-            self.assertIn("differs from the recorded runtime lock", result.stderr)
+            self.assertIn("direct Bilibili publisher is not installed", result.stderr)
             run.assert_not_called()
 
     def test_audit_output_redacts_runtime_paths_and_secret_values(self) -> None:

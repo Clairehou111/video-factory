@@ -107,6 +107,34 @@ class ReviewingPrimaryModel(ValidPrimaryModel):
         return valid_request(packet), {"model": "writer"}, {"review_repaired": True}
 
 
+class ConvergingReviewModel(ValidPrimaryModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_calls = 0
+        self.repair_calls = 0
+
+    def review_visible_copy(self, packet, draft):
+        self.review_calls += 1
+        fields = [
+            ("editorial_brief.headline", "specificity"),
+            ("editorial_brief.subheadline", "causal_certainty"),
+            ("editorial_brief.attention_strategy.selected_hook", "retention_hook"),
+            ("editorial_brief.fixed_conclusion", "payoff"),
+        ]
+        if self.review_calls > len(fields):
+            return [], {"model": "critic"}
+        field, category = fields[self.review_calls - 1]
+        return [{
+            "field_path": field, "category": category,
+            "problem": "next bounded issue", "evidence_ids": ["tweet-evidence"],
+            "repair_instruction": "repair only this field from evidence",
+        }], {"model": "critic"}
+
+    def repair(self, packet, invalid_draft, validation_error):
+        self.repair_calls += 1
+        return valid_request(packet), {"model": "writer"}, {"repair": self.repair_calls}
+
+
 class ContentAgentTest(unittest.TestCase):
     def test_only_render_size_failures_receive_the_bounded_extra_cleanup(self) -> None:
         self.assertTrue(_visible_copy_only_failure(
@@ -167,6 +195,21 @@ class ContentAgentTest(unittest.TestCase):
         self.assertEqual(result.llm_calls, 2)
         self.assertEqual(model.review_calls, 0)
         self.assertEqual(model.repair_calls, 0)
+
+    def test_changed_critic_issue_gets_one_final_convergence_repair(self) -> None:
+        model = ConvergingReviewModel()
+        result = BoundedContentAgent(
+            model, copy_reviewer=model,
+            budget=AgentBudget(max_llm_calls=14, max_repairs=3, max_escalations=0),
+        ).run(packet_with_link())
+
+        self.assertEqual(model.repair_calls, 4)
+        self.assertEqual(model.review_calls, 5)
+        steps = [item["step"] for item in next(
+            check for check in result.manifest.quality_checks if check["name"] == "content_agent"
+        )["detail"]["trace"]]
+        self.assertIn("copy_review_convergence_repair", steps)
+        self.assertIn("copy_review_convergence_verify", steps)
 
     def test_strong_model_is_only_used_after_primary_and_repair_fail(self) -> None:
         primary = RepairingModel(fail_repair=True)

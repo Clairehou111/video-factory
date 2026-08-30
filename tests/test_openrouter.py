@@ -50,6 +50,41 @@ class OpenRouterCatalogTests(unittest.TestCase):
             catalog.snapshot()
         self.assertEqual(calls, [MODELS_API, DISCOUNTS_READER])
 
+    def test_routing_chooses_cheapest_capable_model_not_discount_badge(self) -> None:
+        page = '<a href="/vendor/discounted">Discounted</a><div>90% off</div>'
+        base = {
+            "context_length": 100_000,
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "supported_parameters": ["response_format"],
+            "benchmarks": {"artificial_analysis": {"intelligence_index": 60}},
+        }
+        models = {"data": [
+            {**base, "id": "vendor/discounted", "pricing": {"prompt": "0.000002", "completion": "0.000004"}},
+            {**base, "id": "vendor/economic", "pricing": {"prompt": "0.0000002", "completion": "0.000001"}},
+        ]}
+        payloads = {MODELS_API: json.dumps(models).encode(), DISCOUNTS_READER: page.encode()}
+        with tempfile.TemporaryDirectory() as temp:
+            quote = OpenRouterCatalog(
+                Path(temp), fetch=lambda url: payloads[url], today=lambda: date(2026, 8, 21),
+            ).select(ModelRequirements("story", ("text",)))
+        self.assertEqual(quote.model_id, "vendor/economic")
+        self.assertIn("capability-qualified", quote.reason)
+
+    def test_routing_can_exclude_writer_for_independent_review(self) -> None:
+        models = {"data": [{
+            "id": model, "context_length": 100_000,
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "supported_parameters": ["response_format"],
+            "pricing": {"prompt": prompt, "completion": "0.000001"},
+            "benchmarks": {"artificial_analysis": {"intelligence_index": 60}},
+        } for model, prompt in (("vendor/writer", "0.0000001"), ("vendor/reviewer", "0.0000002"))]}
+        payloads = {MODELS_API: json.dumps(models).encode(), DISCOUNTS_READER: b""}
+        with tempfile.TemporaryDirectory() as temp:
+            quote = OpenRouterCatalog(
+                Path(temp), fetch=lambda url: payloads[url], today=lambda: date(2026, 8, 21),
+            ).select(ModelRequirements("review", ("text",), excluded_models=("vendor/writer",)))
+        self.assertEqual(quote.model_id, "vendor/reviewer")
+
     def test_visual_detector_rejects_badges_and_star_history(self) -> None:
         readme = """# Demo\n## Architecture\n![pipeline](docs/architecture.png)\n## Star History\n![](https://star-history.com/chart?a=1)"""
         visuals = find_high_value_visuals(readme, "https://raw.githubusercontent.com/a/b/main/README.md")

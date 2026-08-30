@@ -12,16 +12,21 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 from .factory import GenerateOptions, VideoFactory
 from .models import ContentType, TopicType
 from .openrouter import DISCOUNTS_READER, ENDPOINTS_API, MODELS_API, parse_discounted_models
+from .serde import load_collection_manifest
 from .storage import Workspace
 from .youtube import DiscoveryConfig as YouTubeDiscoveryConfig
-from .youtube import YouTubeDiscoveryService
+from .youtube import (
+    YouTubeCollectionRenderer, YouTubeDiscoveryService, political_markers,
+    technical_share_markers,
+    validate_collection,
+)
 
 
 class DiscoveryChannel(StrEnum):
@@ -182,6 +187,38 @@ def canonical_url(value: str) -> str:
     return urlunparse((parsed.scheme or "https", host, path, "", query, ""))
 
 
+def source_identity(value: str) -> tuple[str, str]:
+    """Return a stable identity even when a platform canonicalizes its URL.
+
+    X commonly rewrites ``/i/status/<id>`` to ``/<author>/status/<id>`` after
+    acquisition. Treating those URLs as different made deterministic browser
+    failures restart the expensive director workflow.
+    """
+    normalized = canonical_url(value)
+    parsed = urlparse(normalized)
+    host = parsed.hostname or ""
+    if host == "x.com":
+        match = re.search(r"/status/(\d+)(?:/|$)", parsed.path)
+        if match:
+            return "x_status", match.group(1)
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+        if video_id:
+            return "youtube", video_id
+    if host == "youtube.com":
+        video_id = (parse_qs(parsed.query).get("v") or [""])[0]
+        if video_id:
+            return "youtube", video_id
+        match = re.match(r"/(?:shorts|live|embed)/([^/?]+)", parsed.path)
+        if match:
+            return "youtube", match.group(1)
+    return "url", normalized
+
+
+def same_source(left: str, right: str) -> bool:
+    return source_identity(left) == source_identity(right)
+
+
 @dataclass(slots=True)
 class ChannelConfig:
     enabled: bool = True
@@ -223,6 +260,8 @@ class ChannelConfig:
 class ResourceDiscoveryConfig:
     timezone: str = "Asia/Tokyo"
     retry_backoff_seconds: list[int] = field(default_factory=lambda: [0, 30, 120])
+    blocked_retry_delay_hours: int = 6
+    max_blocked_retry_runs: int = 2
     event_dedupe_days: int = 30
     channels: dict[DiscoveryChannel, ChannelConfig] = field(default_factory=dict)
 
@@ -235,10 +274,17 @@ class ResourceDiscoveryConfig:
             raise ValueError("retry_backoff_seconds must contain one to five attempts")
         if any(value < 0 for value in self.retry_backoff_seconds):
             raise ValueError("retry backoff values cannot be negative")
+        if self.blocked_retry_delay_hours < 1:
+            raise ValueError("blocked_retry_delay_hours must be positive")
+        if self.max_blocked_retry_runs < 1:
+            raise ValueError("max_blocked_retry_runs must be positive")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ResourceDiscoveryConfig":
-        unknown = set(data) - {"timezone", "retry_backoff_seconds", "event_dedupe_days", "channels"}
+        unknown = set(data) - {
+            "timezone", "retry_backoff_seconds", "blocked_retry_delay_hours",
+            "max_blocked_retry_runs", "event_dedupe_days", "channels",
+        }
         if unknown:
             raise ValueError("unsupported resource discovery config fields: " + ", ".join(sorted(unknown)))
         raw_channels = data.get("channels") or {}
@@ -252,6 +298,8 @@ class ResourceDiscoveryConfig:
         return cls(
             timezone=str(data.get("timezone") or "Asia/Tokyo"),
             retry_backoff_seconds=[int(item) for item in data.get("retry_backoff_seconds", [0, 30, 120])],
+            blocked_retry_delay_hours=int(data.get("blocked_retry_delay_hours", 6)),
+            max_blocked_retry_runs=int(data.get("max_blocked_retry_runs", 2)),
             event_dedupe_days=int(data.get("event_dedupe_days", 30)),
             channels=channels,
         )
@@ -602,11 +650,14 @@ class RSSDiscoveryAdapter:
                 body, resolved = row.get("summary", ""), raw_url
             final_url = canonical_url(resolved or raw_url)
             final_host = (urlparse(final_url).hostname or "").casefold()
-            if self.channel in OFFICIAL_CHANNELS and config.seed_domains and not any(
+            if self.channel in WEB_DISCOVERY_CHANNELS and config.seed_domains and not any(
                 final_host == domain or final_host.endswith("." + domain)
-                or publisher_host == domain or publisher_host.endswith("." + domain)
                 for domain in config.seed_domains
             ):
+                # Google News' <source> attribution is useful for ranking but
+                # cannot turn an unresolved aggregator wrapper into first-party
+                # or trusted-news evidence. The fetched final URL itself must
+                # land on the configured source domain.
                 continue
             digest = hashlib.sha256(final_url.encode()).hexdigest()[:12]
             found[final_url] = DiscoveryCandidate(
@@ -672,14 +723,23 @@ class YouTubeDiscoveryAdapter:
         hydrated = [self.service._hydrate(item) for item in probed]
         found: list[DiscoveryCandidate] = []
         for item in hydrated:
+            self.service._score(item, yt_config, now)
             transcript_available = bool(getattr(item, "transcript_available", False))
+            markers = technical_share_markers(f"{item.title} {item.description}")
             found.append(DiscoveryCandidate(
                 id=f"youtube-{item.video_id}", channel=DiscoveryChannel.YOUTUBE, url=item.url,
                 title=item.title, author=item.channel, publisher=item.channel, published_at=item.published_at,
                 summary=item.description, body_text=item.description, stable_id=f"youtube:{item.video_id}",
                 metadata={
                     "duration_seconds": item.duration_seconds, "view_count": item.view_count,
-                    "chapters": item.chapters, "transcript_available": transcript_available,
+                    "chapters": item.chapters, "creators": item.creators,
+                    "transcript_available": transcript_available,
+                    "technical_share": item.editorial_mode == "technical_coverage",
+                    "youtube_editorial_mode": item.editorial_mode,
+                    "technical_markers": markers, "known_tech_people": item.matched_known_people,
+                    "political_signals": item.political_signals,
+                    "youtube_score": item.score,
+                    "youtube_rejection_reasons": list(item.rejection_reasons),
                 }, discovered_at=_iso(now),
             ))
         return found
@@ -1151,6 +1211,14 @@ def evaluate_candidate(item: DiscoveryCandidate, config: ChannelConfig, now: dat
             reasons.append("duration_out_of_range")
         if not item.metadata.get("transcript_available"):
             reasons.append("transcript_unavailable")
+        mode = str(item.metadata.get("youtube_editorial_mode") or "")
+        source_text = f"{item.title} {item.summary} {item.body_text}"
+        if mode != "known_tech_interview_clip" and (
+            item.metadata.get("political_signals") or political_markers(source_text)
+        ):
+            reasons.append("political_content_forbidden")
+        if mode not in {"technical_coverage", "known_tech_interview_clip"}:
+            reasons.append("not_technical_share_or_known_tech_interview")
     else:
         visual = bool(item.metadata.get("visual_path"))
         if not item.metadata.get("compelling"):
@@ -1323,10 +1391,49 @@ class ResourceDiscoveryService:
             run.channels[channel.value] = entry
             blocked_payload = channel_state.get("blocked_candidate")
             if isinstance(blocked_payload, dict):
-                blocked[channel] = DiscoveryCandidate.from_dict(blocked_payload)
+                blocked_item = DiscoveryCandidate.from_dict(blocked_payload)
+                if channel in WEB_DISCOVERY_CHANNELS and config.channels[channel].seed_domains:
+                    blocked_host = (urlparse(blocked_item.url).hostname or "").casefold()
+                    if not any(
+                        blocked_host == domain or blocked_host.endswith("." + domain)
+                        for domain in config.channels[channel].seed_domains
+                    ):
+                        persisted = state.setdefault("channels", {}).setdefault(channel.value, {})
+                        persisted.pop("blocked_candidate", None)
+                        persisted.pop("blocked_retry_at", None)
+                        persisted.pop("blocked_retry_runs", None)
+                        blocked_item.status = "rejected"
+                        blocked_item.eligible = False
+                        blocked_item.rejection_reasons.append("unresolved_aggregator_not_primary_source")
+                        self.workspace.save_discovery_candidate(blocked_item.to_dict())
+                        entry.candidates = [blocked_item]
+                        entry.status = "blocked_invalidated_source"
+                        continue
+                retry_at = _parse_date(str(channel_state.get("blocked_retry_at") or ""))
+                if scheduled and retry_at is None:
+                    # Import legacy blocked state without immediately spending
+                    # another full LLM retry budget on the next 10-minute tick.
+                    retry_at = now + timedelta(hours=config.blocked_retry_delay_hours)
+                    persisted = state.setdefault("channels", {}).setdefault(channel.value, {})
+                    persisted["blocked_retry_at"] = _iso(retry_at)
+                    persisted["blocked_retry_runs"] = max(1, int(channel_state.get("blocked_retry_runs") or 0))
+                if scheduled and retry_at and now < retry_at:
+                    entry.candidates = [blocked_item]
+                    entry.status = "blocked_retry_wait"
+                    entry.next_run_at = _iso(retry_at)
+                    continue
+                blocked[channel] = blocked_item
+                entry.candidates = [blocked_item]
+                entry.status = "blocked_retry_pending"
+                continue
             try:
                 items = self.adapters[channel].search(config.channels[channel], now)
                 skipped_ids = set(str(value) for value in (state.get("skipped_ids") or []))
+                needs_human_ids = {
+                    str(value.get("candidate_id") or "")
+                    for value in (state.get("needs_human_candidates") or [])
+                    if isinstance(value, dict)
+                }
                 seen_price_ids = set(str(value) for value in channel_state.get("seen_candidate_ids") or [])
                 for item in items[: config.channels[channel].probe_limit]:
                     evaluate_candidate(item, config.channels[channel], now)
@@ -1338,11 +1445,15 @@ class ResourceDiscoveryService:
                         item.eligible = False
                         item.status = "skipped"
                         item.rejection_reasons.append("manually_skipped")
+                    if item.id in needs_human_ids:
+                        item.eligible = False
+                        item.status = "needs_human"
+                        item.rejection_reasons.append("automatic_repair_budget_exhausted")
                     self.workspace.save_discovery_candidate(item.to_dict())
                 entry.candidates = items
                 eligible[channel] = [
                     item for item in items
-                    if item.eligible and item.id not in skipped_ids
+                    if item.eligible and item.id not in skipped_ids and item.id not in needs_human_ids
                     and not self._historical_duplicate(item, state, config, now)
                 ]
                 entry.status = "searched"
@@ -1376,13 +1487,17 @@ class ResourceDiscoveryService:
             channel_state = state.setdefault("channels", {}).setdefault(channel.value, {})
             if adoption["status"] == "generated":
                 channel_state.pop("blocked_candidate", None)
+                channel_state.pop("blocked_retry_at", None)
+                channel_state.pop("blocked_retry_runs", None)
                 state.setdefault("generated_events", []).append({
                     "event_key": item.event_key, "title": item.title, "published_at": item.published_at,
                     "topic_type": item.topic_type.value if item.topic_type else "", "url": item.url,
                     "generated_at": _iso(self.clock()), "candidate_id": item.id,
                 })
             else:
-                channel_state["blocked_candidate"] = item.to_dict()
+                queue_status = self._record_blocked_candidate(state, item, config, self.clock())
+                if queue_status == "needs_human":
+                    entry.status = "needs_human"
         for channel, entry in run.channels.items():
             if entry.status == "searched":
                 entry.status = "no_selection"
@@ -1404,22 +1519,58 @@ class ResourceDiscoveryService:
         provider: str = "auto", model: str | None = None,
     ) -> dict[str, Any]:
         item = DiscoveryCandidate.from_dict(self.workspace.load_discovery_candidate(candidate_id))
-        if not item.eligible and item.status != "blocked":
+        if not item.eligible and item.status not in {"blocked", "needs_human"}:
             raise ValueError(f"candidate {candidate_id} did not pass its channel quality gate")
         result = self._adopt(item, config, provider, model)
         state = self.workspace.load_discovery_state()
         channel_state = state.setdefault("channels", {}).setdefault(item.channel.value, {})
         if result["status"] == "generated":
             channel_state.pop("blocked_candidate", None)
+            channel_state.pop("blocked_retry_at", None)
+            channel_state.pop("blocked_retry_runs", None)
             state.setdefault("generated_events", []).append({
                 "event_key": item.event_key, "title": item.title, "published_at": item.published_at,
                 "topic_type": item.topic_type.value if item.topic_type else "", "url": item.url,
                 "generated_at": _iso(self.clock()), "candidate_id": item.id,
             })
+            state["needs_human_candidates"] = [
+                value for value in (state.get("needs_human_candidates") or [])
+                if not isinstance(value, dict) or value.get("candidate_id") != item.id
+            ]
         else:
-            channel_state["blocked_candidate"] = item.to_dict()
+            result["queue_status"] = self._record_blocked_candidate(
+                state, item, config, self.clock(),
+            )
         self.workspace.save_discovery_state(state)
         return result
+
+    def _record_blocked_candidate(
+        self, state: dict[str, Any], item: DiscoveryCandidate,
+        config: ResourceDiscoveryConfig, now: datetime,
+    ) -> str:
+        channel_state = state.setdefault("channels", {}).setdefault(item.channel.value, {})
+        previous = channel_state.get("blocked_candidate")
+        previous_runs = int(channel_state.get("blocked_retry_runs") or 0)
+        retry_runs = previous_runs + 1 if isinstance(previous, dict) and previous.get("id") == item.id else 1
+        if retry_runs >= config.max_blocked_retry_runs:
+            item.status = "needs_human"
+            self.workspace.save_discovery_candidate(item.to_dict())
+            channel_state.pop("blocked_candidate", None)
+            channel_state.pop("blocked_retry_at", None)
+            channel_state.pop("blocked_retry_runs", None)
+            state.setdefault("needs_human_candidates", []).append({
+                "candidate_id": item.id, "channel": item.channel.value, "title": item.title,
+                "url": item.url, "recorded_at": _iso(now),
+                "reason": "bounded automatic generation retries exhausted",
+            })
+            state["needs_human_candidates"] = state["needs_human_candidates"][-100:]
+            return "needs_human"
+        channel_state["blocked_candidate"] = item.to_dict()
+        channel_state["blocked_retry_runs"] = retry_runs
+        channel_state["blocked_retry_at"] = _iso(
+            now.astimezone(UTC) + timedelta(hours=config.blocked_retry_delay_hours)
+        )
+        return "blocked"
 
     def skip(self, candidate_id: str, reason: str) -> dict[str, Any]:
         if not reason.strip():
@@ -1434,7 +1585,13 @@ class ResourceDiscoveryService:
         blocked = channel_state.get("blocked_candidate")
         if isinstance(blocked, dict) and blocked.get("id") == item.id:
             channel_state.pop("blocked_candidate", None)
+            channel_state.pop("blocked_retry_at", None)
+            channel_state.pop("blocked_retry_runs", None)
         state.setdefault("skipped_ids", []).append(item.id)
+        state["needs_human_candidates"] = [
+            value for value in (state.get("needs_human_candidates") or [])
+            if not isinstance(value, dict) or value.get("candidate_id") != item.id
+        ]
         self.workspace.save_discovery_state(state)
         return {"status": "skipped", "candidate_id": item.id, "reason": reason.strip()}
 
@@ -1443,9 +1600,19 @@ class ResourceDiscoveryService:
         provider: str, model: str | None,
     ) -> dict[str, Any]:
         attempts: list[dict[str, Any]] = []
-        manifest: Path | None = None
+        manifest: Path | None = (
+            self._latest_failed_manifest(item.url)
+            if item.status in {"blocked", "needs_human"} else None
+        )
+        youtube_media: Path | None = None
+        youtube_subtitles: Path | None = None
+        youtube_translation_plan: Path | None = None
+        if item.channel == DiscoveryChannel.YOUTUBE:
+            youtube_media, youtube_subtitles = self._latest_youtube_assets(item.url)
+            youtube_translation_plan = self._latest_youtube_translation_plan(item.url)
         for attempt, delay in enumerate(config.retry_backoff_seconds, start=1):
-            if delay:
+            retry_mode = "deterministic_rerender" if manifest and manifest.is_file() else "full_generation"
+            if delay and retry_mode == "full_generation":
                 self.sleeper(delay)
             try:
                 if manifest and manifest.is_file():
@@ -1455,6 +1622,14 @@ class ResourceDiscoveryService:
                         provider=provider, model=model, topic=item.topic_type,
                         content_type=item.content_type, render=True,
                         research=item.channel != DiscoveryChannel.OPENROUTER,
+                        youtube_media=str(youtube_media) if youtube_media else None,
+                        youtube_subtitles=str(youtube_subtitles) if youtube_subtitles else None,
+                        youtube_translation_plan=(
+                            str(youtube_translation_plan) if youtube_translation_plan else None
+                        ),
+                        youtube_editorial_mode=str(
+                            item.metadata.get("youtube_editorial_mode") or "auto"
+                        ),
                         linked_sources=tuple(str(url) for url in item.metadata.get("linked_sources") or []),
                         supplemental_context=(
                             f"Discovery headline: {item.title}\n\n{item.body_text}\n\n"
@@ -1477,35 +1652,123 @@ class ResourceDiscoveryService:
                         "music_license_record", "editorial_safety_review", "rights_review",
                     }
                 ]
+                collection_value = result.get("collection_manifest")
+                audio_failures = [
+                    check for check in failed_checks
+                    if any(marker in str(check.get("name") or "") for marker in (
+                        ":aac", ":audio_duration", ":audible_audio",
+                    ))
+                ]
+                if item.channel == DiscoveryChannel.YOUTUBE and collection_value and audio_failures:
+                    collection_path = Path(str(collection_value))
+                    collection = load_collection_manifest(collection_path)
+                    repaired = YouTubeCollectionRenderer(self.workspace).repair_silent_audio(collection)
+                    repaired_checks = validate_collection(collection, self.workspace.root)
+                    collection.quality_checks = [check.to_dict() for check in repaired_checks]
+                    self.workspace.save_collection_manifest(collection)
+                    collection_path.write_text(
+                        json.dumps(collection.to_dict(), ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    result["checks"] = collection.quality_checks
+                    result.setdefault("automatic_repairs", []).append({
+                        "kind": "silent_or_truncated_audio", "outputs": repaired,
+                    })
+                    failed_checks = [
+                        check for check in collection.quality_checks
+                        if not check.get("passed", False)
+                        and str(check.get("name") or "") not in {
+                            "music_license_record", "editorial_safety_review", "rights_review",
+                        }
+                    ]
                 output_created = bool(result.get("video") or result.get("collection_manifest"))
                 success = result.get("status") == "completed" and output_created and not failed_checks
-                attempts.append({"attempt": attempt, "status": "generated" if success else "quality_failed", "result": result})
+                attempts.append({
+                    "attempt": attempt, "mode": retry_mode,
+                    "status": "generated" if success else "quality_failed", "result": result,
+                })
                 if success:
                     item.status = "generated"
                     self.workspace.save_discovery_candidate(item.to_dict())
                     return {"status": "generated", "candidate_id": item.id, "attempts": attempts, "result": result}
             except Exception as error:
-                attempts.append({"attempt": attempt, "status": "failed", "error": f"{type(error).__name__}: {error}"})
+                attempts.append({
+                    "attempt": attempt, "mode": retry_mode,
+                    "status": "failed", "error": f"{type(error).__name__}: {error}",
+                })
                 possible = getattr(error, "manifest", None)
                 if possible:
                     manifest = Path(str(possible))
                 if manifest is None:
                     manifest = self._latest_failed_manifest(item.url)
+                if item.channel == DiscoveryChannel.YOUTUBE:
+                    youtube_media, youtube_subtitles = self._latest_youtube_assets(item.url)
+                    youtube_translation_plan = self._latest_youtube_translation_plan(item.url)
         item.status = "blocked"
         self.workspace.save_discovery_candidate(item.to_dict())
         return {"status": "blocked", "candidate_id": item.id, "attempts": attempts}
+
+    def _latest_youtube_assets(self, source_url: str) -> tuple[Path | None, Path | None]:
+        """Reuse complete source assets across planning/render retries.
+
+        YouTube planning can fail before a collection manifest exists. The
+        downloaded 1080p source and json3 transcript are still valid inputs,
+        so retrying should not spend bandwidth downloading them again.
+        """
+        jobs = self.workspace.root / "jobs"
+        if not jobs.is_dir():
+            return None, None
+        results = sorted(jobs.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for result_path in results[:12]:
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not same_source(str(payload.get("url") or ""), source_url):
+                continue
+            job = result_path.parent
+            media = next(
+                (path for suffix in ("*.mkv", "*.mp4", "*.webm", "*.mov")
+                 for path in sorted(job.glob(suffix)) if path.is_file()),
+                None,
+            )
+            subtitles = next(
+                (path for path in sorted(job.glob("*.json3"))
+                 if path.is_file() and not path.name.endswith(".part")),
+                None,
+            )
+            if media and subtitles:
+                return media, subtitles
+        return None, None
+
+    def _latest_youtube_translation_plan(self, source_url: str) -> Path | None:
+        jobs = self.workspace.root / "jobs"
+        if not jobs.is_dir():
+            return None
+        results = sorted(jobs.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for result_path in results[:12]:
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not same_source(str(payload.get("url") or ""), source_url):
+                continue
+            plan = result_path.parent / "translation-plan.json"
+            if plan.is_file():
+                return plan
+        return None
 
     def _latest_failed_manifest(self, source_url: str) -> Path | None:
         jobs = self.workspace.root / "jobs"
         if not jobs.is_dir():
             return None
         results = sorted(jobs.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
-        for path in results[:8]:
+        for path in results[:30]:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if canonical_url(str(payload.get("url") or "")) != canonical_url(source_url):
+            if not same_source(str(payload.get("url") or ""), source_url):
                 continue
             manifest = payload.get("manifest")
             if manifest and Path(str(manifest)).is_file():

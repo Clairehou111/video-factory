@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,12 +16,40 @@ class VideoProbe:
     video_codec: str
     pixel_format: str
     audio_codec: str | None
+    audio_duration: float | None = None
+    audio_bitrate: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AudioLoudness:
+    mean_db: float
+    max_db: float
+    longest_silence_seconds: float = 0.0
+
+
+def probe_audio_loudness(path: Path) -> AudioLoudness:
+    """Decode the audio track and reject AAC containers that contain silence."""
+    command = [
+        "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+        "-map", "0:a:0", "-af", "silencedetect=noise=-50dB:d=10,volumedetect",
+        "-f", "null", "/dev/null",
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    output = "\n".join([result.stdout or "", result.stderr or ""])
+    mean = re.search(r"mean_volume:\s*(-?[0-9.]+)\s*dB", output)
+    maximum = re.search(r"max_volume:\s*(-?[0-9.]+)\s*dB", output)
+    if result.returncode != 0 or mean is None or maximum is None:
+        raise ValueError(f"audio loudness probe failed for {path}")
+    silences = [float(value) for value in re.findall(r"silence_duration:\s*([0-9.]+)", output)]
+    return AudioLoudness(
+        float(mean.group(1)), float(maximum.group(1)), max(silences, default=0.0),
+    )
 
 
 def probe_video(path: Path) -> VideoProbe:
     command = [
         "ffprobe", "-v", "error", "-show_entries",
-        "format=duration:stream=codec_type,codec_name,width,height,pix_fmt",
+        "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,duration,bit_rate",
         "-of", "json", str(path),
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
@@ -35,6 +64,8 @@ def probe_video(path: Path) -> VideoProbe:
         video_codec=video["codec_name"],
         pixel_format=video["pix_fmt"],
         audio_codec=audio["codec_name"] if audio else None,
+        audio_duration=float(audio["duration"]) if audio and audio.get("duration") else None,
+        audio_bitrate=int(audio["bit_rate"]) if audio and audio.get("bit_rate") else None,
     )
 
 

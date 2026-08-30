@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.clairehou.video-factory.dashboard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/clairehou/pyProjects/video_factory/deploy/macos/run-dashboard.zsh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/clairehou/pyProjects/video_factory</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/clairehou</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/clairehou/.local/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/clairehou/pyProjects/video_factory/workspace/logs/dashboard.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/clairehou/pyProjects/video_factory/workspace/logs/dashboard.stderr.log</string>
+</dict>
+</plist>

@@ -140,24 +140,35 @@ class LLMSettings:
     base_url: str
     api_key: str
     model: str
-    timeout_seconds: int = 120
+    timeout_seconds: int = 45
     provider_preferences: dict[str, object] | None = None
 
     @classmethod
     def from_environment(cls, provider: str, model: str | None = None) -> "LLMSettings":
+        try:
+            timeout_seconds = int(os.environ.get("VIDEO_FACTORY_LLM_TIMEOUT_SECONDS", "45"))
+        except ValueError:
+            timeout_seconds = 45
+        timeout_seconds = max(15, min(timeout_seconds, 120))
         if provider == "deepseek":
             key = os.environ.get("DEEPSEEK_API_KEY")
             # The content agent uses the inexpensive chat tier by default.
             # A stronger account-specific model is configured separately as
             # an escalation writer, never silently selected here.
             selected_model = model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
-            return cls(provider, os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"), key or "", selected_model)
+            return cls(
+                provider, os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+                key or "", selected_model, timeout_seconds=timeout_seconds,
+            )
         if provider == "kimi":
             key = os.environ.get("KIMI_API_KEY") or os.environ.get("MOONSHOT_API_KEY")
             selected_model = model or os.environ.get("KIMI_MODEL")
             if not selected_model:
                 raise ValueError("Kimi requires --model or KIMI_MODEL; model availability is account-specific")
-            return cls(provider, os.environ.get("KIMI_BASE_URL", "https://api.moonshot.cn/v1"), key or "", selected_model)
+            return cls(
+                provider, os.environ.get("KIMI_BASE_URL", "https://api.moonshot.cn/v1"),
+                key or "", selected_model, timeout_seconds=timeout_seconds,
+            )
         if provider == "openrouter":
             key = os.environ.get("OPENROUTER_API_KEY")
             selected_model = model or os.environ.get("OPENROUTER_MODEL")
@@ -172,7 +183,8 @@ class LLMSettings:
                 preferences["zdr"] = True
             return cls(
                 provider, os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-                key or "", selected_model, provider_preferences=preferences,
+                key or "", selected_model, timeout_seconds=timeout_seconds,
+                provider_preferences=preferences,
             )
         raise ValueError(f"unsupported story provider: {provider}")
 
@@ -279,8 +291,8 @@ class OpenAICompatibleStoryWriter:
             {"role": "user", "content": "\n".join([
                 "Review every field listed in fields against its cited evidence and the story as a whole. Return exactly one field_reviews item for every field path; do not omit easy fields.",
                 "A field path ending in .target is the exact source-language proof the browser will highlight, not Chinese copy. Ignore Chinese naturalness for targets. Pass it only when it is an exact contiguous substring of its cited evidence and directly supports that same shot's fact; topical proximity elsewhere on the page is insufficient. If the page supports the fact but this target points at a different claim, fail source_support and instruct replacement with the smallest exact supporting excerpt from the same cited evidence.",
-                "Reject when an actor, action, object, recipient, chronology, causal strength, or certainty differs from the evidence; when a concrete technical name is replaced by a vague category that makes the event harder to understand; when Chinese reads like literal translation, a report, or abstract consultant language; or when a screen cannot explain itself without narration.",
-                "For each field, first extract actor-action-object-recipient and certainty, then compare them with evidence. A naturalness score below 4 is fail. Unexplained English technical nouns inside Chinese prose are fail when the evidence lets you explain the concrete action. Keeping an official English feature name does not exempt it: the first audience-facing occurrence must immediately explain what the feature concretely gives or does in natural Chinese. Preserve quantity, duration, recurrence, permission, and guarantee strength exactly: a one-time credit, reset, trial, exception, or temporary rollout cannot become permanent freedom from recurring limits or costs; free availability or free use does not prove commercial-use permission; support does not prove a guarantee; and an open-source repository does not transfer third-party asset licenses. Unsupported mechanisms, policies, risks, permissions, or advice are fail.",
+                "Reject when an actor, action, object, recipient, chronology, causal strength, or certainty differs from the evidence; when a concrete technical name is replaced by a vague category that makes the event harder to understand; when Chinese reads like literal translation, a report, or abstract consultant language; or when a screen cannot explain itself without narration. For a model/product story, reject a selected hook that omits the exact model/product name and names only its vendor, publisher, host, or benchmark.",
+                "For each field, first extract actor-action-object-recipient and certainty, then compare them with evidence. A naturalness score below 4 is fail. Unexplained English technical nouns inside Chinese prose are fail when the evidence lets you explain the concrete action. Keeping an official English feature name does not exempt it: the first audience-facing occurrence must immediately explain what the feature concretely gives or does in natural Chinese. The same rule applies to specialist Chinese metrics: if a hook/fact says 拒绝率、幻觉率、激活参数、上下文窗口 or a similarly non-obvious metric, the first relevant evidence shot must say in plain Chinese what it measures or means in practice; numbers alone are not an explanation. Preserve quantity, duration, recurrence, permission, and guarantee strength exactly: a one-time credit, reset, trial, exception, or temporary rollout cannot become permanent freedom from recurring limits or costs; free availability or free use does not prove commercial-use permission; support does not prove a guarantee; and an open-source repository does not transfer third-party asset licenses. Unsupported mechanisms, policies, risks, permissions, or advice are fail.",
                 "For headline, selected_hook, fixed_conclusion, GitHub hook_opening, and GitHub footer, also judge short-video attention. A score below 4 is fail. GitHub hook_reveal and hook_verdict must add a clear new capability and payoff, but they do not each need to manufacture another standalone conflict after hook_opening has earned attention. Calibrate strictly: 1 is vague filler; 2 is a generic topic; 3 is an accurate actor-plus-event or project-plus-capability summary that gives little reason to watch the next screen; 4 adds a specific evidence-backed contradiction, workflow contrast, surprise, consequence, relief, scale, or open question and is materially more compelling than the stable project title; 5 is both immediately clear and unusually memorable. A GitHub opening written as 项目名：功能, 项目名能做某事, or a feature list is capped at 3 even when accurate. A strong hook creates an information gap without hiding the event. A headline copied into selected_hook with only a colon or minor wording change cannot score 4. Generic phrases such as 引发讨论、值得关注、注意风险、生态竞争 or a neutral topic label are not a payoff. The fixed conclusion or GitHub footer must deliver a clear evidence-backed view or memorable consequence, not merely repeat the event or give ritual caution.",
                 "Every repair_instruction is evidence-bound too. Never propose an example sentence containing a date, quantity, rollout scope, default behavior, first/only/all/complete superlative, licensing permission, official policy, mechanism, or capability absent from the supplied evidence. If stronger attention cannot be earned by another verified fact, improve the stance and concrete wording around the existing fact instead of inventing one.",
                 "For a fixed_conclusion repair, end on the strongest verified impact, payoff, or concrete action. Never instruct the writer to append 未知、有待观察、有待验证、进一步研究、需关注后续 or an equivalent ritual caveat; move a decision-critical scope limit to its own evidence field instead.",
@@ -486,6 +498,8 @@ class OpenAICompatibleStoryWriter:
             or "flash final shot must deliver" in validation_error
             or "flash story must spend its last seconds" in validation_error
             or "semantic copy critic issues" in validation_error
+            or "selected_hook must name the concrete model subject" in validation_error
+            or "must explain specialist metric" in validation_error
         ):
             return self._repair_editorial_copy(packet, invalid_draft, validation_error)
         repair_contract = (
@@ -539,7 +553,7 @@ class OpenAICompatibleStoryWriter:
             {"role": "system", "content": "Return a single corrected valid JSON object. Never add markdown fences."},
             {"role": "user", "content": packet.prompt()},
             {"role": "assistant", "content": json.dumps(invalid_draft, ensure_ascii=False)},
-            {"role": "user", "content": "Your JSON failed deterministic validation. Return the complete corrected JSON and fix EVERY semicolon-separated error simultaneously. Never return the same invalid target/role pair or the same overlong copy. Rewrite an overlong browser-highlight translation to at most 36 total characters; root full_translation follows its separate 60–120-character rule. " + repair_contract + " Error: " + validation_error},
+            {"role": "user", "content": "Your JSON failed deterministic validation. Return the complete corrected JSON and fix EVERY semicolon-separated error simultaneously. Never return the same invalid target/role pair or the same overlong browser translation. Do not shorten a title or selected_hook by deleting an exact person, company, project, model, or product name: the renderer reduces title font size and adds lines. Rewrite an overlong browser-highlight translation to at most 36 total characters; root full_translation follows its separate 60–120-character rule. " + repair_contract + " Error: " + validation_error},
         ])
 
     def _repair_root_translation(
@@ -651,6 +665,7 @@ class OpenAICompatibleStoryWriter:
                 "Delete unsupported concepts completely; do not replace them with synonyms or caveats. "
                 "Do not mention missing mechanisms/details anywhere. When a feature name is opaque, tell only the verified actor, rollout, time, coverage, quote, capability, or result. End on the strongest verified scope/payoff. "
                 "Keep branded feature and product identifiers exactly as written in evidence unless an official Chinese name is cited, but do not leave an opaque English identifier unexplained. At its first audience-facing occurrence, immediately state in natural Chinese what the evidence says it gives or does; never invent a dictionary-style Chinese product name. "
+                "For model/product stories, keep the exact model/product name in headline and selected_hook. If a visible fact uses a specialist metric such as 拒绝率, add a concise plain-Chinese meaning in that first relevant shot (for 拒绝率: the proportion of prompts the model declines to answer), while preserving the sourced number. "
                 "Preserve every finite scope exactly: one credited reset, trial, grant, exception, or temporary rollout stays finite and cannot become a permanent removal of recurring limits, costs, or waiting periods. "
                 "Every shot must add a different fact. Do not paraphrase the same scope or result twice. "
                 "Keep production metadata separate from visible copy. question, interpretation, relation_to_previous, retention_job, and director_brief are internal. audience_copy is the only optional second line shown to viewers: make it a declarative subject/fact/comparison/impact sentence, or return an empty string. Never put reading guidance, viewing guidance, learning advice, expected-weight instructions, or editor commands in audience_copy. "
@@ -860,7 +875,8 @@ class OpenAICompatibleStoryWriter:
         # finish_reason=error, empty content, or a prose error instead of the
         # requested JSON object. Treat those as bounded transient failures in
         # the same way as 429/5xx responses.
-        for attempt in range(3):
+        max_attempts = 2
+        for attempt in range(max_attempts):
             try:
                 with urlopen(request, timeout=self.settings.timeout_seconds) as response:
                     result = json.loads(response.read().decode("utf-8"))
@@ -879,14 +895,16 @@ class OpenAICompatibleStoryWriter:
                 last_error = error
             except (URLError, OSError, http.client.HTTPException, json.JSONDecodeError, ValueError) as error:
                 last_error = error
-            if attempt < 2:
+            if attempt < max_attempts - 1:
                 time.sleep(0.6 * (attempt + 1))
         if result is None or draft is None:
             if isinstance(last_error, HTTPError):
                 detail = f"HTTP {last_error.code}"
             else:
                 detail = str(getattr(last_error, "reason", last_error))
-            raise RuntimeError(f"{self.settings.provider} story request failed after 3 attempts: {detail}") from last_error
+            raise RuntimeError(
+                f"{self.settings.provider} story request failed after {max_attempts} attempts: {detail}"
+            ) from last_error
         provenance = {
             "provider": self.settings.provider, "model": result.get("model", self.settings.model),
             "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),

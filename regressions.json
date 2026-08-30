@@ -1,0 +1,216 @@
+[
+  {
+    "id": "VF-20260830-001",
+    "title": "X canonical URL caused full LLM regeneration",
+    "stage": "adoption_retry",
+    "reproduction": "A source begins as /i/status/<id> and acquisition resolves it to /<author>/status/<id>.",
+    "impact": "The same valid director manifest was regenerated, adding 22 LLM calls and avoidable cost.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_x_canonical_author_url_reuses_failed_manifest_without_llm_retry",
+      "tests/test_discovery.py::DiscoveryTest::test_needs_human_candidate_resumes_from_manifest_before_any_llm_call"
+    ]
+  },
+  {
+    "id": "VF-20260830-002",
+    "title": "Missing browser text aborted an otherwise valid render",
+    "stage": "browser_capture",
+    "reproduction": "A source page changes DOM text after the director selected an exact evidence target.",
+    "impact": "Capture failed instead of preserving the source page with an honest non-highlighted fallback.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_missing_browser_text_repairs_to_real_page_hold_without_false_highlight"
+    ]
+  },
+  {
+    "id": "VF-20260830-003",
+    "title": "GitHub placeholder description became a fake browser target",
+    "stage": "browser_capture",
+    "reproduction": "The GitHub API returns the literal placeholder 'No repository description'.",
+    "impact": "The recorder searched for text that was never visible on the repository page.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_github_final_cut_skips_nonvisible_empty_description_placeholder"
+    ]
+  },
+  {
+    "id": "VF-20260830-004",
+    "title": "Launchd lock contention was recorded as a pipeline crash",
+    "stage": "scheduler",
+    "reproduction": "A scheduled launch overlaps a still-running manual or launchd pipeline.",
+    "impact": "A healthy no-op collision polluted the bug audit as a crash.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_automation.py::AutomationTest::test_pipeline_lock_collision_is_a_scheduler_skip_not_a_crash"
+    ]
+  },
+  {
+    "id": "VF-20260830-005",
+    "title": "Sensitive research review could be confused with publication approval",
+    "stage": "human_audit",
+    "reproduction": "A security-research video reaches the dashboard with only the editorial safety gate blocked.",
+    "impact": "One click could ambiguously mean both safety review and publication authorization.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_dashboard.py::DashboardTest::test_sensitive_video_requires_separate_review_before_publish"
+    ]
+  },
+  {
+    "id": "VF-20260830-006",
+    "title": "Model video title named the publisher but omitted the model",
+    "stage": "director",
+    "reproduction": "A repair shortens a model hook by dropping GLM-5.3-Flash while retaining OrcaRouter.",
+    "impact": "Viewers cannot identify which model the metrics describe.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_model_brief_rejects_hook_that_names_vendor_but_not_model",
+      "tests/test_editorial.py::EditorialContractTests::test_model_canonicalization_selects_existing_model_named_hook"
+    ]
+  },
+  {
+    "id": "VF-20260830-007",
+    "title": "Specialist metric was not explained for vibe coders",
+    "stage": "director",
+    "reproduction": "The hook says refusal rate or rejection rate with a percentage but never defines the metric.",
+    "impact": "A technically curious non-research audience sees numbers without understanding what they measure.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_model_opening_explains_refusal_rate_for_vibe_coders",
+      "tests/test_editorial.py::EditorialContractTests::test_model_prompt_requires_exact_name_and_plain_metric_explanation",
+      "tests/test_editorial.py::EditorialContractTests::test_canonicalization_injects_plain_refusal_metric_glossary",
+      "tests/test_editorial.py::EditorialContractTests::test_common_metrics_receive_one_plain_definition_at_first_use",
+      "tests/test_editorial.py::EditorialContractTests::test_common_developer_terms_do_not_consume_the_single_glossary_slot",
+      "tests/test_editorial.py::EditorialContractTests::test_video_explains_only_the_hardest_term_unless_hook_names_one"
+    ]
+  },
+  {
+    "id": "VF-20260830-008",
+    "title": "Long exact titles risked losing entities instead of adapting layout",
+    "stage": "composition",
+    "reproduction": "A title needs the exact model name plus a quantified hook and exceeds the default two-line rail.",
+    "impact": "Copy repair could remove the subject to fit instead of preserving meaning.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_fixed_upper_rail_expands_to_keep_long_title_complete"
+    ]
+  },
+  {
+    "id": "VF-20260830-009",
+    "title": "YouTube output could contain silent or truncated audio",
+    "stage": "youtube_render",
+    "reproduction": "A rendered collection item fails AAC, audio duration, or audible-audio validation.",
+    "impact": "A video could look complete while losing the original speech after the opening minutes.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_youtube_audio_failure_is_repaired_and_revalidated_in_same_attempt"
+    ]
+  },
+  {
+    "id": "VF-20260830-010",
+    "title": "Tiny browser highlight aborted deterministic rendering",
+    "stage": "browser_capture",
+    "reproduction": "A valid source target such as License: produces a yellow outline narrower than the readable-line gate.",
+    "impact": "A valid content manifest failed rendering even though the page position itself was useful evidence.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_tiny_browser_highlight_repairs_to_source_page_hold"
+    ]
+  },
+  {
+    "id": "VF-20260830-011",
+    "title": "Selected glossary definition was stored but invisible on X card",
+    "stage": "composition",
+    "reproduction": "The root X shot carries a glossary definition in audience_copy while the card renders only full_translation.",
+    "impact": "The manifest passed readability checks but the viewer never saw the promised explanation.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_x_card_renders_the_single_selected_glossary_beside_translation"
+    ]
+  },
+  {
+    "id": "VF-20260830-012",
+    "title": "YouTube interview highlight downloaded the complete source before selection",
+    "stage": "youtube_acquisition",
+    "reproduction": "Generate a 60–180 second known-tech interview highlight from a 15–120 minute YouTube source.",
+    "impact": "The factory downloaded the entire source before transcript selection, wasting bandwidth, time, storage, and retry cost.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_selection_precedes_partial_media_download",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_download_command_uses_only_padded_selected_interval",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_complete_source_download_omits_download_sections",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_technical_coverage_factory_requests_complete_source",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_rebase_keeps_original_provenance_and_stays_in_bounds"
+    ]
+  },
+  {
+    "id": "VF-20260830-013",
+    "title": "X acquisition hid OpenCLI exit diagnostics",
+    "stage": "x_acquisition",
+    "reproduction": "The same OpenCLI X command succeeds directly but exits 69 when the Video Factory subprocess lacks browser automation access.",
+    "impact": "The job reported only CalledProcessError, so operators could not distinguish a browser permission boundary from a bad URL or missing post.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_x_capture_failure_preserves_opencli_exit_diagnostics",
+      "tests/test_editorial.py::EditorialContractTests::test_x_capture_falls_back_to_public_snapshot_without_browser_session",
+      "tests/test_editorial.py::EditorialContractTests::test_x_capture_backs_off_once_before_switching_backend"
+    ]
+  },
+  {
+    "id": "VF-20260830-014",
+    "title": "Editorial agent stopped after a cheap model exhausted semantic repairs",
+    "stage": "content_agent",
+    "reproduction": "The primary low-cost writer produces three near-duplicate retention hooks and the independent copy critic rejects every bounded repair.",
+    "impact": "A valid source required Codex intervention even though a stronger qualified model was available through a configured fallback provider; an explicit primary-provider choice incorrectly disabled that route.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted",
+      "tests/test_agent.py::ContentAgentTest::test_changed_critic_issue_gets_one_final_convergence_repair"
+    ]
+  },
+  {
+    "id": "VF-20260830-015",
+    "title": "LLM retry multiplication allowed one logical call to block for six minutes",
+    "stage": "model_transport",
+    "reproduction": "A provider returns empty or invalid content while each of three transport attempts waits for the former 120-second timeout.",
+    "impact": "A 12-call primary plus 14-call fallback path could take many minutes without local CPU work or visible progress.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_transport_stops_after_two_bounded_attempts",
+      "tests/test_factory.py::VideoFactoryTest::test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted"
+    ]
+  },
+  {
+    "id": "VF-20260830-016",
+    "title": "Temporal wording still implied an explicitly unproven causal link",
+    "stage": "content_agent",
+    "reproduction": "Evidence says an account was suspended after a configuration change and the author explicitly says they do not know whether the setup triggered it.",
+    "impact": "Short-video copy such as '照做后被封' was likely to be read as causation even after replacing the stronger word '导致'.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_explicit_trigger_uncertainty_requires_adjacent_visible_qualification",
+      "tests/test_factory.py::VideoFactoryTest::test_no_causal_uncertainty_rule_without_explicit_source_boundary"
+    ]
+  },
+  {
+    "id": "VF-20260830-017",
+    "title": "Employee reply was promoted to an official company response",
+    "stage": "content_agent",
+    "reproduction": "A company employee replies from a personal X account inside a public discussion thread.",
+    "impact": "Viewer-facing copy called the personal comment the company's first official response, overstating source identity and authority.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_employee_reply_cannot_be_promoted_to_official_company_response"
+    ]
+  },
+  {
+    "id": "VF-20260830-018",
+    "title": "WeChat playback chrome covered the fixed title and conclusion rails",
+    "stage": "composition",
+    "reproduction": "View a 1080x1920 information-frame video full-screen in WeChat Channels on a phone with status chrome and the post-title/action overlay visible.",
+    "impact": "The first title line overflowed beneath the top status area and the fixed conclusion collided with the WeChat post title, making essential copy unreadable.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_information_frame_keeps_wechat_ui_safe_bands_free_of_text"
+    ]
+  }
+]

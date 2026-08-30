@@ -1,11 +1,18 @@
+import json
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from video_factory.director import NarrativeAnswer, StoryboardDirector
-from video_factory.editorial import canonicalize_editorial_brief, compile_evidence_shots, route_content, validate_editorial_brief
+from video_factory.editorial import (
+    canonicalize_editorial_brief, compile_evidence_shots, route_content,
+    validate_editorial_brief, validate_editorial_structure,
+)
 from video_factory.compositor import (
-    GITHUB_COLD_OPEN_LAYOUTS, _centered_lines, _footer_layout, _information_layout, _wrapped_lines, render_github_cold_open_frames,
+    GITHUB_COLD_OPEN_LAYOUTS, WECHAT_BOTTOM_UI_SAFE, WECHAT_TOP_UI_SAFE,
+    _centered_lines, _footer_layout, _information_layout, _wrapped_lines, render_github_cold_open_frames,
     render_information_frame,
 )
 from video_factory.llm import OpenAICompatibleStoryWriter, _compile_evidence_shot_kind
@@ -15,6 +22,7 @@ from video_factory.models import (
     SelectionReason, SourceType, StoryArcBeat, StorySubject, TopicType,
 )
 from video_factory.quality import _quantity_supported, validate_manifest
+from video_factory.storage import Workspace
 from video_factory.tweetcard import render_editorial_card, render_tweet_card
 from video_factory.webcapture import WebScrollVideoAdapter
 from video_factory.writer import StoryWriterPacket
@@ -123,6 +131,25 @@ class EditorialContractTests(unittest.TestCase):
         height, _, lines = _footer_layout(footer)
         self.assertLessEqual(height, 310)
         self.assertGreaterEqual(lines, 3)
+
+    def test_information_frame_keeps_wechat_ui_safe_bands_free_of_text(self):
+        from PIL import Image
+
+        title = "OpenRouter Cheaper Choice｜DeepSeek V4 Flash 0731"
+        footer = "开发者现在可以直接比较真实线路价格，再决定是否接入。"
+        with TemporaryDirectory() as directory:
+            output = render_information_frame(title, footer, Path(directory) / "frame.png")
+            with Image.open(output).convert("RGBA") as image:
+                background = (3, 17, 38, 255)
+                top_colors = set(image.crop((0, 0, 1080, WECHAT_TOP_UI_SAFE)).getdata())
+                bottom_colors = set(image.crop((0, 1920 - WECHAT_BOTTOM_UI_SAFE, 1080, 1920)).getdata())
+                self.assertEqual(top_colors, {background})
+                self.assertEqual(bottom_colors, {background})
+
+                title_band = image.crop((0, WECHAT_TOP_UI_SAFE, 1080, WECHAT_TOP_UI_SAFE + 260))
+                footer_band = image.crop((0, 1920 - WECHAT_BOTTOM_UI_SAFE - 230, 1080, 1920 - WECHAT_BOTTOM_UI_SAFE))
+                self.assertGreater(len(set(title_band.getdata())), 1)
+                self.assertGreater(len(set(footer_band.getdata())), 1)
 
     def test_balanced_footer_never_splits_an_ascii_word(self):
         from PIL import Image, ImageDraw, ImageFont
@@ -350,12 +377,92 @@ class EditorialContractTests(unittest.TestCase):
             [{"type": "photo", "url": "https://pbs.twimg.com/media/context.jpg"}],
         )
 
+    def test_x_capture_failure_preserves_opencli_exit_diagnostics(self):
+        failure = subprocess.CalledProcessError(
+            69, ["opencli", "twitter", "thread"],
+            output="trace retained", stderr="browser automation permission denied",
+        )
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp) / "workspace")
+            workspace.initialize()
+            with (
+                patch("video_factory.acquisition.subprocess.run", side_effect=failure),
+                patch.object(URLAcquirer, "_fetch_readable", side_effect=RuntimeError("reader offline")),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    r"opencli-twitter-thread: exit 69: browser automation permission denied trace retained",
+                ),
+            ):
+                URLAcquirer(workspace)._acquire_x(
+                    "https://x.com/JeffDean/status/2085034604172603724", Path(temp),
+                )
+
+    def test_x_capture_falls_back_to_public_snapshot_without_browser_session(self):
+        snapshot = '''Title: Jeff Dean (@JeffDean) on X
+Published Time: 2026-08-05T16:06:02.000Z
+Markdown Content:
+## Post
+* [Jeff Dean](https://x.com/JeffDean) [@JeffDean](https://x.com/JeffDean)  Announcing Discovery Loop with Sanjay, Oriol and Quoc. Learn more at [discoveryloop.com](https://discoveryloop.com/) [![Image 3](https://pbs.twimg.com/media/team.jpg)](https://x.com/JeffDean/status/2085034604172603724/photo/1) [4:06 PM · Aug 5, 2026](https://x.com/JeffDean/status/2085034604172603724)
+'''
+        failure = subprocess.CalledProcessError(69, ["opencli"], stderr="permission denied")
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp) / "workspace")
+            workspace.initialize()
+            acquirer = URLAcquirer(workspace)
+            with (
+                patch("video_factory.acquisition.subprocess.run", side_effect=failure),
+                patch.object(acquirer, "_fetch_readable", return_value=(snapshot.encode(), "text/plain", "jina-reader")),
+                patch.object(acquirer, "_archive_x_media"),
+            ):
+                result = acquirer._acquire_x(
+                    "https://x.com/JeffDean/status/2085034604172603724", Path(temp),
+                )
+
+            self.assertEqual(result.method, "jina-reader-x-fallback")
+            self.assertEqual(result.ingest.candidate.author, "JeffDean")
+            self.assertIn("Announcing Discovery Loop", result.ingest.evidence[0].quote)
+            self.assertIn("discoveryloop.com", result.ingest.evidence[0].quote)
+
+    def test_x_capture_backs_off_once_before_switching_backend(self):
+        failure = subprocess.CalledProcessError(69, ["opencli"], stderr="extension busy")
+        success = subprocess.CompletedProcess(
+            ["opencli"], 0,
+            stdout='[{"id":"2086470022772457950","author":"sama","name":"Sam Altman",'
+                   '"text":"tibo is great","created_at":"Sun Aug 09 15:09:52 +0000 2026"}]',
+            stderr="",
+        )
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp) / "workspace")
+            workspace.initialize()
+            acquirer = URLAcquirer(workspace)
+            with (
+                patch("video_factory.acquisition.subprocess.run", side_effect=[failure, success]) as run,
+                patch("video_factory.acquisition.time.sleep") as sleep,
+                patch.object(acquirer, "_fetch_readable") as public_reader,
+                patch.object(acquirer, "_archive_x_media"),
+            ):
+                result = acquirer._acquire_x(
+                    "https://x.com/sama/status/2086470022772457950", Path(temp),
+                )
+
+            self.assertEqual(result.method, "opencli-twitter-thread")
+            self.assertEqual(run.call_count, 2)
+            sleep.assert_called_once_with(0.75)
+            public_reader.assert_not_called()
+            capture = json.loads(result.artifact.read_text(encoding="utf-8"))
+            self.assertEqual(capture["selected_backend"], "opencli-twitter-thread")
+            self.assertEqual(
+                [item["status"] for item in capture["acquisition_trace"]],
+                ["retryable_failure", "backoff", "succeeded"],
+            )
+
     def test_source_kind_and_story_topic_are_routed_independently(self):
         cases = [
             (Candidate("x-company", SourceType.TWEET, "https://x.com/JeffDean/status/1", "We are founding Discovery Loop", author="JeffDean"), "founding a company and leaving Google", TopicType.COMPANY_OR_TEAM, ContentType.FLASH),
             (Candidate("x-practice", SourceType.TWEET, "https://x.com/dev/status/2", "My coding workflow"), "I tried this workflow once", TopicType.PRACTICE_POST, ContentType.FLASH),
             (Candidate("x-research", SourceType.TWEET, "https://x.com/researcher/status/3", "We found an API vulnerability"), "We verified the experiment across frontier models", TopicType.RESEARCH_OR_BENCHMARK, ContentType.DEEP_DIVE),
             (Candidate("x-update", SourceType.TWEET, "https://x.com/employee/status/4", "The banked reset has landed"), "For all paid users", TopicType.OFFICIAL_ANNOUNCEMENT, ContentType.FLASH),
+            (Candidate("x-model", SourceType.TWEET, "https://x.com/lab/status/5", "GLM-5.3-Flash: we released open-source native FP8 model weights"), "320B parameters on Hugging Face", TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER),
             (Candidate("tool", SourceType.WEB, "https://developers.cloudflare.com/agents/", "Agents SDK docs"), "Quick Start SDK API reference", TopicType.TOOL_SDK_AGENT, ContentType.EXPLAINER),
             (Candidate("model", SourceType.WEB, "https://www.anthropic.com/product", "Introducing Claude Opus"), "The new model is available today", TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER),
             (Candidate("company", SourceType.WEB, "https://example.com/team", "New founding team"), "The seed round backs a new company", TopicType.COMPANY_OR_TEAM, ContentType.FLASH),
@@ -416,6 +523,135 @@ class EditorialContractTests(unittest.TestCase):
         self.assertNotIn('"scenes"', prompt)
         self.assertIn('"director_brief"', prompt)
         self.assertIn("Investigate like an editor", prompt)
+
+    def test_model_prompt_requires_exact_name_and_plain_metric_explanation(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
+        prompt = StoryWriterPacket(
+            candidate, [evidence(candidate)], TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER, 28,
+        ).prompt()
+
+        self.assertIn("persistent title and selected hook must name the exact model", prompt)
+        self.assertIn("vibe coder", prompt)
+        self.assertIn("refusal rate means", prompt)
+        self.assertIn("renderer owns title fitting", prompt)
+
+    def test_model_brief_rejects_hook_that_names_vendor_but_not_model(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
+        brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+        brief.subjects = [
+            StorySubject("OrcaRouter", "vendor", "发布权重", "开放研究", [item.id]),
+            StorySubject("GLM-5.3-Flash", "model", "开放权重", "可供研究", [item.id]),
+        ]
+        brief.attention_strategy.selected_hook = "OrcaRouter 把拒绝率从 96% 降到 11%"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER,
+        )
+
+        self.assertTrue(any("must name the concrete model subject" in error for error in errors))
+
+    def test_model_opening_explains_refusal_rate_for_vibe_coders(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
+        brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+        brief.subjects = [StorySubject(
+            "GLM-5.3-Flash", "model", "开放权重", "拒绝率下降", [item.id],
+        )]
+        brief.attention_strategy.selected_hook = "GLM-5.3-Flash 拒绝率从 96% 降到 11%"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        brief.evidence_shots[0].fact = "GLM-5.3-Flash 拒绝率降到 11%"
+        brief.evidence_shots[0].audience_copy = ""
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER,
+        )
+        self.assertTrue(any("must explain specialist metric 拒绝率" in error for error in errors))
+
+        brief.evidence_shots[0].audience_copy = "拒绝率就是模型直接拒绝回答的问题占比。"
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER,
+        )
+        self.assertFalse(any("must explain specialist metric 拒绝率" in error for error in errors))
+
+    def test_model_canonicalization_selects_existing_model_named_hook(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
+        brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+        brief.subjects = [
+            StorySubject("OrcaRouter", "vendor", "发布权重", "开放研究", [item.id]),
+            StorySubject("GLM-5.3-Flash", "model", "开放权重", "可供研究", [item.id]),
+        ]
+        brief.attention_strategy.hook_candidates = [
+            "OrcaRouter 把拒答率从 96% 降到 11%",
+            "GLM-5.3-Flash 拒答率从 96% 降到 11%",
+            "GLM-5.3-Flash 的部分拒绝仍未归零",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [item])
+
+        self.assertIn("GLM-5.3-Flash", brief.attention_strategy.selected_hook)
+
+    def test_canonicalization_injects_plain_refusal_metric_glossary(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
+        brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+        brief.attention_strategy.selected_hook = "GLM-5.3-Flash 拒答率从 96% 降到 11%"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        brief.evidence_shots[0].audience_copy = "320B 参数，原生 FP8。"
+
+        canonicalize_editorial_brief(brief, [item])
+
+        self.assertEqual(
+            brief.evidence_shots[0].audience_copy,
+            "拒答率：模型直接拒绝回答的请求占比。",
+        )
+
+    def test_common_metrics_receive_one_plain_definition_at_first_use(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "Model")
+        cases = {
+            "幻觉率降到 3%": "幻觉率：模型生成错误或无依据内容的占比。",
+            "激活参数只有 18B": "激活参数：模型每次生成时实际参与计算的参数规模。",
+            "原生 FP8 权重": "FP8 量化：用更低数值精度减少模型的显存和计算占用。",
+            "TTFT 降到 100ms": "TTFT：发出请求到看到第一个 Token 的等待时间。",
+            "Arena 分上升": "Arena 分：模型对战评测按胜负换算的相对分数。",
+            "SWE-bench pass@1 达到 50%": "pass@1：代码只生成一次就通过测试的比例。",
+        }
+        for visible, expected in cases.items():
+            with self.subTest(term=visible):
+                brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+                brief.evidence_shots[0].fact = visible
+                brief.evidence_shots[0].audience_copy = ""
+                canonicalize_editorial_brief(brief, [item])
+                self.assertEqual(brief.evidence_shots[0].audience_copy, expected)
+
+    def test_common_developer_terms_do_not_consume_the_single_glossary_slot(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "Model")
+        brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+        brief.evidence_shots[0].fact = "上下文窗口扩大到 1M，吞吐量达到 200 TPS"
+        brief.evidence_shots[0].audience_copy = "开发者可直接比较长文本和并发性能。"
+
+        canonicalize_editorial_brief(brief, [item])
+
+        self.assertEqual(brief.evidence_shots[0].audience_copy, "开发者可直接比较长文本和并发性能。")
+
+    def test_video_explains_only_the_hardest_term_unless_hook_names_one(self):
+        candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "Model")
+        brief, item = brief_for(candidate, TopicType.MODEL_OR_PRODUCT, ContentType.EXPLAINER)
+        brief.evidence_shots[0].fact = "原生 FP8 权重，拒绝率降到 11%"
+        brief.evidence_shots[0].audience_copy = ""
+        brief.evidence_shots[1].fact = "激活参数只有 18B"
+        brief.evidence_shots[1].audience_copy = ""
+        canonicalize_editorial_brief(brief, [item])
+        explanations = [shot.audience_copy for shot in brief.evidence_shots if "：" in shot.audience_copy]
+        self.assertEqual(explanations, ["FP8 量化：用更低数值精度减少模型的显存和计算占用。"])
+
+        brief.evidence_shots[0].audience_copy = ""
+        brief.attention_strategy.selected_hook = "模型拒绝率降到 11%"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        canonicalize_editorial_brief(brief, [item])
+        self.assertEqual(
+            brief.evidence_shots[0].audience_copy,
+            "拒绝率：模型直接拒绝回答的请求占比。",
+        )
 
     def test_company_and_research_prompts_include_channel_specific_editorial_contracts(self):
         candidate = Candidate("web", SourceType.WEB, "https://example.com/story", "Story")

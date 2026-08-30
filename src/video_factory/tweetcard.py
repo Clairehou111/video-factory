@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from .compositor import _font_path, _translation_only, _wrapped_lines
+from .editorial import is_audience_glossary_definition
 from .models import Candidate, Evidence, Scene
 
 
@@ -37,6 +38,14 @@ def _contextual_excerpt(source: str, target: str, limit: int = 340) -> str:
     return excerpt
 
 
+def _tweet_translation_copy(scene: Scene) -> str:
+    translation = (scene.highlight_translation or "").strip()
+    glossary = (scene.screen_interpretation or "").strip()
+    if glossary and is_audience_glossary_definition(glossary) and glossary not in translation:
+        return (translation + "\n" + glossary).strip()
+    return translation
+
+
 def render_tweet_card(
     candidate: Candidate, root: Evidence, scene: Scene, output: Path,
     size: tuple[int, int] = (1384, 1602),
@@ -67,7 +76,7 @@ def render_tweet_card(
 
     source_text = re.sub(r"https://t\.co/\S+", "", root.quote).replace("♾", "∞")
     source_text = re.sub(r"(?im)^\s*(?:learn more at|read more|details)\s*:\s*$", "", source_text).strip()
-    translation = (scene.highlight_translation or "").strip()
+    translation = _tweet_translation_copy(scene)
     translation_font = None
     translation_lines: list[str] = []
     translation_height = 0

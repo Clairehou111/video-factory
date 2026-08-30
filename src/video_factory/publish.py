@@ -20,6 +20,9 @@ from .quality import CheckResult, is_publishable, validate_manifest
 
 SOCIAL_AUTO_UPLOAD_REPOSITORY = "https://github.com/dreammis/social-auto-upload.git"
 SOCIAL_AUTO_UPLOAD_COMMIT = "1c66b7db4b30585bbb40c58eb0aa572ffa3cce97"
+BILIUP_REPOSITORY = "https://github.com/biliup/biliup.git"
+BILIUP_COMMIT = "051f5c7eb051f6c178c52e73fa0b52818a46c52d"
+BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID = "__ordinary_upload__"
 
 
 class PublicationState(StrEnum):
@@ -230,6 +233,7 @@ class PublishBatch:
     state: PublishBatchState
     backend_commit: str = SOCIAL_AUTO_UPLOAD_COMMIT
     checks: list[dict[str, Any]] = field(default_factory=list)
+    review_overrides: dict[str, dict[str, str]] = field(default_factory=dict)
     approval_digest: str | None = None
     approved_by: str | None = None
     approved_at: str | None = None
@@ -260,6 +264,7 @@ class PublishBatch:
             "video_sha256": self.video_sha256,
             "backend_commit": self.backend_commit,
             "targets": [target.approval_payload() for target in self.targets],
+            "review_overrides": self.review_overrides,
         }
 
     def compute_approval_digest(self) -> str:
@@ -277,6 +282,31 @@ class PublishBatch:
         self.approved_by = actor.strip()
         self.approved_at = now_iso()
         self.state = PublishBatchState.APPROVED
+        self.updated_at = now_iso()
+
+    def record_review_override(self, check_name: str, actor: str, reason: str) -> None:
+        """Record a narrow human quality-gate decision before ordinary approval."""
+        if check_name != "editorial_safety_review":
+            raise ValueError(f"quality check cannot be overridden from the dashboard: {check_name}")
+        if self.state != PublishBatchState.BLOCKED:
+            raise ValueError(f"review override requires a blocked batch; current state is {self.state}")
+        if not actor.strip() or not reason.strip():
+            raise ValueError("review override requires an actor and reason")
+        check = next((row for row in self.checks if row.get("name") == check_name), None)
+        if check is None or check.get("passed", False):
+            raise ValueError(f"batch has no failed {check_name} check")
+        original_detail = str(check.get("detail") or "")
+        self.review_overrides[check_name] = {
+            "actor": actor.strip(), "reason": reason.strip(),
+            "reviewed_at": now_iso(), "original_detail": original_detail,
+        }
+        check["passed"] = True
+        check["detail"] = f"人工审核通过：{reason.strip()}（原门禁：{original_detail}）"
+        if all(bool(row.get("passed", False)) for row in self.checks):
+            self.state = PublishBatchState.READY_FOR_REVIEW
+        self.approval_digest = None
+        self.approved_by = None
+        self.approved_at = None
         self.updated_at = now_iso()
 
     def verify_approval(self) -> None:
@@ -356,6 +386,10 @@ class SocialAutoUploadSettings:
             return self.venv_dir / "Scripts" / "sau.exe"
         return self.venv_dir / "bin" / "sau"
 
+    @property
+    def biliup_source_dir(self) -> Path:
+        return self.runtime_home / "biliup-source"
+
 
 class SocialAutoUploadBackend:
     """Pinned, isolated subprocess adapter for social-auto-upload's public CLI."""
@@ -396,6 +430,17 @@ class SocialAutoUploadBackend:
         if not python.is_file():
             self._checked([uv, "venv", "--python", self.settings.python_version, str(self.settings.venv_dir)])
         self._checked([uv, "pip", "install", "--python", str(python), "-e", str(source)])
+        biliup_source = self.settings.biliup_source_dir
+        if not biliup_source.exists():
+            self._checked([git, "clone", "--filter=blob:none", "--no-checkout", BILIUP_REPOSITORY, str(biliup_source)])
+        elif not (biliup_source / ".git").is_dir():
+            raise RuntimeError(f"managed biliup source is not a git checkout: {biliup_source}")
+        self._checked([git, "-C", str(biliup_source), "fetch", "--depth", "1", "origin", BILIUP_COMMIT])
+        self._checked([git, "-C", str(biliup_source), "checkout", "--detach", BILIUP_COMMIT])
+        self._checked([
+            uv, "pip", "install", "--python", str(python),
+            "requests>=2.32.3", "aiohttp>=3.9.5", "rsa>=4.6",
+        ])
         patchright = self.settings.venv_dir / ("Scripts/patchright.exe" if os.name == "nt" else "bin/patchright")
         install_managed_browser = not local_chrome or os.environ.get("VIDEO_FACTORY_INSTALL_MANAGED_CHROMIUM") == "1"
         if install_managed_browser:
@@ -416,6 +461,8 @@ class SocialAutoUploadBackend:
             "browser_runtime": str(self.settings.runtime_home / "browsers"),
             "managed_browser_installed": str(install_managed_browser).lower(),
             "compatibility_patches": ",".join(compatibility_patches),
+            "biliup_repository": BILIUP_REPOSITORY,
+            "biliup_commit": BILIUP_COMMIT,
         }
         (self.settings.runtime_home / "installation.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
@@ -423,6 +470,8 @@ class SocialAutoUploadBackend:
         return metadata
 
     def login_account(self, platform: PublishPlatform, account_name: str, headless: bool = False) -> BackendResult:
+        if platform == PublishPlatform.BILIBILI:
+            return self._run_bilibili_direct("login", account_name, [], timeout=900, interactive=True)
         flags = [] if platform == PublishPlatform.BILIBILI else (["--headless"] if headless else ["--headed"])
         result = self._run([platform.value, "login", "--account", account_name, *flags], timeout=900, interactive=True)
         self._restrict_account_files()
@@ -432,6 +481,10 @@ class SocialAutoUploadBackend:
         return self.check_login(target.platform, target.account_name)
 
     def check_login(self, platform: PublishPlatform, account_name: str) -> BackendResult:
+        if platform == PublishPlatform.BILIBILI:
+            return self._run_bilibili_direct(
+                "check", account_name, [], timeout=self.settings.check_timeout_seconds,
+            )
         return self._run(
             [platform.value, "check", "--account", account_name],
             timeout=self.settings.check_timeout_seconds,
@@ -439,12 +492,20 @@ class SocialAutoUploadBackend:
 
     def submit_video(self, target: PublishTarget, video_path: Path) -> BackendResult:
         if target.platform == PublishPlatform.BILIBILI:
-            metadata = self.runtime_metadata()
-            if metadata.get("biliup_integrity") == "mismatch":
-                return BackendResult(
-                    ["sau", "bilibili", "upload-video"], None,
-                    stderr="biliup binary differs from the recorded runtime lock; run publisher setup and revalidate",
-                )
+            direct_args = [
+                "--file", str(video_path.resolve()), "--title", target.title,
+                "--desc", target.description, "--tid", str(target.options["tid"]),
+            ]
+            if target.tags:
+                direct_args.extend(["--tags", ",".join(target.tags)])
+            if target.schedule_at:
+                direct_args.extend(["--schedule", target.schedule_at])
+            if thumbnail := target.options.get("thumbnail"):
+                direct_args.extend(["--thumbnail", str(thumbnail)])
+            return self._run_bilibili_direct(
+                "upload", target.account_name, direct_args,
+                timeout=self.settings.submit_timeout_seconds,
+            )
         command = [
             target.platform.value, "upload-video", "--account", target.account_name,
             "--file", str(video_path.resolve()), "--title", target.title,
@@ -483,6 +544,8 @@ class SocialAutoUploadBackend:
         """
         if target.platform != PublishPlatform.BILIBILI:
             return self.submit_video(target, video_path)
+        if not self._supports_bilibili_collection_cli():
+            return self.submit_video(target, video_path)
         command = [
             target.platform.value, "upload-video", "--account", target.account_name,
             "--file", str(video_path.resolve()), "--title", target.title,
@@ -495,6 +558,17 @@ class SocialAutoUploadBackend:
         return result
 
     def ensure_bilibili_collection(self, account_name: str, title: str) -> BackendResult:
+        if not self._supports_bilibili_collection_cli():
+            return BackendResult(
+                ["sau", "bilibili", "collection-ensure"],
+                0,
+                stdout=json.dumps({
+                    "collection_id": BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID,
+                    "supported": False,
+                    "mode": "ordinary_upload",
+                }, ensure_ascii=False),
+                started=True,
+            )
         return self._run(
             ["bilibili", "collection-ensure", "--account", account_name, "--title", title, "--json"],
             timeout=self.settings.check_timeout_seconds,
@@ -503,6 +577,13 @@ class SocialAutoUploadBackend:
     def add_bilibili_collection(
         self, account_name: str, collection_id: str, bvid: str, position: int,
     ) -> BackendResult:
+        if collection_id == BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID:
+            return BackendResult(
+                ["sau", "bilibili", "collection-add"],
+                0,
+                stdout=json.dumps({"supported": False, "mode": "ordinary_upload"}),
+                started=True,
+            )
         return self._run(
             [
                 "bilibili", "collection-add", "--account", account_name,
@@ -511,6 +592,74 @@ class SocialAutoUploadBackend:
             ],
             timeout=self.settings.check_timeout_seconds,
         )
+
+    def _supports_bilibili_collection_cli(self) -> bool:
+        """Detect the optional collection contract without invoking a remote API."""
+        cli = self.settings.source_dir / "sau_cli.py"
+        if not cli.is_file():
+            return False
+        try:
+            source = cli.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return "collection-ensure" in source and "collection-add" in source
+
+    def _run_bilibili_direct(
+        self,
+        action: str,
+        account_name: str,
+        arguments: list[str],
+        timeout: int,
+        interactive: bool = False,
+    ) -> BackendResult:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", account_name) or account_name in {".", ".."}:
+            return BackendResult(["biliup-direct", action], None, stderr="invalid Bilibili account name")
+        python = self.settings.venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        source = self.settings.biliup_source_dir
+        helper = Path(__file__).with_name("bilibili_direct.py")
+        if not python.is_file() or not source.is_dir():
+            return BackendResult(
+                ["biliup-direct", action], None,
+                stderr="direct Bilibili publisher is not installed; run publisher setup",
+            )
+        account_file = self.settings.source_dir / "cookies" / f"bilibili_{account_name}.json"
+        env_file = self.settings.runtime_home / "credentials" / f"bilibili_{account_name}.env"
+        command = [
+            str(python), str(helper), "--source-dir", str(source),
+            "--account-file", str(account_file), "--env-file", str(env_file),
+            action, *arguments,
+        ]
+        environment = os.environ.copy()
+        isolated_home = self.settings.runtime_home / "home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        _restrict_directory(isolated_home)
+        environment["HOME"] = str(isolated_home)
+        if os.name == "nt":
+            environment["USERPROFILE"] = str(isolated_home)
+        try:
+            completed = subprocess.run(
+                command, cwd=self.settings.source_dir,
+                env=environment,
+                capture_output=not interactive, text=True, timeout=timeout, check=False,
+            )
+            return BackendResult(
+                ["biliup-direct", action], completed.returncode,
+                _redact_output(completed.stdout or "", self.settings.runtime_home),
+                _redact_output(completed.stderr or "", self.settings.runtime_home),
+                started=True,
+            )
+        except subprocess.TimeoutExpired as error:
+            return BackendResult(
+                ["biliup-direct", action], None,
+                _redact_output(_timeout_text(error.stdout), self.settings.runtime_home),
+                _redact_output(_timeout_text(error.stderr), self.settings.runtime_home),
+                started=True, timed_out=True,
+            )
+        except OSError as error:
+            return BackendResult(
+                ["biliup-direct", action], None,
+                stderr=_redact_output(str(error), self.settings.runtime_home),
+            )
 
     def runtime_metadata(self) -> dict[str, Any]:
         metadata: dict[str, Any] = {"social_auto_upload_commit": self.commit}
@@ -862,20 +1011,36 @@ def _detect_local_chrome_path() -> Path | None:
 
 
 def _apply_upstream_compatibility_patches(source: Path) -> list[str]:
-    """Route undeclared legacy Playwright imports through upstream's declared Patchright runtime."""
+    """Apply the publisher policies and compatibility fixes required by Video Factory."""
     changed: list[str] = []
     uploader_root = source / "uploader"
-    if not uploader_root.exists():
+    cli_path = source / "sau_cli.py"
+    candidates = list(uploader_root.rglob("*.py")) if uploader_root.exists() else []
+    if cli_path.is_file():
+        candidates.append(cli_path)
+    if not candidates:
         return changed
     replacements = {
         "from playwright.async_api": "from patchright.async_api",
         "from playwright.sync_api": "from patchright.sync_api",
+        'result = run_biliup_command(["-u", str(account_file), "renew"])': (
+            'result = run_biliup_command(["-u", str(account_file), "list", "--max-pages", "1"])'
+        ),
     }
-    for path in uploader_root.rglob("*.py"):
+    for path in candidates:
         original = path.read_text(encoding="utf-8")
         patched = original
         for before, after in replacements.items():
             patched = patched.replace(before, after)
+        label_marker = "Video Factory republishes edited source material and leaves this optional label unset."
+        label_signature = "    async def apply_original_statement(self, page: Page) -> None:\n"
+        if label_signature in patched and label_marker not in patched:
+            patched = patched.replace(
+                label_signature,
+                label_signature
+                + f"        # {label_marker}\n"
+                + "        return None\n",
+            )
         if patched != original:
             path.write_text(patched, encoding="utf-8")
             changed.append(str(path.relative_to(source)))

@@ -50,6 +50,7 @@ class GenerateOptions:
     youtube_media: str | None = None
     youtube_subtitles: str | None = None
     youtube_translation_plan: str | None = None
+    youtube_editorial_mode: str = "auto"
     linked_sources: tuple[str, ...] = ()
     supplemental_context: str | None = None
     price_event_metadata: dict[str, object] | None = None
@@ -96,6 +97,7 @@ class VideoFactory:
                         Path(options.youtube_translation_plan).resolve()
                         if options.youtube_translation_plan else None
                     ),
+                    editorial_mode=options.youtube_editorial_mode,
                 )
                 result.update(generated)
                 result["model_selection"] = selection
@@ -609,6 +611,7 @@ class VideoFactory:
                     "name": "x_visual_analysis", "status": "ok" if added else "empty",
                     "model": used_vision_quote.model_id, "attempts": vision_errors,
                     "images": added, "artifact": str(analysis_path),
+                    "provenance": analysis.get("provenance"),
                 })
             except Exception as error:
                 result["stages"].append({
@@ -620,6 +623,8 @@ class VideoFactory:
             editorial_direction=(
                 "先发现可验证的冲突、反差或高风险变化。第一镜必须承担钩子并同时展示来源证据；"
                 "结尾必须回答开头。X 原帖完整放在第一镜，不拆段。"
+                + self._causal_uncertainty_direction(evidence)
+                + self._source_identity_direction(evidence)
                 + (
                     "这是价格异常线索：用每百万 token 实价、指定工作负载总价和可靠端点做钩子；"
                     "若与原厂比较，必须同时交代峰谷价、缓存条件、供应商和抓取时间。"
@@ -634,24 +639,21 @@ class VideoFactory:
                 )
             ),
         )
-        agent = BoundedContentAgent(
-            writer, research_tool=LinkedSourceResearchTool(self.workspace),
-            context_tool=DirectorContextToolbox(self.workspace, job) if options.research else None,
-            copy_reviewer=copy_reviewer,
-            # plan + structural write/repair + independent copy review/repair/
-            # verification must all fit.  A repaired writer draft must never
-            # bypass the semantic/attention critic merely because it consumed
-            # the old four-call budget.
-            budget=AgentBudget(max_llm_calls=12, max_research_sources=3, max_repairs=2, max_escalations=0),
-        )
         try:
-            run = agent.run(packet)
-        except ContentAgentError as error:
-            trace_path = job / "content-agent-error.json"
-            trace_path.write_text(
-                json.dumps({"error": str(error), "trace": error.trace}, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+            run = self._run_editorial_agent_with_fallback(
+                packet, writer, copy_reviewer, options, job, selection,
             )
+        except ContentAgentError as error:
+            trace_path = next((
+                path for path in (
+                    job / "content-agent-error.json", job / "content-agent-primary-error.json",
+                ) if path.is_file()
+            ), job / "content-agent-error.json")
+            if not trace_path.is_file():
+                trace_path.write_text(
+                    json.dumps({"error": str(error), "trace": error.trace}, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             result["content_agent_error"] = str(trace_path)
             raise
         manifest = run.manifest
@@ -691,6 +693,107 @@ class VideoFactory:
             return
 
         self._render_editorial(manifest, candidate.source_url, job, result)
+
+    @staticmethod
+    def _causal_uncertainty_direction(evidence: list[Evidence]) -> str:
+        corpus = "\n".join(item.quote for item in evidence).casefold()
+        explicit_uncertainty = any(marker in corpus for marker in (
+            "don't know yet whether", "do not know yet whether", "not sure whether",
+            "unclear whether", "不确定是否", "尚不确定", "说不清是不是", "原因不明",
+        ))
+        trigger_language = any(marker in corpus for marker in (
+            "trigger", "caused", "suspend", "banned", "封禁", "封号", "触发",
+        ))
+        if not (explicit_uncertainty and trigger_language):
+            return ""
+        return (
+            "证据明确说因果关系尚未确定。任何可见字段只要同时提到前一操作与后一结果，"
+            "必须在同一句或同一屏明确写出‘当事人说不确定两者是否相关/是否由此触发尚无定论’；"
+            "禁止用‘导致、触发、秒封、随即被封、照做就被封’偷渡确定因果。可以写时间顺序，"
+            "但不能让观众离开这一语义单元后才看到范围限定。"
+        )
+
+    @staticmethod
+    def _source_identity_direction(evidence: list[Evidence]) -> str:
+        corpus = "\n".join(item.quote for item in evidence).casefold()
+        if not any(marker in corpus for marker in ("employee", "员工", "staff member")):
+            return ""
+        return (
+            "来源身份必须逐级准确：员工个人账号、个人评论或个人回复不等于公司官方账号或公司声明；"
+            "除非证据明确标注为公司官方回应，否则禁止写‘官方回应、官方表态、第一条官方回应’，"
+            "必须点名为‘某公司员工的个人回复/评论’。"
+        )
+
+    def _editorial_agent(
+        self, writer: OpenAICompatibleStoryWriter, copy_reviewer: OpenAICompatibleStoryWriter,
+        options: GenerateOptions, job: Path, max_llm_calls: int = 12,
+    ) -> BoundedContentAgent:
+        return BoundedContentAgent(
+            writer, research_tool=LinkedSourceResearchTool(self.workspace),
+            context_tool=DirectorContextToolbox(self.workspace, job) if options.research else None,
+            copy_reviewer=copy_reviewer,
+            # Plan + structural write/repair + independent copy review/repair/
+            # verification must all fit. A repaired draft never bypasses the
+            # critic merely because it consumed the original low-cost budget.
+            budget=AgentBudget(max_llm_calls=max_llm_calls, max_research_sources=3, max_repairs=2, max_escalations=0),
+        )
+
+    def _run_editorial_agent_with_fallback(
+        self, packet: StoryWriterPacket, writer: OpenAICompatibleStoryWriter,
+        copy_reviewer: OpenAICompatibleStoryWriter, options: GenerateOptions,
+        job: Path, selection: dict[str, object],
+    ):
+        fallback_model = "google/gemini-3.7-flash"
+        # A cheap writer gets one complete semantic round (review, repair,
+        # verify). If that still fails, open the job-scoped semantic circuit
+        # and escalate instead of spending several more rounds on the same
+        # model. The stronger writer keeps the bounded convergence budget.
+        primary_call_budget = 14 if writer.settings.model == fallback_model else 6
+        try:
+            return self._editorial_agent(
+                writer, copy_reviewer, options, job, max_llm_calls=primary_call_budget,
+            ).run(packet)
+        except ContentAgentError as primary_error:
+            primary_trace_path = job / "content-agent-primary-error.json"
+            primary_trace_path.write_text(
+                json.dumps(
+                    {"error": str(primary_error), "trace": primary_error.trace},
+                    ensure_ascii=False, indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            can_fallback = (
+                bool(os.environ.get("OPENROUTER_API_KEY"))
+                and writer.settings.model != fallback_model
+            )
+            if not can_fallback:
+                raise
+            fallback_writer = OpenAICompatibleStoryWriter(
+                LLMSettings.from_environment("openrouter", fallback_model)
+            )
+            fallback_reviewer, fallback_reviewer_selection = self._copy_reviewer(
+                fallback_writer, options,
+            )
+            selection["fallback"] = {
+                "provider": "openrouter", "model": fallback_model,
+                "reason": "low-cost primary model exhausted bounded semantic-copy repairs",
+                "primary_error": str(primary_trace_path),
+                "copy_reviewer": fallback_reviewer_selection,
+            }
+            try:
+                return self._editorial_agent(
+                    fallback_writer, fallback_reviewer, options, job, max_llm_calls=14,
+                ).run(packet)
+            except ContentAgentError as fallback_error:
+                trace_path = job / "content-agent-error.json"
+                trace_path.write_text(
+                    json.dumps(
+                        {"error": str(fallback_error), "trace": fallback_error.trace},
+                        ensure_ascii=False, indent=2,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                raise
 
     def _cached_acquisition(self, url: str) -> AcquisitionResult | None:
         """Reuse immutable archived source evidence when only the edit schema changed."""
@@ -906,9 +1009,7 @@ class VideoFactory:
         result["stages"].append({"name": "ingest", "status": "ok", "candidate": ingest.candidate.id})
 
         writer, quote, selection = self._story_writer(options)
-        copy_reviewer, reviewer_selection = self._copy_reviewer(
-            writer, options, preferred_model="google/gemini-3.7-flash",
-        )
+        copy_reviewer, reviewer_selection = self._copy_reviewer(writer, options)
         selection["copy_reviewer"] = reviewer_selection
         result["model_selection"] = selection
         evidence = list(ingest.evidence)
@@ -950,6 +1051,7 @@ class VideoFactory:
             result["stages"].append({
                 "name": "visual_analysis", "status": "ok", "images": [asdict(item) for item in visuals],
                 "model": vision_quote.to_dict(), "artifact": str(analysis_path),
+                "provenance": analysis.get("provenance"),
             })
         else:
             reason = "no high-value README image" if not visuals else "OPENROUTER_API_KEY is not configured"
@@ -1059,33 +1161,29 @@ class VideoFactory:
 
     def _copy_reviewer(
         self, writer: OpenAICompatibleStoryWriter, options: GenerateOptions,
-        preferred_model: str | None = None,
     ) -> tuple[OpenAICompatibleStoryWriter, dict[str, object]]:
         """Choose an independent low-cost critic; never let the writer grade itself when avoidable."""
-        if preferred_model and os.environ.get("OPENROUTER_API_KEY") and writer.settings.model != preferred_model:
-            settings = LLMSettings.from_environment("openrouter", preferred_model)
-            return OpenAICompatibleStoryWriter(settings), {
-                "provider": "openrouter", "model": preferred_model,
-                "reason": "GitHub copy needs a strict attention-and-grounding critic",
-            }
-        if os.environ.get("DEEPSEEK_API_KEY") and writer.settings.provider != "deepseek":
-            settings = LLMSettings.from_environment("deepseek", None)
-            return OpenAICompatibleStoryWriter(settings), {
-                "provider": "deepseek", "model": settings.model, "reason": "independent low-cost critic",
-            }
         if os.environ.get("OPENROUTER_API_KEY"):
             try:
                 quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(
-                    ModelRequirements("story", ("text",)), options.refresh_prices,
+                    ModelRequirements(
+                        "review", ("text",), excluded_models=(writer.settings.model,),
+                    ),
+                    options.refresh_prices,
                 )
-                if quote.model_id != writer.settings.model:
-                    settings = LLMSettings.from_environment("openrouter", quote.model_id)
-                    return OpenAICompatibleStoryWriter(settings), {
-                        "provider": "openrouter", "quote": quote.to_dict(),
-                        "reason": "independent discounted critic",
-                    }
+                settings = LLMSettings.from_environment("openrouter", quote.model_id)
+                return OpenAICompatibleStoryWriter(settings), {
+                    "provider": "openrouter", "quote": quote.to_dict(),
+                    "reason": "cheapest capability-qualified independent critic",
+                }
             except Exception:
                 pass
+        if os.environ.get("DEEPSEEK_API_KEY") and writer.settings.provider != "deepseek":
+            settings = LLMSettings.from_environment("deepseek", None)
+            return OpenAICompatibleStoryWriter(settings), {
+                "provider": "deepseek", "model": settings.model,
+                "reason": "economical independent critic fallback",
+            }
         return writer, {
             "provider": writer.settings.provider, "model": writer.settings.model,
             "reason": "no independent reviewer configured",

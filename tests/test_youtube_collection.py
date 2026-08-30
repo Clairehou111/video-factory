@@ -1,27 +1,33 @@
 import json
 import subprocess
 import unittest
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from video_factory.models import (
-    Candidate, CollectionItem, CollectionItemKind, FramingMode, HookSpec, HookStrategy,
+    Candidate, CollectionItem, CollectionItemKind, Evidence, FramingMode, HookSpec, HookStrategy,
     PlatformRender, RenderProfile, RightsReview, SlideTranslation, SourceMediaInfo, SourceRange, SourceType,
     TerminologyEntry, TerminologyStrategy, TranscriptCue,
+    VideoCollectionManifest,
 )
-from video_factory.media import VideoProbe
+from video_factory.media import AudioLoudness, VideoProbe, probe_audio_loudness
 from video_factory.serde import collection_manifest_from_dict
 from video_factory.storage import Workspace
 from video_factory.youtube import (
     DiscoveryConfig, NaturalSubtitleTranslator, YouTubeAcquirer, YouTubeCandidate,
-    YouTubeCollectionRenderer, YouTubeDiscoveryService, SourceBelow1080Error, YouTubeAcquisitionError,
+    YouTubeCollectionFactory, YouTubeCollectionRenderer, YouTubeDiscoveryService,
+    SourceBelow1080Error, YouTubeAcquisitionError,
     build_collection_manifest, build_hook_candidates, normalize_chinese_subtitle,
-    _coerce_range, editorial_plan_contract_errors, parse_youtube_json3,
+    classify_youtube_editorial,
+    _coerce_range, editorial_plan_contract_errors, normalize_editorial_plan_structure,
+    parse_youtube_json3,
     rebalance_source_cues, render_source_ranges, terminology_contract_errors,
     validate_collection, wrap_subtitle, write_item_subtitle_files, _headline_fragment,
     _required_short_source_ranges, _slide_translation_rows, _write_hook_overlay_concat,
+    rebase_interview_clip_timeline,
 )
 
 
@@ -67,6 +73,70 @@ class FakeYouTubeRunner:
 
 
 class YouTubeCollectionTest(unittest.TestCase):
+    def test_known_tech_interview_survives_politics_elsewhere_in_full_source(self) -> None:
+        mode, people, political = classify_youtube_editorial(
+            "Riding AGI, AI Anxiety, Who Funded COVID, Defending Taiwan",
+            "Naval", "A long conversation about technology and society", [], ["Naval", "Nivi"],
+        )
+
+        self.assertEqual(mode, "known_tech_interview_clip")
+        self.assertIn("naval", people)
+        self.assertTrue(political)
+
+    def test_country_technology_and_education_comparison_is_allowed(self) -> None:
+        cues = [
+            TranscriptCue("political-outside", 0, 8, "The election and government debate came first.", "前面谈到其他话题。"),
+            TranscriptCue("safe-1", 100, 108, "China and the United States teach software engineering differently.", "中美的软件工程教育方式不同。"),
+            TranscriptCue("safe-2", 108, 116, "Students should learn to inspect what AI generated.", "学生要学会检查 AI 生成的代码。"),
+            TranscriptCue("safe-3", 116, 124, "That skill matters more when code becomes cheap.", "代码越便宜，这项能力越重要。"),
+            TranscriptCue("safe-4", 124, 209, "Engineering education must emphasize judgment and verification.", "工程教育更要强调判断与验证。"),
+        ]
+        plan = {
+            "editorial_mode": "known_tech_interview_clip",
+            "collection_title": "科技人物高光",
+            "story_start": 100, "story_end": 209, "bilibili_chapters": [],
+            "wechat_lessons": [{
+                "speaker_label": "C++之父", "title": "AI 越会写，越要学会验",
+                "thesis": "AI 降低代码成本后，判断与验证更重要。",
+                "start": 100, "end": 209, "framing": "speaker",
+                "hook_headlines": [
+                    "AI 写得越快，人越要会验", "代码便宜后，判断力更贵", "不同国家都在补同一课",
+                ],
+            }],
+        }
+        candidate = Candidate(
+            "youtube-interview", SourceType.YOUTUBE, "https://youtube.com/watch?v=interview",
+            "Known technologist interview", author="InfoQ", metadata={"video_id": "interview"},
+        )
+        manifest = build_collection_manifest(
+            candidate, {"duration": 600, "known_tech_people": ["Bjarne Stroustrup"]},
+            cues, [], plan, "", "",
+            SourceMediaInfo(1920, 1080, 600, "h264", "aac", "137", "mweb"),
+        )
+        manifest.rights_review = RightsReview(status="reviewed", reviewed_by="editor")
+
+        checks = validate_collection(manifest)
+
+        self.assertEqual(manifest.editorial_mode, "known_tech_interview_clip")
+        self.assertEqual(len(manifest.items), 1)
+        self.assertEqual(manifest.items[0].renders[0].selected_hook.speaker_label, "C++之父")
+        self.assertTrue(next(item for item in checks if item.name.endswith(":non_political")).passed)
+
+    def test_selected_interview_clip_rejects_political_words(self) -> None:
+        cues = [TranscriptCue("p", 100, 170, "The election changed the government's war policy.")]
+        plan = {
+            "editorial_mode": "known_tech_interview_clip", "story_start": 100, "story_end": 170,
+            "bilibili_chapters": [], "wechat_lessons": [{
+                "speaker_label": "Naval", "title": "技术判断", "thesis": "讨论技术判断。",
+                "start": 100, "end": 170,
+                "hook_headlines": ["技术判断改变路径", "真正的系统代价", "团队应该如何选择"],
+            }],
+        }
+
+        errors = editorial_plan_contract_errors(plan, 600, cues)
+
+        self.assertTrue(any("political content" in error for error in errors), errors)
+
     def test_metadata_failure_does_not_accept_null_json(self) -> None:
         runner = lambda command, **kwargs: subprocess.CompletedProcess(
             command, 1, "null\n", "network lookup failed",
@@ -77,6 +147,272 @@ class YouTubeCollectionTest(unittest.TestCase):
             YouTubeAcquirer(Workspace(Path(temp)), runner=runner)._metadata(
                 "https://youtube.com/watch?v=failed",
             )
+
+    def test_acquirer_falls_back_to_archived_metadata_on_network_failure(self) -> None:
+        runner = lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, "", "SSL EOF",
+        )
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            previous = workspace.root / "jobs" / "previous"
+            previous.mkdir(parents=True)
+            metadata = {
+                "id": "cached123", "title": "Cached technical lesson",
+                "channel": "Teacher", "duration": 900, "upload_date": "20260820",
+                "chapters": [],
+            }
+            (previous / "cached123.metadata.json").write_text(
+                json.dumps(metadata), encoding="utf-8",
+            )
+            subtitles = previous / "cached123.en.json3"
+            subtitles.write_text(json.dumps({"events": [{
+                "tStartMs": 0, "dDurationMs": 2000,
+                "segs": [{"utf8": "Technical lesson."}],
+            }]}), encoding="utf-8")
+
+            candidate, _, loaded, cues, _, _, _ = YouTubeAcquirer(
+                workspace, runner=runner,
+            ).acquire(
+                "https://youtube.com/watch?v=cached123", workspace.root / "jobs" / "retry",
+                local_subtitles=subtitles, download_media=False,
+            )
+
+            self.assertEqual(candidate.id, "youtube-cached123")
+            self.assertEqual(loaded["title"], "Cached technical lesson")
+            self.assertEqual(cues[0].source_text, "Technical lesson.")
+
+    def test_interview_download_command_uses_only_padded_selected_interval(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Workspace(root / "workspace")
+            workspace.initialize()
+            job = root / "job"
+            job.mkdir()
+            commands: list[list[str]] = []
+
+            def runner(command, **kwargs):
+                commands.append(command)
+                (job / "clip123.mkv").write_bytes(b"video")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            path = YouTubeAcquirer(workspace, runner=runner)._download_media(
+                "https://youtube.com/watch?v=clip123", "clip123", job,
+                download_window=(98.0, 202.0),
+            )
+
+            self.assertEqual(path.name, "clip123.mkv")
+            command = commands[0]
+            self.assertEqual(command[command.index("--download-sections") + 1], "*98.000-202.000")
+            self.assertIn("--force-keyframes-at-cuts", command)
+
+    def test_complete_source_download_omits_download_sections(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Workspace(root / "workspace")
+            workspace.initialize()
+            job = root / "job"
+            job.mkdir()
+            commands: list[list[str]] = []
+
+            def runner(command, **kwargs):
+                commands.append(command)
+                (job / "technical123.mkv").write_bytes(b"video")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            YouTubeAcquirer(workspace, runner=runner)._download_media(
+                "https://youtube.com/watch?v=technical123", "technical123", job,
+            )
+
+            self.assertNotIn("--download-sections", commands[0])
+
+    def test_interview_rebase_keeps_original_provenance_and_stays_in_bounds(self) -> None:
+        cues = [
+            TranscriptCue("c1", 99, 108, "A concrete engineering claim.", "一个工程判断。"),
+            TranscriptCue("c2", 108, 198, "The complete useful explanation.", "完整解释。"),
+            TranscriptCue("c3", 198, 203, "The final consequence.", "最终影响。"),
+        ]
+        plan = {
+            "story_start": 100, "story_end": 200,
+            "wechat_lessons": [{"start": 100, "end": 200, "title": "工程判断"}],
+        }
+
+        provenance = rebase_interview_clip_timeline(cues, plan, {
+            "original_start": 100, "original_end": 200,
+            "download_start": 98, "download_end": 202,
+        }, 104)
+
+        self.assertEqual((plan["story_start"], plan["story_end"]), (2.0, 102.0))
+        self.assertEqual(plan["wechat_lessons"][0]["original_start"], 100.0)
+        self.assertTrue(all(0 <= cue.start < cue.end <= 104 for cue in cues))
+        self.assertEqual((cues[0].original_start, cues[-1].original_end), (99, 203))
+        self.assertTrue(provenance["rebased"])
+
+        # A reviewed cached plan is already clip-local. Its original fields,
+        # rather than its local seconds, drive the next bounded acquisition.
+        cached_cues = [TranscriptCue(**asdict(cue)) for cue in cues]
+        cached_plan = json.loads(json.dumps(plan))
+        second = rebase_interview_clip_timeline(
+            cached_cues, cached_plan, {
+                "original_start": 100, "original_end": 200,
+                "download_start": 98, "download_end": 202,
+            }, 104, previous_clip=provenance,
+        )
+        self.assertEqual(
+            [(cue.start, cue.end) for cue in cached_cues],
+            [(cue.start, cue.end) for cue in cues],
+        )
+        self.assertEqual(second["original_start"], 100)
+
+        full_source_cues = [TranscriptCue(**asdict(cue)) for cue in cues]
+        full_source_plan = json.loads(json.dumps(plan))
+        rebase_interview_clip_timeline(
+            full_source_cues, full_source_plan, {
+                "original_start": 100, "original_end": 200,
+                "download_start": 0, "download_end": 600,
+            }, 600, previous_clip=provenance,
+        )
+        self.assertEqual((full_source_plan["story_start"], full_source_plan["story_end"]), (100.0, 200.0))
+        self.assertEqual((full_source_cues[0].start, full_source_cues[-1].end), (99.0, 203.0))
+
+    def test_interview_selection_precedes_partial_media_download(self) -> None:
+        events: list[str] = []
+        download_flags: list[bool] = []
+        testcase = self
+        metadata = {
+            "id": "interview123", "title": "Known engineer interview",
+            "channel": "AI Engineer", "description": "AI engineering interview",
+            "duration": 600, "creators": ["Andrej Karpathy", "Host"],
+        }
+        cues = [
+            TranscriptCue(f"c{index}", 100 + index * 8, 108 + index * 8,
+                          "A concrete AI engineering system changes team workflow.", "工程系统改变团队工作流。")
+            for index in range(12)
+        ]
+        plan = {
+            "editorial_mode": "known_tech_interview_clip", "collection_title": "人物高光",
+            "story_start": 100, "story_end": 190, "bilibili_chapters": [],
+            "wechat_lessons": [{
+                "speaker_label": "Andrej Karpathy", "title": "工程系统改变团队协作",
+                "thesis": "一个完整且可验证的工程判断。", "start": 100, "end": 190,
+                "framing": "speaker", "hook_headlines": [
+                    "AI 工程真正卡在协作", "系统选择会改变团队", "这套方法减少返工成本",
+                ],
+            }],
+        }
+
+        class FakeAcquirer:
+            def __init__(self, workspace):
+                self.workspace = workspace
+
+            def acquire(self, url, job, **kwargs):
+                events.append("metadata_transcript")
+                download_flags.append(bool(kwargs["download_media"]))
+                candidate = Candidate(
+                    "youtube-interview123", SourceType.YOUTUBE, url, metadata["title"],
+                    author=metadata["channel"], metadata={"video_id": metadata["id"]},
+                )
+                return candidate, [], dict(metadata), list(cues), "", "subtitles.json3", None
+
+            def acquire_remote_media(self, candidate, acquired_metadata, url, job, source_range=None, **kwargs):
+                events.append("partial_download")
+                testcase.assertIsNotNone(source_range)
+                testcase.assertEqual((source_range.start, source_range.end), (100, 190))
+                info = SourceMediaInfo(1920, 1080, 94, "h264", "aac")
+                evidence = Evidence("video", candidate.id, url, "selected interval", "youtube:video")
+                return "clip.mkv", info, evidence, {
+                    "original_start": 100, "original_end": 190,
+                    "download_start": 98, "download_end": 192,
+                }
+
+        def select(self, acquired_metadata, acquired_cues, editorial_mode):
+            events.append("highlight_selected")
+            acquired_cues[:] = [cue for cue in acquired_cues if cue.end > 100 and cue.start < 190]
+            return [], dict(plan), []
+
+        with TemporaryDirectory() as temp, patch(
+            "video_factory.youtube.YouTubeAcquirer", FakeAcquirer,
+        ), patch.object(
+            NaturalSubtitleTranslator, "translate", select,
+        ), patch.object(
+            YouTubeCollectionRenderer, "render", return_value=[],
+        ):
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            (Path(temp) / "job").mkdir()
+            result = YouTubeCollectionFactory(workspace, object()).generate(
+                "https://youtube.com/watch?v=interview123", Path(temp) / "job",
+                render=True, editorial_mode="known_tech_interview_clip",
+            )
+            generated = json.loads(Path(result["collection_manifest"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(events, ["metadata_transcript", "highlight_selected", "partial_download"])
+        self.assertEqual(download_flags, [False])
+        self.assertEqual(result["editorial_mode"], "known_tech_interview_clip")
+        source_range = generated["items"][0]["source_ranges"][0]
+        hook_range = generated["items"][0]["renders"][0]["selected_hook"]["source_range"]
+        self.assertEqual((source_range["start"], source_range["end"]), (2.0, 92.0))
+        self.assertEqual((source_range["original_start"], source_range["original_end"]), (100.0, 190.0))
+        self.assertTrue(0 <= hook_range["start"] < hook_range["end"] <= 94)
+        self.assertIsNotNone(hook_range["original_start"])
+        self.assertTrue(all(0 <= cue["start"] < cue["end"] <= 94 for cue in generated["transcript"]))
+
+    def test_technical_coverage_factory_requests_complete_source(self) -> None:
+        requested_ranges: list[SourceRange | None] = []
+        metadata = {
+            "id": "technical123", "title": "AI engineering lecture", "channel": "AI Engineer",
+            "description": "technical systems", "duration": 600, "creators": [],
+        }
+        cues = [
+            TranscriptCue(f"c{index}", index * 8, min(600, index * 8 + 8),
+                          "A concrete AI engineering system changes team workflow.", "工程系统改变团队工作流。")
+            for index in range(75)
+        ]
+        plan = {
+            "editorial_mode": "technical_coverage", "collection_title": "技术精讲",
+            "story_start": 0, "story_end": 600, "bilibili_chapters": [],
+            "wechat_lessons": [
+                {"title": "系统设计第一部分", "thesis": "完整观点一。", "start": 0, "end": 300,
+                 "framing": "speaker", "hook_headlines": ["系统瓶颈不在模型", "工具链决定团队速度", "验证流程减少返工"]},
+                {"title": "系统设计第二部分", "thesis": "完整观点二。", "start": 300, "end": 600,
+                 "framing": "speaker", "hook_headlines": ["扩展之后问题变了", "评估必须进入流程", "系统最终稳定交付"]},
+            ],
+        }
+
+        class FakeAcquirer:
+            def __init__(self, workspace):
+                pass
+
+            def acquire(self, url, job, **kwargs):
+                candidate = Candidate("youtube-technical123", SourceType.YOUTUBE, url, metadata["title"],
+                                      author=metadata["channel"], metadata={"video_id": metadata["id"]})
+                return candidate, [], dict(metadata), list(cues), "", "subtitles.json3", None
+
+            def acquire_remote_media(self, candidate, acquired_metadata, url, job, source_range=None, **kwargs):
+                requested_ranges.append(source_range)
+                info = SourceMediaInfo(1920, 1080, 600, "h264", "aac")
+                evidence = Evidence("video", candidate.id, url, "complete source", "youtube:video")
+                return "complete.mkv", info, evidence, None
+
+        def select(self, acquired_metadata, acquired_cues, editorial_mode):
+            return [], dict(plan), []
+
+        with TemporaryDirectory() as temp, patch(
+            "video_factory.youtube.YouTubeAcquirer", FakeAcquirer,
+        ), patch.object(
+            NaturalSubtitleTranslator, "translate", select,
+        ), patch.object(
+            YouTubeCollectionRenderer, "render", return_value=[],
+        ):
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            (Path(temp) / "job").mkdir()
+            YouTubeCollectionFactory(workspace, object()).generate(
+                "https://youtube.com/watch?v=technical123", Path(temp) / "job",
+                render=True, editorial_mode="technical_coverage",
+            )
+
+        self.assertEqual(requested_ranges, [None])
 
     def test_wechat_hook_headline_persists_for_full_video(self) -> None:
         hook = HookSpec(
@@ -660,6 +996,44 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertTrue(any("WeChat lessons must cover" in item for item in errors), errors)
 
+    def test_deterministic_structure_repair_preserves_long_source_quality_contract(self) -> None:
+        duration = 4182.0
+        cues = [
+            TranscriptCue(f"c{index}", index * 10, min(duration, index * 10 + 10), "Agent systems lesson.")
+            for index in range(419)
+        ]
+        plan = {
+            "collection_title": "自改进 Agent 课程",
+            "story_start": 0,
+            "story_end": duration,
+            "terminology": [],
+            "bilibili_chapters": [
+                {"title": "规模化规律", "thesis": "解释模型规模化。", "start": 0, "end": 900,
+                 "hook_headlines": ["太短", "规模化的工程取舍", "规模化带来的系统变化"]},
+                {"title": "Agent 工作流", "thesis": "解释 Agent 工作流。", "start": 2500, "end": 3300,
+                 "hook_headlines": ["聊天不是 Agent", "工作流的工程取舍", "工作流带来的系统变化"]},
+            ],
+            "wechat_lessons": [
+                {"title": f"技术精讲 {index}", "thesis": "独立技术观点。", "start": index * 500,
+                 "end": index * 500 + 120, "hook_headlines": ["太短"]}
+                for index in range(4)
+            ],
+        }
+
+        repaired = normalize_editorial_plan_structure(plan, cues, duration)
+
+        self.assertEqual(editorial_plan_contract_errors(repaired, duration), [])
+        self.assertEqual(repaired["story_start"], 0)
+        self.assertEqual(repaired["story_end"], duration)
+        self.assertTrue(all(
+            480 <= row["end"] - row["start"] <= 1800
+            for row in repaired["bilibili_chapters"]
+        ))
+        self.assertTrue(all(
+            180 <= row["end"] - row["start"] <= 360
+            for row in repaired["wechat_lessons"]
+        ))
+
     def test_short_source_boundaries_are_deterministic_and_complete(self) -> None:
         cues = [
             TranscriptCue(f"c{index}", index * 5, index * 5 + 5, "Complete thought.")
@@ -758,7 +1132,11 @@ class YouTubeCollectionTest(unittest.TestCase):
                 "完整主题", "完整观点", [source_range],
                 [PlatformRender(RenderProfile.WECHAT_VERTICAL, 1080, 1920)],
             )
-            runner = lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", "")
+            commands = []
+
+            def runner(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
 
             YouTubeCollectionRenderer(Workspace(root), runner=runner)._render_one(
                 source, item, item.renders[0], source_subtitle,
@@ -773,6 +1151,72 @@ class YouTubeCollectionTest(unittest.TestCase):
             filters,
         )
         self.assertNotIn("[fg0]crop=", filters)
+        self.assertIn("[1:a]atrim", filters)
+        self.assertIn("[2:v]format=rgba", filters)
+        self.assertEqual(commands[0].count(str(source)), 2)
+
+    def test_audio_loudness_probe_reads_volumedetect_levels(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["ffmpeg"], 0, "",
+            "[Parsed_volumedetect] mean_volume: -14.2 dB\n"
+            "[Parsed_volumedetect] max_volume: -1.8 dB\n"
+            "[Parsed_silencedetect] silence_duration: 45.2\n",
+        )
+        with patch("video_factory.media.subprocess.run", return_value=completed):
+            loudness = probe_audio_loudness(Path("audible.mp4"))
+
+        self.assertEqual(loudness.mean_db, -14.2)
+        self.assertEqual(loudness.max_db, -1.8)
+        self.assertEqual(loudness.longest_silence_seconds, 45.2)
+
+    def test_silent_audio_repair_rerenders_only_failed_output(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            source = workspace.root / "source.mp4"
+            source.write_bytes(b"source")
+            output = workspace.root / "renders" / "collection" / "lesson.mp4"
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"silent")
+            source_subtitle = output.with_suffix(".en.srt")
+            translation_subtitle = output.with_suffix(".zh-Hans.srt")
+            source_subtitle.write_text("", encoding="utf-8")
+            translation_subtitle.write_text("", encoding="utf-8")
+            render = PlatformRender(
+                RenderProfile.WECHAT_VERTICAL, 1080, 1920,
+                video_path=str(output.relative_to(workspace.root)),
+                source_subtitle_path=str(source_subtitle.relative_to(workspace.root)),
+                translation_subtitle_path=str(translation_subtitle.relative_to(workspace.root)),
+            )
+            item = CollectionItem(
+                "lesson", CollectionItemKind.WECHAT_SHORT, 1,
+                "技术精讲", "技术观点", [SourceRange(0, 180)], [render],
+            )
+            manifest = VideoCollectionManifest(
+                "collection", "candidate", "https://youtube.com/watch?v=demo", "demo",
+                "Demo", "Teacher", "Collection", [], [], [item],
+                source_media_path="source.mp4", source_duration=180,
+            )
+            commands = []
+
+            def runner(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch(
+                "video_factory.youtube.probe_audio_loudness",
+                side_effect=[AudioLoudness(-91, -91), AudioLoudness(-13, -2)],
+            ), patch(
+                "video_factory.youtube.probe_video",
+                return_value=VideoProbe(
+                    output, 180, 1080, 1920, "h264", "yuv420p", "aac",
+                    audio_duration=180, audio_bitrate=192000,
+                ),
+            ):
+                repaired = YouTubeCollectionRenderer(workspace, runner=runner).repair_silent_audio(manifest)
+
+        self.assertEqual(repaired, [render.video_path])
+        self.assertEqual(len(commands), 1)
 
     def test_slide_translations_follow_reordered_hook_timeline(self) -> None:
         rows = _slide_translation_rows(

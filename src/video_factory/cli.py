@@ -21,7 +21,9 @@ from .agent import (
 )
 from .models import ContentType, TopicType, now_iso
 from .serde import load_collection_manifest
-from .youtube import DiscoveryConfig, YouTubeDiscoveryService, validate_collection
+from .youtube import (
+    DiscoveryConfig, YouTubeCollectionRenderer, YouTubeDiscoveryService, validate_collection,
+)
 from .youtube_runtime import ManagedYouTubeRuntime
 from .writer import StoryWriterPacket
 from .webcapture import WebScrollVideoAdapter, WebScrollVideoSettings
@@ -36,6 +38,11 @@ from .collection_publish import (
 )
 from .factory import GenerateOptions, VideoFactory
 from .discovery import ChannelConfig, DiscoveryChannel, ResourceDiscoveryConfig, ResourceDiscoveryService
+from .automation import (
+    AutomationAuditService, AutomationPolicy, DiscoveryPublishBridge,
+    PipelinePublishConfig, is_pipeline_lock_collision, pipeline_lock,
+)
+from .dashboard import serve_dashboard
 
 
 def _workspace(path: str) -> Workspace:
@@ -63,6 +70,11 @@ def main() -> None:
     rights_review.add_argument("--status", required=True, choices=["permission_granted", "licensed", "educational_excerpt", "reviewed"])
     rights_review.add_argument("--basis", default="educational_noncommercial")
     rights_review.add_argument("--notes", default="")
+    repair_collection_audio = subcommands.add_parser(
+        "repair-collection-audio",
+        help="只重渲染音轨缺失或实际静音的 YouTube 合集成片",
+    )
+    repair_collection_audio.add_argument("manifest")
     inspect_video = subcommands.add_parser("inspect-video", help="用 ffprobe 验收最终 MP4")
     inspect_video.add_argument("file")
     inspect_video.add_argument("--max-duration", type=float)
@@ -151,6 +163,13 @@ def main() -> None:
     publish_collection_retry = subcommands.add_parser("publish-collection-retry-link", help="只重试已上传 Bilibili 视频的合集关联，绝不重复上传")
     publish_collection_retry.add_argument("batch")
     publish_collection_retry.add_argument("--item", required=True)
+    publish_collection_reconcile = subcommands.add_parser(
+        "publish-collection-confirm-pre-submit-failure",
+        help="将有明确 Bilibili -101 证据的不确定项确认成可安全重试的上传前失败",
+    )
+    publish_collection_reconcile.add_argument("batch")
+    publish_collection_reconcile.add_argument("--item", required=True)
+    publish_collection_reconcile.add_argument("--actor", required=True)
     subcommands.add_parser("publish-policy", help="显示发布安全边界")
     youtube_runtime = subcommands.add_parser(
         "youtube-runtime",
@@ -165,6 +184,26 @@ def main() -> None:
     discover.add_argument("--force", action="store_true", help="忽略所选渠道的 next_run_at")
     discover.add_argument("--provider", choices=["auto", "deepseek", "kimi", "openrouter"], default="auto")
     discover.add_argument("--model")
+    pipeline = subcommands.add_parser(
+        "pipeline", help="发现资源、生成成片，并按渠道规则创建待审核发布批次",
+    )
+    pipeline.add_argument("--config", help="多渠道搜索池、节奏和质量门配置 JSON")
+    pipeline.add_argument("--publish-config", help="视频号与 Bilibili 账号、分区和标签配置 JSON")
+    pipeline.add_argument("--channel", action="append", choices=[item.value for item in DiscoveryChannel], help="只运行指定渠道；可重复")
+    pipeline.add_argument("--force", action="store_true", help="忽略所选渠道的 next_run_at")
+    pipeline.add_argument("--provider", choices=["auto", "deepseek", "kimi", "openrouter"], default="auto")
+    pipeline.add_argument("--model")
+    pipeline.add_argument("--trial-days", type=int, default=7, help="本地监督运行期；默认 7 天")
+    pipeline.add_argument("--notify", action="store_true", help="运行后发送 macOS 待审核通知")
+    automation_status = subcommands.add_parser(
+        "automation-status", help="查看最近一次（或指定一次）自动工厂运行审计",
+    )
+    automation_status.add_argument("--run", help="discovery run id；默认读取 latest")
+    automation_status.add_argument("--notify", action="store_true", help="重发这次审计的 macOS 通知")
+    dashboard = subcommands.add_parser("dashboard", help="启动本地成片审核与逐条发布 Dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1", help="仅允许 loopback 地址")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--actor", default="claire", help="写入审批记录的审核人")
     discover_youtube = subcommands.add_parser("discover-youtube", help="按 48 小时节奏发现并最多生产一个高价值 YouTube 源视频")
     discover_youtube.add_argument("--config", help="YouTube 搜索池和质量门配置 JSON")
     discover_youtube.add_argument("--force", action="store_true", help="忽略 next_run_at，立即执行一次搜索")
@@ -203,6 +242,12 @@ def main() -> None:
         "--youtube-translation-plan",
         help="复用已完成的 YouTube translation-plan.json，只修复规划并渲染",
     )
+    generate.add_argument(
+        "--youtube-editorial-mode",
+        choices=["auto", "technical_coverage", "known_tech_interview_clip", "study"],
+        default="auto",
+        help="覆盖 YouTube 自动分类；正常自动工厂保持 auto",
+    )
     rerender = subcommands.add_parser("rerender", help="复用现有内容清单，只重试确定性录屏、合成和验收")
     rerender.add_argument("manifest")
     args = parser.parse_args()
@@ -219,6 +264,8 @@ def main() -> None:
             sys.exit(1)
     elif args.command == "init":
         print(f"initialized {workspace.root}")
+    elif args.command == "dashboard":
+        serve_dashboard(workspace, args.host, args.port, args.actor)
     elif args.command == "discover":
         config = ResourceDiscoveryConfig.from_path(Path(args.config).resolve() if args.config else None)
         channels = [DiscoveryChannel(item) for item in args.channel] if args.channel else None
@@ -229,6 +276,49 @@ def main() -> None:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         if result.status == "failed":
             sys.exit(1)
+    elif args.command == "pipeline":
+        config = ResourceDiscoveryConfig.from_path(Path(args.config).resolve() if args.config else None)
+        publish_config = PipelinePublishConfig.from_path(
+            Path(args.publish_config).resolve() if args.publish_config else None,
+        )
+        channels = [DiscoveryChannel(item) for item in args.channel] if args.channel else None
+        auditor = AutomationAuditService(workspace, AutomationPolicy(trial_days=args.trial_days))
+        try:
+            with pipeline_lock(workspace.root):
+                result = ResourceDiscoveryService(workspace).run(
+                    config, scheduled=not args.force, channels=channels,
+                    provider=args.provider, model=args.model,
+                )
+                prepared = DiscoveryPublishBridge(workspace, publish_config).prepare(result)
+                audit = auditor.record(result, prepared, args.provider, args.model)
+                if args.notify:
+                    auditor.notify(audit)
+        except Exception as error:
+            if is_pipeline_lock_collision(error):
+                print(json.dumps({
+                    "status": "already_running",
+                    "detail": str(error),
+                    "publication_boundary": "no second run started and nothing was published",
+                }, ensure_ascii=False, indent=2))
+                return
+            audit = auditor.record_crash(error, args.provider, args.model)
+            if args.notify:
+                auditor.notify(audit)
+            raise
+        print(json.dumps({
+            "discovery": result.to_dict(),
+            "publish_queue": [item.to_dict() for item in prepared],
+            "automation_audit": audit,
+            "publication_boundary": "review and approve each batch before publish-run",
+        }, ensure_ascii=False, indent=2))
+        if result.status == "failed":
+            sys.exit(1)
+    elif args.command == "automation-status":
+        auditor = AutomationAuditService(workspace)
+        report = auditor.load(args.run)
+        if args.notify:
+            auditor.notify(report, force=True)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     elif args.command == "discover-youtube":
         config = DiscoveryConfig.from_path(Path(args.config).resolve() if args.config else None)
         if args.select_only or args.no_render:
@@ -290,6 +380,7 @@ def main() -> None:
             youtube_media=args.youtube_media,
             youtube_subtitles=args.youtube_subtitles,
             youtube_translation_plan=args.youtube_translation_plan,
+            youtube_editorial_mode=args.youtube_editorial_mode,
         ))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "rerender":
@@ -334,6 +425,29 @@ def main() -> None:
             "reviewed_by": manifest.rights_review.reviewed_by, "reviewed_at": manifest.rights_review.reviewed_at,
             "notes": manifest.rights_review.notes,
         }, ensure_ascii=False, indent=2))
+    elif args.command == "repair-collection-audio":
+        path = Path(args.manifest).resolve()
+        manifest = load_collection_manifest(path)
+        repaired = YouTubeCollectionRenderer(workspace).repair_silent_audio(manifest)
+        manifest.quality_checks = [
+            check.to_dict() for check in validate_collection(manifest, workspace.root)
+        ]
+        workspace.save_collection_manifest(manifest)
+        path.write_text(json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        result_path = path.parent / "result.json"
+        if result_path.is_file():
+            result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+            result_payload["checks"] = manifest.quality_checks
+            result_payload["publishable"] = all(item["passed"] for item in manifest.quality_checks)
+            result_path.write_text(
+                json.dumps(result_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+            )
+        failed = [item for item in manifest.quality_checks if not item["passed"]]
+        print(json.dumps({
+            "repaired": repaired, "failed_checks": failed,
+        }, ensure_ascii=False, indent=2))
+        if failed:
+            sys.exit(1)
     elif args.command == "inspect-video":
         checks = validate_wechat_mp4(probe_video(Path(args.file)), args.max_duration, require_audio=not args.visual_track)
         print(json.dumps(checks, ensure_ascii=False, indent=2))
@@ -513,6 +627,14 @@ def main() -> None:
         print(json.dumps(batch.to_dict(), ensure_ascii=False, indent=2))
         if batch.state.value not in {"succeeded", "partial_success"}:
             sys.exit(1)
+    elif args.command == "publish-collection-confirm-pre-submit-failure":
+        batch = workspace.load_publish_batch(args.batch)
+        if not isinstance(batch, CollectionPublishBatch):
+            raise ValueError("publish-collection-confirm-pre-submit-failure requires a collection batch")
+        CollectionPublishBatchService(workspace, SocialAutoUploadBackend()).confirm_pre_submit_auth_rejection(
+            batch, args.item, args.actor,
+        )
+        print(json.dumps(batch.to_dict(), ensure_ascii=False, indent=2))
     elif args.command == "publish-policy":
         print(json.dumps({
             "quality_gate_required": True,

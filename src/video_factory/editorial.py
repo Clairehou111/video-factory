@@ -15,6 +15,18 @@ from .models import (
 INTERNAL_LABELS = ("证据带读", "关键结论", "仓库描述", "README声明", "trial", "boundary", "翻译：", "译为：")
 EMPTY_HYPE = ("炸锅了", "彻底炸锅", "颠覆一切", "改写一切", "历史性时刻")
 
+# Explain one decision-critical specialist term at its first relevant shot.
+# Definitions are audience UI copy, not claims about the selected source.
+AUDIENCE_GLOSSARY: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("pass@1",), "pass@1：代码只生成一次就通过测试的比例。", r"只生成一次.{0,12}通过测试.{0,8}(?:比例|占比)"),
+    (("首 Token 延迟", "TTFT"), "{term}：发出请求到看到第一个 Token 的等待时间。", r"发出请求.{0,12}第一个\s*Token.{0,10}(?:等待|时间)"),
+    (("FP8", "INT8", "INT4", "量化"), "{term} 量化：用更低数值精度减少模型的显存和计算占用。", r"低.{0,6}(?:数值)?精度.{0,12}(?:减少|降低).{0,12}(?:显存|计算)"),
+    (("激活参数量", "激活参数"), "{term}：模型每次生成时实际参与计算的参数规模。", r"每次.{0,8}(?:生成|回答).{0,12}(?:参与计算|实际调用).{0,8}参数"),
+    (("Arena 分", "Arena分", "Elo"), "{term}：模型对战评测按胜负换算的相对分数。", r"模型对战.{0,12}(?:胜负|偏好).{0,12}(?:相对)?分数"),
+    (("幻觉率",), "幻觉率：模型生成错误或无依据内容的占比。", r"(?:错误|无依据|编造).{0,12}(?:比例|占比)|(?:比例|占比).{0,12}(?:错误|无依据|编造)"),
+    (("拒绝率", "拒答率"), "{term}：模型直接拒绝回答的请求占比。", r"(?:拒绝|不愿|不)(?:直接)?(?:回答|作答).{0,12}(?:比例|占比)|(?:比例|占比).{0,12}(?:拒绝|不回答|不作答)"),
+)
+
 
 def looks_like_internal_direction(value: str) -> bool:
     """Detect production/readership instructions in an audience-copy field.
@@ -107,10 +119,25 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
         return score
 
     if strategy.hook_candidates and strategy.selected_hook in strategy.hook_candidates:
+        model_names = [
+            subject.name.strip() for subject in brief.subjects
+            if subject.subject_type.strip().casefold() == "model" and subject.name.strip()
+        ]
+        model_named_hooks = [
+            hook for hook in strategy.hook_candidates
+            if any(name.casefold() in hook.casefold() for name in model_names)
+        ]
+        if model_named_hooks and not any(
+            name.casefold() in strategy.selected_hook.casefold() for name in model_names
+        ):
+            # Select already-written model-specific copy instead of inventing
+            # or prefixing prose in the execution layer.
+            strategy.selected_hook = max(model_named_hooks, key=candidate_score)
         selected_score = candidate_score(strategy.selected_hook)
         strongest = max(strategy.hook_candidates, key=candidate_score)
         if candidate_score(strongest) >= selected_score + 2.0:
             strategy.selected_hook = strongest
+    _inject_audience_glossary(brief)
     hook_claims = "\n".join([
         strategy.hook_fact, strategy.conflict, strategy.stakes, strategy.stance,
         strategy.selected_hook, brief.headline, brief.subheadline,
@@ -452,6 +479,16 @@ def route_content(
             topic, reason = TopicType.RESEARCH_OR_BENCHMARK, "X post leads with research"
         elif any(marker in tweet_route_text for marker in ("paid users", "rate limit", "pricing", "reset has landed", "takes effect", "rollout")):
             topic, reason = TopicType.OFFICIAL_ANNOUNCEMENT, "X post communicates an operational product update"
+        elif (
+            any(marker in tweet_route_text for marker in (
+                "model", "weights", "checkpoint", "parameters", "parameter model",
+                "fp8", "bf16", "gguf", "mlx", "llm",
+            ))
+            and any(marker in tweet_route_text for marker in (
+                "released", "release", "available", "launching", "open source", "hugging face",
+            ))
+        ):
+            topic, reason = TopicType.MODEL_OR_PRODUCT, "X post announces a model/product"
         elif any(marker in tweet_route_text for marker in ("sdk", "api", "agent", "tool", "cli", "open source")):
             topic, reason = TopicType.TOOL_SDK_AGENT, "X post leads with a tool or developer interface"
         elif any(marker in tweet_route_text for marker in ("model", "product", "available today", "launching")):
@@ -933,6 +970,17 @@ def validate_editorial_structure(
         errors.append("hook must cite valid evidence")
     if not all((brief.headline.strip(), brief.subheadline.strip(), brief.fixed_conclusion.strip())):
         errors.append("headline, subheadline, and fixed_conclusion are required")
+    if topic == TopicType.MODEL_OR_PRODUCT:
+        model_names = [
+            subject.name.strip() for subject in brief.subjects
+            if subject.subject_type.strip().casefold() == "model" and subject.name.strip()
+        ]
+        if model_names and not any(
+            name.casefold() in strategy.selected_hook.casefold() for name in model_names
+        ):
+            errors.append(
+                "selected_hook must name the concrete model subject: " + ", ".join(model_names)
+            )
     if content_type == ContentType.FLASH and copy_width(brief.fixed_conclusion) > 64:
         errors.append("fixed conclusion must fit the persistent bottom rail in at most 64 Chinese-character-equivalents")
     if not brief.subjects:
@@ -948,6 +996,12 @@ def validate_editorial_structure(
         return [*errors, "at least one evidence shot is required"]
     if candidate.source_type == SourceType.TWEET and brief.evidence_shots[0].kind != EvidenceShotKind.TWEET_CARD:
         errors.append("an X-rooted story must begin with one complete tweet_card shot")
+    missing_glossary = _missing_audience_glossary(brief)
+    if missing_glossary:
+        shot_index, term = missing_glossary
+        errors.append(
+            f"evidence_shots[{shot_index}].audience_copy must explain specialist metric {term} in plain Chinese"
+        )
 
     seen_facts: set[str] = set()
     for index, shot in enumerate(brief.evidence_shots, start=1):
@@ -1034,6 +1088,69 @@ def validate_editorial_structure(
             elif len(translation) > 140:
                 errors.append("root-post Chinese translation exceeds 140 characters")
     return errors
+
+
+def _glossary_match(value: str) -> tuple[str, str, str] | None:
+    # Registry order is difficulty priority. The first matching group wins;
+    # alias order resolves wording variants inside that group.
+    for aliases, template, explanation_pattern in AUDIENCE_GLOSSARY:
+        for term in aliases:
+            if term.casefold() in value.casefold():
+                return term, template, explanation_pattern
+    return None
+
+
+def _selected_glossary(brief: EditorialBrief) -> tuple[int, str, str, str] | None:
+    # A hook term wins because misunderstanding it blocks the whole story.
+    hook_match = _glossary_match(brief.attention_strategy.selected_hook)
+    if hook_match:
+        return 0, *hook_match
+    full_video = "\n".join(
+        " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+        for shot in brief.evidence_shots
+    )
+    match = _glossary_match(full_video)
+    if not match:
+        return None
+    term, template, explanation_pattern = match
+    shot_index = next(
+        index for index, shot in enumerate(brief.evidence_shots)
+        if term.casefold() in " ".join((
+            shot.fact, shot.audience_copy, shot.translation, shot.full_translation,
+        )).casefold()
+    )
+    return shot_index, term, template, explanation_pattern
+
+
+def _missing_audience_glossary(brief: EditorialBrief) -> tuple[int, str] | None:
+    selected = _selected_glossary(brief)
+    if selected:
+        shot_index, term, _, explanation_pattern = selected
+        shot = brief.evidence_shots[shot_index]
+        visible = " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+        if not re.search(explanation_pattern, visible, re.IGNORECASE):
+            return shot_index + 1, term
+    return None
+
+
+def _inject_audience_glossary(brief: EditorialBrief) -> None:
+    # One definition per short video prevents a useful explainer from turning
+    # into a stack of glossary cards.
+    selected = _selected_glossary(brief)
+    if not selected:
+        return
+    shot_index, term, template, explanation_pattern = selected
+    shot = brief.evidence_shots[shot_index]
+    visible = " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+    if not re.search(explanation_pattern, visible, re.IGNORECASE):
+        shot.audience_copy = template.format(term=term)
+
+
+def is_audience_glossary_definition(value: str) -> bool:
+    return any(
+        re.search(explanation_pattern, value, re.IGNORECASE)
+        for _, _, explanation_pattern in AUDIENCE_GLOSSARY
+    )
 
 
 def compile_evidence_shots(brief: EditorialBrief, candidate: Candidate) -> list[SceneProposal]:

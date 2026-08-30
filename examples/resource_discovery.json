@@ -1,6 +1,8 @@
 {
   "timezone": "Asia/Tokyo",
   "retry_backoff_seconds": [0, 30, 120],
+  "blocked_retry_delay_hours": 6,
+  "max_blocked_retry_runs": 2,
   "event_dedupe_days": 30,
   "channels": {
     "x": {

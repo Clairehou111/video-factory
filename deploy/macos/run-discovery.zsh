@@ -31,9 +31,12 @@ LOG_FILE="${LOG_DIR}/discovery-$(date '+%Y-%m-%d').log"
     # No --force: Video Factory's persisted next_run_at controls each channel.
     # caffeinate keeps a long browser capture or render from being interrupted.
     /usr/bin/caffeinate -dimsu "${CLI}" \
-      --workspace "${WORKSPACE}" discover \
+      --workspace "${WORKSPACE}" pipeline \
       --config "${CONFIG}" \
-      --provider deepseek
+      --publish-config "${PROJECT_ROOT}/examples/pipeline_publish.json" \
+      --provider auto \
+      --trial-days 7 \
+      --notify
     exit_code=$?
   fi
   echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] scheduled discovery finished with status ${exit_code}"

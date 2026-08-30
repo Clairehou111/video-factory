@@ -56,7 +56,7 @@ def find_high_value_visuals(readme: str, base_url: str, limit: int = 3) -> list[
 
 
 class OpenRouterVisualAnalyst:
-    """Read charts/architecture images with the selected discounted vision model."""
+    """Read charts/architecture images with the cheapest capability-qualified vision model."""
 
     def __init__(self, settings: LLMSettings, quote: ModelQuote):
         if settings.provider != "openrouter":

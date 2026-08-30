@@ -142,6 +142,9 @@ class TranscriptCue:
     translation: str = ""
     speaker: str = ""
     confidence: float | None = None
+    # Clip-local YouTube transcripts keep the source timeline for audit/rebuilds.
+    original_start: float | None = None
+    original_end: float | None = None
 
     @property
     def duration(self) -> float:
@@ -167,6 +170,9 @@ class SourceRange:
     crop_y: int | None = None
     crop_width: int | None = None
     crop_height: int | None = None
+    # Set when a remote interview is downloaded as a bounded source clip.
+    original_start: float | None = None
+    original_end: float | None = None
 
     @property
     def duration(self) -> float:
@@ -205,6 +211,7 @@ class HookSpec:
     source_range: SourceRange
     source_cue_ids: list[str]
     payoff_cue_ids: list[str]
+    speaker_label: str = ""
     motion: str = "push_in"
     persistent_title: bool = True
     selected: bool = False
@@ -291,6 +298,7 @@ class VideoCollectionManifest:
     transcript: list[TranscriptCue]
     terminology: list[TerminologyEntry]
     items: list[CollectionItem]
+    editorial_mode: str = "study"
     source_media_path: str = ""
     source_subtitle_path: str = ""
     source_duration: float = 0.0

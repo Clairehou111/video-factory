@@ -170,6 +170,13 @@ class StoryboardDirector:
         elif request.editorial_brief:
             fixed_hook = request.editorial_brief.attention_strategy.selected_hook or request.editorial_brief.attention_strategy.hook_candidates[0]
             fixed_title = fixed_hook
+            if request.topic_type == TopicType.MODEL_OR_PRODUCT:
+                model_name = next((
+                    subject.name.strip() for subject in request.editorial_brief.subjects
+                    if subject.subject_type.strip().casefold() == "model" and subject.name.strip()
+                ), "")
+                if model_name and model_name.casefold() not in fixed_title.casefold():
+                    fixed_title = f"{model_name}｜{fixed_title}"
         return RenderManifest(
             id=request.id, candidate_id=request.candidate.id, content_type=request.content_type,
             scenes=scenes, evidence=request.evidence, source_urls=[request.candidate.source_url, *request.candidate.linked_sources],

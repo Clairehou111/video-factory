@@ -119,7 +119,7 @@ class StoryWriterPacket:
             )
         else:
             schema["editorial_brief"] = {
-                "headline": "specific two-line-rail headline naming the actor and conflict",
+                "headline": "specific adaptive upper-rail headline naming the actor and conflict; keep the exact entity even when it needs a smaller font or extra line",
                 "subheadline": "new information: consequence, technical change, or open loop",
                 "fixed_conclusion": "distinctive evidence-backed stance that resolves the opening",
                 "duration_target": self.target_duration,
@@ -180,6 +180,8 @@ class StoryWriterPacket:
                 "Non-GitHub editorial contract: return editorial_brief, never scenes, kind, material_role, visual_action, recording_cues, selectors, pointer tracks, zoom tracks, duration schedules, trial as a material, or boundary as a material. The execution layer compiles cited evidence plus visual_family into browser/render scenes and schedules flash timing deterministically. "
                 "Treat attention as a factual layer, not decoration. Find a concrete tension: new workflow versus old labor, architecture innovation versus prior paradigms, capability breakthrough versus trade-offs, named vendor action versus community response, key people versus incumbent organization, result versus prior expectation, or announcement versus migration deadline. If no honest conflict exists, use a concrete surprise, record scale, or high-stakes change; never fabricate opposition or cost conflicts when the source does not focus on cost. "
                 "Return exactly three materially different hook_candidates and select one verbatim. The chosen hook, headline, and subheadline must name the actor/product/company/paper and say what happened. Do not merely add emotional adjectives to a summary. The payoff must answer the opening with a distinct judgment. "
+                "The audience includes vibe coders, not only AI researchers. When the hook or a visible metric uses a specialist term, its first evidence shot must immediately add a short plain-Chinese explanation of what the term measures or means in practice. For example, a refusal rate means the share of prompts the model declines to answer; explain the concept without assuming familiarity, while keeping the exact sourced number. Do not waste space defining common words such as API or model. "
+                "Never shorten a title by deleting the exact person, company, project, model, or product name. The renderer owns title fitting and may reduce font size, add a line, and increase the fixed upper rail; preserve identity and meaning first. "
                 "For short video, at least two hook candidates must exploit a real evidence-backed contradiction, surprise, consequence, or unresolved tension rather than a neutral topic label. Use direct emotional Chinese when the facts earn it. Phrases such as 引发讨论、值得关注、注意风险 or 生态竞争 cannot carry the hook or payoff by themselves. The fixed conclusion must give the viewer a memorable stance or consequence, not a ritual compliance reminder. "
                 "For an X-rooted story, evidence_shots[0] must be tweet_card, show the complete original post in one shot, and cite the root post. Do not split its text into multiple cards. Then extend only when primary evidence adds a new causal step or impact. "
                 "Primary-source images are first-class evidence. When evidence kind web:source_image or x:media_photo has editorial_priority=high and directly depicts a named team, product, architecture, benchmark, result, or decisive quoted-post context used by the story, cite it in the relevant evidence_shot and use visual_family=source_image. An image attached to the root or quoted X post is direct source evidence and should be shown when it explains the post's central object or conflict. A company/team story with an official founding-team photo should show the photo instead of replacing it with a generic text card. "
@@ -222,6 +224,13 @@ class StoryWriterPacket:
             topic_contract = (
                 "Official-news editorial contract: separate the announced event, its effective scope, and the audience action. "
                 "Lead with the concrete change or deadline, preserve the official availability wording, and never convert a pilot into a rollout."
+            )
+        elif self.topic_type == TopicType.MODEL_OR_PRODUCT:
+            topic_contract = (
+                "Model/product editorial contract: the persistent title and selected hook must name the exact model or product, "
+                "not only its publisher, host, benchmark, or release channel. Lead with what concretely changed and why it matters. "
+                "Translate specialist metrics into one-line plain Chinese at their first visible evidence shot so a technically curious "
+                "vibe coder can follow the stakes without prior research knowledge."
             )
         return "\n".join([
             "You are an evidence-bound Chinese technical-video editor for WeChat Channels.",

@@ -6,8 +6,9 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from video_factory.agent import ContentAgentError
 from video_factory.factory import GenerateOptions, VideoFactory
 from video_factory.models import (
     ColdOpenBeat, ContentType, Evidence, MaterialRole, RenderManifest, Scene,
@@ -28,6 +29,81 @@ def basic_manifest() -> RenderManifest:
 
 
 class VideoFactoryTest(unittest.TestCase):
+    def test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted(self) -> None:
+        with TemporaryDirectory() as temp:
+            factory = VideoFactory(Workspace(Path(temp) / "workspace"))
+            job = Path(temp) / "job"
+            job.mkdir()
+            primary_writer = MagicMock()
+            primary_writer.settings.model = "z-ai/glm-5.3-flash"
+            primary_reviewer = MagicMock()
+            fallback_writer = MagicMock()
+            fallback_reviewer = MagicMock()
+            primary_agent = MagicMock()
+            fallback_agent = MagicMock()
+            primary_agent.run.side_effect = ContentAgentError(
+                "critic rejected duplicate hook", [{"step": "copy_review", "status": "failed"}],
+            )
+            expected_run = object()
+            fallback_agent.run.return_value = expected_run
+            selection: dict[str, object] = {}
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
+                patch.object(
+                    factory, "_editorial_agent", side_effect=[primary_agent, fallback_agent],
+                ) as editorial_agent,
+                patch("video_factory.factory.LLMSettings.from_environment", return_value=MagicMock()),
+                patch("video_factory.factory.OpenAICompatibleStoryWriter", return_value=fallback_writer),
+                patch.object(
+                    factory, "_copy_reviewer",
+                    return_value=(fallback_reviewer, {"provider": "openrouter", "model": "critic"}),
+                ),
+            ):
+                run = factory._run_editorial_agent_with_fallback(
+                    object(), primary_writer, primary_reviewer,
+                    GenerateOptions(provider="deepseek"), job, selection,
+                )
+
+            self.assertIs(run, expected_run)
+            self.assertTrue((job / "content-agent-primary-error.json").is_file())
+            self.assertEqual(selection["fallback"]["model"], "google/gemini-3.7-flash")
+            self.assertIn("semantic-copy repairs", selection["fallback"]["reason"])
+            self.assertEqual(editorial_agent.call_args_list[0].kwargs["max_llm_calls"], 6)
+            self.assertEqual(editorial_agent.call_args_list[1].kwargs["max_llm_calls"], 14)
+
+    def test_explicit_trigger_uncertainty_requires_adjacent_visible_qualification(self) -> None:
+        evidence = [Evidence(
+            "e-uncertain", "tweet-1", "https://x.com/example/status/1",
+            "Shortly afterward my account was suspended. I don't know yet whether this setup was the trigger.",
+            "x:thread_post",
+        )]
+
+        direction = VideoFactory._causal_uncertainty_direction(evidence)
+
+        self.assertIn("同一句或同一屏", direction)
+        self.assertIn("是否由此触发尚无定论", direction)
+        self.assertIn("禁止用‘导致、触发、秒封、随即被封、照做就被封’", direction)
+
+    def test_no_causal_uncertainty_rule_without_explicit_source_boundary(self) -> None:
+        evidence = [Evidence(
+            "e-causal", "tweet-1", "https://x.com/example/status/1",
+            "The vendor confirmed that the policy caused the suspension.", "x:thread_post",
+        )]
+        self.assertEqual(VideoFactory._causal_uncertainty_direction(evidence), "")
+
+    def test_employee_reply_cannot_be_promoted_to_official_company_response(self) -> None:
+        evidence = [Evidence(
+            "e-employee", "tweet-1", "https://x.com/employee/status/1",
+            "An Anthropic employee replied from a personal account: We are hiring.",
+            "x:visual_analysis",
+        )]
+
+        direction = VideoFactory._source_identity_direction(evidence)
+
+        self.assertIn("个人回复不等于公司官方账号或公司声明", direction)
+        self.assertIn("禁止写‘官方回应、官方表态、第一条官方回应’", direction)
+
     def test_github_generation_cache_is_reused_and_refreshable(self) -> None:
         with TemporaryDirectory() as temp:
             factory = VideoFactory(Workspace(Path(temp) / "workspace"))

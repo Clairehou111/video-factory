@@ -13,6 +13,12 @@ from .media import probe_video
 
 CANVAS = (1080, 1920)
 DEFAULT_FONT = "/Users/clairehou/pyProjects/MoneyPrinterTurbo/resource/fonts/STHeitiMedium.ttc"
+# WeChat overlays the device/status chrome at the top and the post title plus
+# action controls at the bottom.  These bands are intentionally content-free:
+# rails may paint their background through them, but no essential glyph or
+# evidence is allowed there.
+WECHAT_TOP_UI_SAFE = 120
+WECHAT_BOTTOM_UI_SAFE = 400
 
 # Cold-open copy earns attention, but the repository must already feel like
 # the subject—not a small preview pushed below a title card.  Each tuple is
@@ -174,8 +180,14 @@ def render_fixed_footer(text: str, output: Path, font_path: Path | None = None) 
         raise ValueError("fixed footer text is required")
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((80, 1650, 1000, 1840), radius=26, fill="#061a36f8")
-    _draw_centered(draw, text, box=(120, 1670, 960, 1820), font=ImageFont.truetype(str(_font_path(font_path)), 36), fill="#e8f1ff", max_lines=3)
+    footer_bottom = CANVAS[1] - WECHAT_BOTTOM_UI_SAFE
+    footer_top = footer_bottom - 190
+    draw.rounded_rectangle((80, footer_top, 1000, footer_bottom), radius=26, fill="#061a36f8")
+    _draw_centered(
+        draw, text, box=(120, footer_top + 20, 960, footer_bottom - 20),
+        font=ImageFont.truetype(str(_font_path(font_path)), 36),
+        fill="#e8f1ff", max_lines=3,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output)
     return output
@@ -191,17 +203,21 @@ def render_information_frame(hook: str, footer: str, output: Path, font_path: Pa
     draw = ImageDraw.Draw(canvas)
     top_height, title_size, title_lines = _information_layout(hook, font_path)
     bottom_height, conclusion_size, conclusion_lines = _footer_layout(footer, font_path)
-    bottom_top = 1920 - bottom_height
-    draw.rectangle((0, 0, 1080, top_height), fill="#031126ff")
+    top_bottom = WECHAT_TOP_UI_SAFE + top_height
+    bottom_top = 1920 - WECHAT_BOTTOM_UI_SAFE - bottom_height
+    draw.rectangle((0, 0, 1080, top_bottom), fill="#031126ff")
     draw.rectangle((0, bottom_top, 1080, 1920), fill="#031126ff")
     title = ImageFont.truetype(str(_font_path(font_path)), title_size)
     conclusion = ImageFont.truetype(str(_font_path(font_path)), conclusion_size)
     _draw_centered(
-        draw, hook, box=(68, 28, 1012, top_height - 24), font=title,
+        draw, hook,
+        box=(68, WECHAT_TOP_UI_SAFE + 28, 1012, top_bottom - 24), font=title,
         fill="#f4f8ff", max_lines=title_lines, line_gap=12,
     )
     _draw_centered(
-        draw, footer, box=(78, bottom_top + 28, 1002, 1892), font=conclusion,
+        draw, footer,
+        box=(78, bottom_top + 28, 1002, 1920 - WECHAT_BOTTOM_UI_SAFE - 28),
+        font=conclusion,
         fill="#eaf2ff", max_lines=conclusion_lines, line_gap=14,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -473,8 +489,11 @@ def compose_information_frame(manifest: RenderManifest, visual_track: Path, outp
     title = (manifest.fixed_title or manifest.scenes[0].caption).strip()
     top_height, _, _ = _information_layout(title, font_path)
     bottom_height, _, _ = _footer_layout(manifest.fixed_footer or "", font_path)
-    bottom_top = 1920 - bottom_height
-    content_height = bottom_top - top_height
+    pane_top = WECHAT_TOP_UI_SAFE + top_height
+    bottom_top = 1920 - WECHAT_BOTTOM_UI_SAFE - bottom_height
+    content_height = bottom_top - pane_top
+    if content_height < 620:
+        raise ValueError("WeChat UI-safe rails leave less than 620px for source evidence")
     with TemporaryDirectory(prefix="video-factory-frame-") as temp:
         temp_root = Path(temp)
         static = render_information_frame(title, manifest.fixed_footer or "", temp_root / "fixed.png", font_path)
@@ -483,10 +502,10 @@ def compose_information_frame(manifest: RenderManifest, visual_track: Path, outp
         if (probe.width, probe.height) == (1080, content_height):
             content_filter = "[0:v]setsar=1[content]"
         else:
-            content_filter = f"[0:v]scale=1080:{content_height}:force_original_aspect_ratio=decrease,pad=1080:{content_height}:(ow-iw)/2:(oh-ih)/2:color=0xf7f7f7,setsar=1[content]"
+            content_filter = f"[0:v]scale=1080:{content_height}:force_original_aspect_ratio=decrease,pad=1080:{content_height}:(ow-iw)/2:(oh-ih)/2:color=0x020815,setsar=1[content]"
         filters = [
             content_filter,
-            f"[content]pad=1080:1920:0:{top_height}:color=0x020815[base]",
+            f"[content]pad=1080:1920:0:{pane_top}:color=0x020815[base]",
             "[base][1:v]overlay=0:0:format=auto[v1]",
         ]
         previous = "[v1]"
@@ -503,7 +522,7 @@ def compose_information_frame(manifest: RenderManifest, visual_track: Path, outp
                 gloss = render_adjacent_gloss(
                     translation, temp_root / f"gloss-{len(inputs)}.png", font_path,
                     highlight_box=shot.get("highlight_box"), source_size=source_size,
-                    pane_top=top_height, pane_height=content_height,
+                    pane_top=pane_top, pane_height=content_height,
                 )
                 input_index = len(inputs) // 4 + 1
                 inputs.extend(["-loop", "1", "-i", str(gloss)])

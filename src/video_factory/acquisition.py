@@ -96,21 +96,101 @@ class URLAcquirer:
                 "--window", "background", "--trace", "retain-on-failure",
             ], "opencli-twitter"))
         errors: list[str] = []
+        attempt_trace: list[dict[str, object]] = []
         payload: dict | None = None
         method = ""
         for command, name in attempts:
-            try:
-                completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
-                parsed = self._parse_json_output(completed.stdout)
-                payload = self._normalize_x_payload(parsed, status_id, author)
-                if payload.get("data"):
-                    method = name
+            for attempt in range(1, 3):
+                try:
+                    completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+                    parsed = self._parse_json_output(completed.stdout)
+                    payload = self._normalize_x_payload(parsed, status_id, author)
+                    if payload.get("data"):
+                        method = name
+                        attempt_trace.append({
+                            "backend": name, "attempt": attempt, "status": "succeeded",
+                        })
+                        break
+                    errors.append(f"{name}: exact status {status_id} was not present")
+                    attempt_trace.append({
+                        "backend": name, "attempt": attempt, "status": "wrong_result",
+                        "detail": f"exact status {status_id} was not present",
+                    })
                     break
-                errors.append(f"{name}: exact status {status_id} was not present")
+                except subprocess.CalledProcessError as error:
+                    # OpenCLI uses meaningful exit codes and stderr (for example,
+                    # browser-extension or automation-permission failures).  Keep
+                    # that diagnostic: a bare CalledProcessError made an
+                    # environment failure indistinguishable from a bad X URL.
+                    diagnostics = " ".join(
+                        part.strip() for part in (error.stderr or "", error.stdout or "") if part.strip()
+                    )
+                    diagnostics = re.sub(r"\s+", " ", diagnostics)[:800]
+                    detail = f"exit {error.returncode}"
+                    if diagnostics:
+                        detail += f": {diagnostics}"
+                    retryable = error.returncode in {1, 69, 75}
+                    attempt_trace.append({
+                        "backend": name, "attempt": attempt,
+                        "status": "retryable_failure" if retryable else "failed",
+                        "detail": detail,
+                    })
+                    if retryable and attempt < 2:
+                        delay = 0.75 * (2 ** (attempt - 1))
+                        attempt_trace.append({
+                            "backend": name, "attempt": attempt,
+                            "status": "backoff", "delay_seconds": delay,
+                        })
+                        time.sleep(delay)
+                        continue
+                    errors.append(f"{name}: {detail}")
+                    break
+                except subprocess.TimeoutExpired as error:
+                    detail = f"timeout after {error.timeout}s"
+                    attempt_trace.append({
+                        "backend": name, "attempt": attempt,
+                        "status": "retryable_failure", "detail": detail,
+                    })
+                    if attempt < 2:
+                        delay = 0.75 * (2 ** (attempt - 1))
+                        attempt_trace.append({
+                            "backend": name, "attempt": attempt,
+                            "status": "backoff", "delay_seconds": delay,
+                        })
+                        time.sleep(delay)
+                        continue
+                    errors.append(f"{name}: {detail}")
+                    break
+                except Exception as error:
+                    detail = f"{type(error).__name__}: {error}"
+                    attempt_trace.append({
+                        "backend": name, "attempt": attempt, "status": "failed", "detail": detail,
+                    })
+                    errors.append(f"{name}: {detail}")
+                    break
+            if payload and payload.get("data"):
+                break
+        if not payload or not payload.get("data"):
+            try:
+                body, _, public_method = self._fetch_readable(url)
+                payload = self._x_payload_from_public_snapshot(
+                    body.decode("utf-8", errors="replace"), status_id, author, url,
+                )
+                method = f"{public_method}-x-fallback"
+                attempt_trace.append({
+                    "backend": method, "attempt": 1, "status": "succeeded",
+                    "reason": "structured browser-backed acquisition exhausted",
+                })
             except Exception as error:
-                errors.append(f"{name}: {type(error).__name__}: {error}")
+                attempt_trace.append({
+                    "backend": "public-x-snapshot", "attempt": 1,
+                    "status": "failed", "detail": f"{type(error).__name__}: {error}",
+                })
+                errors.append(f"public-x-snapshot: {type(error).__name__}: {error}")
         if not payload or not payload.get("data"):
             raise RuntimeError("X acquisition failed; " + "; ".join(errors))
+        payload["acquisition_trace"] = attempt_trace
+        payload["selected_backend"] = method
         capture.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         resolver = ExternalLinkResolver()
         ingest = TwitterCliIngestor().ingest(
@@ -119,6 +199,66 @@ class URLAcquirer:
         )
         self._archive_x_media(ingest, payload, job)
         return AcquisitionResult(ingest, capture, method)
+
+    @staticmethod
+    def _x_payload_from_public_snapshot(
+        snapshot: str, status_id: str, author: str, source_url: str,
+    ) -> dict:
+        """Recover the exact root post from a public Jina-rendered X page.
+
+        This deliberately returns only the root post.  Replies and embedded
+        quote cards are not promoted without a structured backend because a
+        public Markdown snapshot cannot always distinguish their boundaries.
+        Context research may still archive them as separate evidence.
+        """
+        canonical_author = author.lstrip("@")
+        title_match = re.search(
+            r"^Title:\s*(.*?)\s+\(@([^)]+)\)\s+on X\s*$", snapshot, re.MULTILINE,
+        )
+        display_name = title_match.group(1).strip() if title_match else canonical_author
+        if title_match and not canonical_author:
+            canonical_author = title_match.group(2).strip()
+        if not canonical_author:
+            raise ValueError("public X snapshot has no author identity")
+
+        canonical_url = f"https://x.com/{canonical_author}/status/{status_id}"
+        markdown = snapshot.split("Markdown Content:", 1)[-1]
+        timestamp_link = re.search(
+            rf"\[[^\]]+\]\({re.escape(canonical_url)}\)", markdown,
+        )
+        if not timestamp_link:
+            # Reader output may preserve twitter.com even when the input was x.com.
+            alternate = f"https://twitter.com/{canonical_author}/status/{status_id}"
+            timestamp_link = re.search(rf"\[[^\]]+\]\({re.escape(alternate)}\)", markdown)
+        if not timestamp_link:
+            raise ValueError(f"public X snapshot does not contain exact status {status_id}")
+        root_block = markdown[:timestamp_link.start()]
+        handle_links = list(re.finditer(
+            rf"\[@{re.escape(canonical_author)}\]\(https?://(?:www\.)?(?:x|twitter)\.com/{re.escape(canonical_author)}\)",
+            root_block, re.IGNORECASE,
+        ))
+        if not handle_links:
+            raise ValueError("public X snapshot has no root author handle")
+        content = root_block[handle_links[-1].end():].strip()
+        content = re.split(r"\s*\[!\[Image|\n\s*\n", content, maxsplit=1)[0]
+        content = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", content)
+        content = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", content)
+        content = re.sub(r"\s+", " ", content).strip(" -*#")
+        if not content:
+            raise ValueError("public X snapshot contains no root post text")
+
+        published = re.search(r"^Published Time:\s*(.+)$", snapshot, re.MULTILINE)
+        root = {
+            "id": status_id,
+            "text": content,
+            "author": {"screenName": canonical_author, "name": display_name or canonical_author},
+            "createdAtISO": published.group(1).strip() if published else None,
+            "metrics": {},
+            "media": [],
+            "urls": extract_external_urls(content),
+            "url": canonical_url if canonical_author else source_url,
+        }
+        return {"ok": True, "schema_version": "1", "data": [root]}
 
     def _archive_x_media(self, ingest: IngestResult, payload: dict, job: Path) -> None:
         """Promote root and quoted-post photos to immutable visual evidence."""

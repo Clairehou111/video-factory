@@ -23,6 +23,7 @@ class ModelRequirements:
     input_modalities: tuple[str, ...] = ("text",)
     minimum_context: int = 32_000
     require_structured_output: bool = True
+    excluded_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +126,8 @@ class OpenRouterCatalog:
             model_id = str(item.get("id", ""))
             if not model_id or model_id.endswith(":batch") or model_id == "openrouter/auto":
                 continue
+            if model_id in requirements.excluded_models:
+                continue
             if model_id.endswith(":free") and os.environ.get("OPENROUTER_ALLOW_FREE", "0") != "1":
                 continue
             if allowlist and model_id not in allowlist:
@@ -173,11 +176,13 @@ class OpenRouterCatalog:
                 f"no OpenRouter model satisfies purpose={requirements.purpose}, "
                 f"modalities={requirements.input_modalities}; set the matching OPENROUTER_*_MODELS allowlist"
             )
-        discounted = [quote for quote in eligible if quote.discount_percent is not None]
-        pool = discounted if discounted and os.environ.get("OPENROUTER_PREFER_DISCOUNTS", "1") != "0" else eligible
-        chosen = min(pool, key=lambda quote: (quote.estimated_cost, -quote.context_length, quote.model_id))
+        # Discounts are an editorial discovery signal, not a production-routing
+        # preference. Once models pass the purpose-specific capability gate,
+        # route to the lowest effective price even when another eligible model
+        # happens to carry a promotional badge.
+        chosen = min(eligible, key=lambda quote: (quote.estimated_cost, -quote.quality_score, -quote.context_length, quote.model_id))
         reason = (
-            f"cheapest eligible {'discounted ' if chosen.discount_percent is not None else ''}model; "
+            "cheapest capability-qualified model; "
             f"effective catalog estimate ${chosen.estimated_cost:.6f}/request"
         )
         return ModelQuote(**{**chosen.to_dict(), "reason": reason})

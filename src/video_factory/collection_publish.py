@@ -11,7 +11,8 @@ from uuid import uuid4
 
 from .models import RenderProfile, VideoCollectionManifest, now_iso
 from .publish import (
-    BackendResult, FILE_OPTION_NAMES, PublishBatchState, PublishPlatform, PublishTarget,
+    BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID, BackendResult, FILE_OPTION_NAMES,
+    PublishBatchState, PublishPlatform, PublishTarget,
     SOCIAL_AUTO_UPLOAD_COMMIT, SocialAutoUploadBackend,
 )
 from .quality import CheckResult
@@ -196,6 +197,11 @@ def _remote_video_id(result: BackendResult) -> str:
     return match.group(0) if match else ""
 
 
+def _is_definitive_bilibili_auth_rejection(result: BackendResult) -> bool:
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return "账号未登录" in output and ("code: -101" in output or "code -101" in output)
+
+
 def create_collection_publish_batch(
     manifest: VideoCollectionManifest, spec: dict[str, Any], workspace: Path,
 ) -> CollectionPublishBatch:
@@ -319,13 +325,22 @@ class CollectionPublishBatchService:
             result = self.backend.submit_collection_video(target, Path(item.video_path))
             self._record(batch, item.platform.value, f"submit:{item.id}", result)
             if not result.succeeded:
-                item.state = CollectionPublishItemState.UNCERTAIN if result.started else CollectionPublishItemState.FAILED_PRE_SUBMIT
+                if item.platform == PublishPlatform.BILIBILI and _is_definitive_bilibili_auth_rejection(result):
+                    item.state = CollectionPublishItemState.FAILED_PRE_SUBMIT
+                else:
+                    item.state = (
+                        CollectionPublishItemState.UNCERTAIN
+                        if result.started else CollectionPublishItemState.FAILED_PRE_SUBMIT
+                    )
                 item.last_error = (result.stderr or result.stdout or "submission failed")[-1000:]
                 self.save(batch)
                 continue
             item.submitted_at = now_iso()
             item.remote_id = _remote_video_id(result)
-            if item.platform != PublishPlatform.BILIBILI:
+            if (
+                item.platform != PublishPlatform.BILIBILI
+                or batch.remote_collection_id == BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID
+            ):
                 item.state = CollectionPublishItemState.SUBMITTED
                 item.last_error = ""
                 self.save(batch)
@@ -349,6 +364,58 @@ class CollectionPublishBatchService:
         self._finish(batch)
         return batch
 
+    def run_item(self, batch: CollectionPublishBatch, item_id: str) -> CollectionPublishBatch:
+        """Publish one human-selected WeChat item without submitting its siblings."""
+        if batch.backend_commit != self.backend.commit:
+            raise ValueError(
+                f"batch requires publisher {batch.backend_commit}; backend is {self.backend.commit}"
+            )
+        if batch.state not in {
+            PublishBatchState.APPROVED, PublishBatchState.FAILED,
+            PublishBatchState.PARTIAL_SUCCESS,
+        }:
+            raise ValueError(f"collection batch is not runnable from state {batch.state}")
+        batch.verify_approval()
+        item = next((value for value in batch.items if value.id == item_id), None)
+        if item is None:
+            raise KeyError(item_id)
+        if item.platform != PublishPlatform.TENCENT:
+            raise ValueError("Bilibili publishing is paused; the dashboard only publishes WeChat videos")
+        if item.state not in {
+            CollectionPublishItemState.PENDING, CollectionPublishItemState.FAILED_PRE_SUBMIT,
+        }:
+            raise ValueError(f"collection item is not safely publishable from state {item.state}")
+
+        batch.state = PublishBatchState.RUNNING
+        self.save(batch)
+        target = item.as_publish_target()
+        preflight = self.backend.check_account(target)
+        self._record(batch, item.platform.value, f"preflight:{item.id}", preflight)
+        if not preflight.succeeded:
+            item.state = CollectionPublishItemState.FAILED_PRE_SUBMIT
+            item.last_error = (preflight.stderr or preflight.stdout or "account preflight failed")[-1000:]
+            self._finish(batch)
+            return batch
+
+        item.state = CollectionPublishItemState.SUBMITTING
+        item.attempts += 1
+        self.save(batch)
+        result = self.backend.submit_collection_video(target, Path(item.video_path))
+        self._record(batch, item.platform.value, f"submit:{item.id}", result)
+        if result.succeeded:
+            item.state = CollectionPublishItemState.SUBMITTED
+            item.submitted_at = now_iso()
+            item.remote_id = _remote_video_id(result)
+            item.last_error = ""
+        else:
+            item.state = (
+                CollectionPublishItemState.UNCERTAIN
+                if result.started else CollectionPublishItemState.FAILED_PRE_SUBMIT
+            )
+            item.last_error = (result.stderr or result.stdout or "submission failed")[-1000:]
+        self._finish(batch)
+        return batch
+
     def retry_collection_link(self, batch: CollectionPublishBatch, item_id: str) -> CollectionPublishBatch:
         item = next((value for value in batch.items if value.id == item_id), None)
         if item is None:
@@ -366,6 +433,32 @@ class CollectionPublishBatchService:
         else:
             item.last_error = (result.stderr or result.stdout or "collection association failed")[-1000:]
         self._finish(batch)
+        return batch
+
+    def confirm_pre_submit_auth_rejection(
+        self, batch: CollectionPublishBatch, item_id: str, actor: str,
+    ) -> CollectionPublishBatch:
+        item = next((value for value in batch.items if value.id == item_id), None)
+        if item is None:
+            raise KeyError(item_id)
+        if item.state != CollectionPublishItemState.UNCERTAIN:
+            raise ValueError("only an uncertain item can be reconciled")
+        if not actor.strip():
+            raise ValueError("reconciliation actor must not be empty")
+        evidence = item.last_error.lower()
+        if "账号未登录" not in evidence or ("code: -101" not in evidence and "code -101" not in evidence):
+            raise ValueError("item does not contain a definitive Bilibili pre-submit authentication rejection")
+        item.state = CollectionPublishItemState.FAILED_PRE_SUBMIT
+        self.workspace.append_publish_attempt(
+            batch.id, item.platform.value, f"reconcile_pre_submit:{item.id}",
+            {
+                "actor": actor.strip(),
+                "reason": "Bilibili code -101 rejected authentication before media upload",
+                "recorded_at": now_iso(),
+            },
+        )
+        batch.updated_at = now_iso()
+        self.save(batch)
         return batch
 
     def _record(self, batch: CollectionPublishBatch, platform: str, action: str, result: BackendResult) -> None:

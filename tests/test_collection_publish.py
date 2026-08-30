@@ -7,7 +7,10 @@ from video_factory.collection_publish import (
     CollectionPublishBatch, CollectionPublishBatchService, CollectionPublishItem,
     CollectionPublishItemState,
 )
-from video_factory.publish import BackendResult, PublishBatchState, PublishPlatform, SOCIAL_AUTO_UPLOAD_COMMIT
+from video_factory.publish import (
+    BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID, BackendResult, PublishBatchState,
+    PublishPlatform, SOCIAL_AUTO_UPLOAD_COMMIT,
+)
 from video_factory.storage import Workspace
 
 
@@ -38,6 +41,32 @@ class FakeCollectionBackend:
         return BackendResult(["add"], 0, json.dumps({"ok": True}), started=True)
 
 
+class FakeOrdinaryUploadBackend(FakeCollectionBackend):
+    def ensure_bilibili_collection(self, account_name, title):
+        return BackendResult(
+            ["ensure"], 0,
+            json.dumps({
+                "collection_id": BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID,
+                "supported": False,
+            }),
+            started=True,
+        )
+
+    def submit_collection_video(self, target, video_path):
+        self.uploaded.append(video_path.name)
+        return BackendResult(["upload"], 0, "ordinary upload completed", started=True)
+
+
+class FakeRejectedBilibiliBackend(FakeOrdinaryUploadBackend):
+    def submit_collection_video(self, target, video_path):
+        self.uploaded.append(video_path.name)
+        return BackendResult(
+            ["upload"], 1,
+            stderr='ResponseData { code: -101, message: "账号未登录" }',
+            started=True,
+        )
+
+
 class CollectionPublishTest(unittest.TestCase):
     def make_batch(self, temp: str, count: int = 2):
         root = Path(temp)
@@ -62,6 +91,36 @@ class CollectionPublishTest(unittest.TestCase):
         )
         workspace.save_publish_batch(batch)
         return workspace, batch
+
+    def make_tencent_batch(self, temp: str, count: int = 2):
+        workspace, batch = self.make_batch(temp, count)
+        for item in batch.items:
+            item.platform = PublishPlatform.TENCENT
+            item.options = {"collection": "AI 工程精选"}
+        workspace.save_publish_batch(batch)
+        return workspace, batch
+
+    def test_dashboard_style_run_item_submits_only_selected_wechat_video(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_tencent_batch(temp)
+            backend = FakeCollectionBackend()
+            service = CollectionPublishBatchService(workspace, backend)
+            service.approve(batch, "editor")
+
+            service.run_item(batch, "item-1")
+
+            self.assertEqual(backend.uploaded, ["video-1.mp4"])
+            self.assertEqual(batch.items[0].state, CollectionPublishItemState.PENDING)
+            self.assertEqual(batch.items[1].state, CollectionPublishItemState.SUBMITTED)
+            self.assertEqual(batch.state, PublishBatchState.PARTIAL_SUCCESS)
+
+    def test_dashboard_style_run_item_refuses_bilibili(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(temp, count=1)
+            service = CollectionPublishBatchService(workspace, FakeCollectionBackend())
+            service.approve(batch, "editor")
+            with self.assertRaisesRegex(ValueError, "Bilibili publishing is paused"):
+                service.run_item(batch, "item-0")
 
     def test_uploads_each_item_once_and_adds_it_to_collection(self) -> None:
         with TemporaryDirectory() as temp:
@@ -91,6 +150,45 @@ class CollectionPublishTest(unittest.TestCase):
             self.assertEqual(batch.state, PublishBatchState.SUCCEEDED)
             self.assertEqual(len(backend.uploaded), 1)
             self.assertEqual(len(backend.added), 2)
+
+    def test_unsupported_collection_cli_falls_back_to_ordinary_upload(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(temp, count=1)
+            backend = FakeOrdinaryUploadBackend()
+            service = CollectionPublishBatchService(workspace, backend)
+            service.approve(batch, "editor")
+            service.run(batch)
+            self.assertEqual(batch.state, PublishBatchState.SUCCEEDED)
+            self.assertEqual(batch.remote_collection_id, BILIBILI_ORDINARY_UPLOAD_COLLECTION_ID)
+            self.assertEqual(batch.items[0].state, CollectionPublishItemState.SUBMITTED)
+            self.assertEqual(len(backend.uploaded), 1)
+            self.assertEqual(backend.added, [])
+
+    def test_explicit_bilibili_auth_rejection_is_retryable_pre_submit_failure(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(temp, count=1)
+            backend = FakeRejectedBilibiliBackend()
+            service = CollectionPublishBatchService(workspace, backend)
+            service.approve(batch, "editor")
+            service.run(batch)
+            self.assertEqual(batch.state, PublishBatchState.FAILED)
+            self.assertEqual(batch.items[0].state, CollectionPublishItemState.FAILED_PRE_SUBMIT)
+
+    def test_reconciles_historical_uncertain_bilibili_auth_rejection(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(temp, count=1)
+            service = CollectionPublishBatchService(workspace, FakeCollectionBackend())
+            service.approve(batch, "editor")
+            batch.state = PublishBatchState.PARTIAL_SUCCESS
+            batch.items[0].state = CollectionPublishItemState.UNCERTAIN
+            batch.items[0].last_error = 'ResponseData { code: -101, message: "账号未登录" }'
+            workspace.save_publish_batch(batch)
+
+            service.confirm_pre_submit_auth_rejection(batch, batch.items[0].id, "editor")
+
+            self.assertEqual(batch.items[0].state, CollectionPublishItemState.FAILED_PRE_SUBMIT)
+            restored = workspace.load_publish_batch(batch.id)
+            self.assertEqual(restored.items[0].state, CollectionPublishItemState.FAILED_PRE_SUBMIT)
 
     def test_approval_digest_binds_every_video(self) -> None:
         with TemporaryDirectory() as temp:

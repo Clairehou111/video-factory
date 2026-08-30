@@ -1,6 +1,6 @@
 # Video Factory
 
-面向技术内容的可追溯短视频生产系统。默认只生成待审核包；也可在一次人工批次审批后，将成片顺序提交到视频号、抖音、小红书和 Bilibili。
+面向技术内容的可追溯短视频生产系统。自动工厂只生成待审核包，由本地 Dashboard 逐条人工确认后发布到视频号。Bilibili 自动路由目前暂停，历史发布代码保留但不会出现在自动队列或 Dashboard 中。
 
 ## 多渠道资源发现与自动成片
 
@@ -30,26 +30,65 @@ video-factory --workspace workspace discovery-skip <candidate-id> \
 
 候选池由可信账号、组织、媒体和官网种子与开放主题查询共同组成。搜索摘要不能直接通过质量门：系统还会检查可核验的身份和日期、足够的事实与叙事材料、真实视觉路径及各渠道特有条件。热度只参与软评分。候选、淘汰理由、跨渠道事件匹配、生产尝试和阻塞状态同时写入 SQLite 与 `workspace/discovery/` 的审计 JSON；发现并生成视频不会绕过现有人工发布审批。
 
+### 发现 → 生成 → 发布队列
+
+`pipeline` 在统一 discovery 完成后，立即把通过成片质量门的结果转换成幂等的待审核发布批次。所有自动来源目前只进入视频号，Bilibili 暂停。YouTube 有两条允许路径：AI 工程等技术讲座按顺序拆成 3–6 分钟短课并覆盖完整技术内容；知名科技人物对谈只选一个 60–180 秒、可独立理解且最有传播力的高光。普通生活访谈、融资闲聊和不知名人物对谈不进入候选。
+
+政治门禁只检查最终入选片段及其标题、人物标签和三条钩子；原始长视频其他部分含政治话题不会导致整片淘汰。入选片段禁止政治、选举、政府、战争、地缘政治和政治人物内容，但不同国家之间的技术、研究、工程、人才、学校或教育比较明确允许。
+
+```bash
+video-factory --workspace workspace pipeline \
+  --config examples/resource_discovery.json \
+  --publish-config examples/pipeline_publish.json \
+  --provider auto
+
+# pipeline 只创建 ready_for_review；审核后才真正上传
+video-factory --workspace workspace dashboard --actor claire
+# 浏览器打开 http://127.0.0.1:8765，预览后点击每张卡片的“确认并发布”
+```
+
+同一 manifest 重复执行 `pipeline` 会复用现有批次，不会重复投稿。YouTube 合集仍须先完成复用依据审核；未审核时批次保持 `blocked`，审核完成后再次运行 pipeline 才会生成可审批批次。
+
+Dashboard 只绑定 loopback 地址，按 manifest 去重，仅显示视频号未发布项。每张卡片可预览真实 MP4；按钮会在点击时绑定成片哈希、标题、文案和目标，完成账号预检后只发布这一条，不会连带提交同批其他视频。缺失成片、质量门失败或提交结果不确定时按钮保持禁用。
+
 ### macOS 持续运行
 
-`deploy/macos/com.clairehou.video-factory.discovery.plist` 是用户级 LaunchAgent。它登录后立即运行，并每 10 分钟调用一次 `discover`；命令不使用 `--force`，各渠道仍由持久化的 `next_run_at` 控制实际搜索频率。运行期间 `caffeinate` 防止录屏或渲染被系统睡眠打断。日志按天写入 `workspace/logs/discovery-YYYY-MM-DD.log`，并自动删除超过 14 天的 discovery 日志。
+`deploy/macos/com.clairehou.video-factory.discovery.plist` 是自动工厂 LaunchAgent：登录后立即运行，并每 10 分钟调用一次 `pipeline`；各渠道仍由持久化的 `next_run_at` 控制实际搜索频率。`deploy/macos/com.clairehou.video-factory.dashboard.plist` 常驻提供 `http://127.0.0.1:8765` 审核台。pipeline 会自动发现、生成、执行有界审稿/修复并创建待审核发布批次，但不会自行批准或公开投稿。
+
+首次定时运行会在 `workspace/automation/state.json` 开始 7 天本地监督期。每一轮（包括编排层崩溃）都会写入 `workspace/automation/runs/<run-id>.json`、同名 Markdown、`latest.json` 和 `latest.md`；历史问题追加到 `problems.jsonl`，Token 与费用追加到 `llm-costs.jsonl`。审计会区分未解决问题、已自动修复问题、实际/估算 LLM 成本、模型选择依据和待审核批次。单次候选内部最多按 `retry_backoff_seconds` 有界修复；整轮失败后至少冷却 `blocked_retry_delay_hours`，最多自动重跑 `max_blocked_retry_runs` 轮，随后转入 `needs_human_candidates`，避免 launchd 每 10 分钟重复烧 Token。第 7 天后报告会把下一阶段标记为 `remote_deployment_ready`，但人工发布闸门不会自动解除。
+
+已确认的产品 Bug 同时登记在 `regressions.json`。每个标记为 `fixed` 的条目必须绑定至少一个 `tests/test_*.py::TestClass::test_method`；`tests/test_regressions.py` 会检查引用的测试文件、测试类和测试方法确实存在。因此运行日志负责发现问题，回归清单负责确保同一问题不再出现；没有 test case 的条目不能标记为已修复。
 
 ```bash
 mkdir -p workspace/logs ~/Library/LaunchAgents
 chmod 700 deploy/macos/run-discovery.zsh
 cp deploy/macos/com.clairehou.video-factory.discovery.plist \
   ~/Library/LaunchAgents/
+chmod 700 deploy/macos/run-dashboard.zsh
+cp deploy/macos/com.clairehou.video-factory.dashboard.plist \
+  ~/Library/LaunchAgents/
 launchctl bootstrap "gui/$(id -u)" \
   ~/Library/LaunchAgents/com.clairehou.video-factory.discovery.plist
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.clairehou.video-factory.dashboard.plist
 
 # 状态、最近日志与手动立即触发
 launchctl print "gui/$(id -u)/com.clairehou.video-factory.discovery"
 tail -n 200 workspace/logs/discovery-"$(date '+%Y-%m-%d')".log
 launchctl kickstart -k "gui/$(id -u)/com.clairehou.video-factory.discovery"
+open http://127.0.0.1:8765
+video-factory --workspace workspace automation-status
+video-factory --workspace workspace automation-status --notify  # 重发通知
+
+# 收到通知后：在 Dashboard 完整预览，再逐条点击发布
+video-factory --workspace workspace dashboard --actor claire
 
 # 停用
 launchctl bootout "gui/$(id -u)/com.clairehou.video-factory.discovery"
+launchctl bootout "gui/$(id -u)/com.clairehou.video-factory.dashboard"
 ```
+
+本机 `--notify` 使用 macOS 通知中心；远程部署时设置 `VIDEO_FACTORY_AUDIT_WEBHOOK_URL`，系统会向该地址 POST 不含凭据的审核摘要（run id、待审核 batch id、问题数和人工操作提示）。通知只报告待办，绝不会替代 `publish-approve` 或触发上传。
 
 ## YouTube 中文精选合集
 
@@ -77,9 +116,9 @@ video-factory --workspace workspace generate \
 
 源视频有硬性 `1920×1080` 门禁：本地文件和下载文件都会用 `ffprobe` 验证，低于 1080p 就记录 `source_below_1080` 并停止，不做 AI 放大，也不渲染模糊的 PC 成片。需要重建旧样片时，不传 `--youtube-media` 即可重新获取高码率源；新清单会通过 `supersedes_collection_id` 与旧清单建立可审计的替代关系，旧文件不会被删除。
 
-一个源视频生成两套相互独立的学习版本。Bilibili 是完整学习合集：按原始论述顺序拆成 1–8 条通常为 10–35 分钟的横屏章节，章节不重叠，并覆盖至少 95% 的实质故事；只允许排除问候、赞助、空白和片尾。约 25 分钟的短源视频通常保留为一条完整 Bilibili 视频，两小时访谈则通常拆成 3–5 条章节。微信保持约 3–6 分钟的竖屏 mini lesson：源视频不超过 45 分钟时，3–8 条短课按顺序覆盖完整故事；超过 45 分钟时，只选择最强的 4–8 条短课，不为凑覆盖率制造弱内容。两个平台分别拥有连续的平台内顺序，但都保留相同源视频与证据关系。
+技术讲座只生成微信竖屏 mini lesson：每条约 3–6 分钟，按原始顺序覆盖至少 90% 的完整技术故事，长视频最多拆成 24 条，不会因为超过 45 分钟就静默丢掉后半段。知名科技人物对谈只生成一个约 1–3 分钟高光；片段必须有独立观点和回报，顶部整段常驻“人物身份 + 强观点”，人物画面居中，双语字幕保留原声。身份标签必须可由来源核实，不能凭空制造头衔。远程对谈会先仅获取 metadata 和 transcript，完成非政治片段选择与校验后，再用 `yt-dlp --download-sections` 只下载所选区间及两秒边界余量；渲染时间轴改为片段本地秒数，同时在字幕、范围和 hook 中保留原视频起止秒数。技术讲座仍下载完整源视频，本地媒体仍使用完整源时间轴。
 
-Bilibili 保持 1920×1080；微信保持 1080×1920，中间使用向上移动的 1080×720 源画面舞台。构图可以在镜头范围内切换：讲者画面使用居中放大；真正的全屏投影片完整适配；会议的“左侧讲者＋右侧投影片”合成画面使用 `split` 构图，完整适配原始合成画面，不再为了放大投影片而切掉左侧讲者，也不会用小窗遮挡投影片文字。投影片翻译是独立的 source-timed 图层：保留原始英文，在原文常见标题区的下方就近显示中文，不添加“画面文字”等内部标签，也不与下方口播字幕混在一起。两种版本都从同一条成片内部挑选一段可追溯到字幕 cue 的 6–10 秒强冷开场，再从正文中精确移除这一区间，避免重复且保持总时长不变。Bilibili 只在第一镜显示大标题钩子，随后回到干净横屏；微信前 7 秒显示醒目的中文钩子卡片，之后缩成上方的细标题条并贯穿整条视频。每条视频保存三份语义完整、不会截断英文术语的候选钩子及被选中的钩子；问候语、空泛问题和泛化点击诱饵会被质量门拒绝。
+微信保持 1080×1920，中间使用向上移动的源画面舞台。构图可以在镜头范围内切换：讲者画面使用居中放大；真正的全屏投影片完整适配；“左侧讲者＋右侧投影片”使用 `split` 构图，避免裁掉讲者或文字。每条视频保存三份可追溯到字幕 cue、语义完整且不截断英文术语的候选钩子；问候语、空泛问题、泛化点击诱饵和没有来源支持的夸张结论会被质量门拒绝。
 
 所有 YouTube 成片保留原始英文字幕，并在其下方叠加字号更大的自然中文翻译；同时输出独立 `.en.srt`、`.zh-Hans.srt` 和 `.bilingual.srt`。没有自然中文对应词的 AI/软件术语可以保留英文。完成字幕和复用依据审核后，再创建绑定全部文件、标题和顺序的合集发布批次：
 
@@ -92,7 +131,7 @@ video-factory --workspace workspace publish-collection-create \
   --spec examples/youtube_collection_publish.json
 ```
 
-Bilibili 自动合集要求发布后端提供 `upload-video --json`、`collection-ensure` 和 `collection-add`。旧后端会在上传前安全失败，不会在拿不到 BVID 时猜测或重复投稿；上传成功但关联失败的项目只允许通过 `publish-collection-retry-link` 重试合集关联。
+Bilibili 自动发布目前暂停。历史上传与合集关联实现仍保留用于审计和未来重新设计，但 pipeline、示例发布配置和 Dashboard 都不会调用它。
 
 ## 首期范围
 
@@ -158,6 +197,8 @@ video-factory --workspace workspace rerender workspace/jobs/<job-id>/manifest.js
 
 观众文案采用独立的低成本语义审稿模型，不用针对单条新闻维护术语替换或内容正则。Writer 完稿后，critic 必须逐字段抽取“人物—动作—对象—接收者”和确定性，并对照证据检查实体关系、因果强度、技术名词具体度、中文自然度与无旁白可读性；失败项以结构化 issue 返回给 writer 做一次字段级修复。确定性程序只校验 Schema、证据 ID、镜头顺序、时长和素材可渲染性。配置允许时 critic 与 writer 使用不同模型，避免模型自审直接放行。
 
+模型/产品视频的固定标题必须保留具体模型或产品名；排版层会通过缩小字号、增加行数和抬高标题栏适配长标题，不允许为“塞得下”而删除主语。面向 vibe coder 的短视频每条最多解释一个真正难懂、且会影响结论的专业指标：标题中的术语优先，否则从全片选理解门槛最高的一项。上下文窗口、吞吐量、API、Token 价格等开发者常用词不占解释位。
+
 外链官网中的团队合影、产品截图、架构图和 Benchmark 图会被下载并归档为一等 `web:source_image` 证据；与故事主体直接相关的高价值图片优先进入对应镜头，同一张图片在快报中不会被重复当作背景。每个清单还保存 `editorial_evidence_coverage`：列出已研究且进入成片的证据，以及因重复背景或时长预算被舍弃的证据，避免“导演知道、观众没看见”。派生文字卡不绘制无语义的黄色装饰线；黄色只用于真实来源中的重点框与相邻翻译。
 
 `trial`、`boundary` 等编辑语义与底层 Scene 素材类型在 Schema 中物理分离；非 GitHub 模型甚至不再返回 `kind` 和时长。确定性编译器根据引用证据和 `visual_family/retention_job` 生成完整原帖、引用帖、真实官网/图表/代码或 evidence-backed 节奏卡，并统一安排 Flash 的 1.3–2.8 秒节奏。文档页只能证明产品可用及其能力，除非原文明确写出 release/launch/announcement，否则不能被升级成“正式发布”。
@@ -175,11 +216,10 @@ video-factory generate-story examples/moneyprinterturbo_story_packet.json \
 
 GitHub 背景采集采用 README 内生规则：程序只打开 README 明确链接的 `vendor-notes`、background/reference 等仓库文档，再把其中标记为官方来源的链接交给有限研究工具。官方帮助中心若拒绝普通 HTTP 客户端，会通过只读文本代理抓取，但证据 URL 始终保留原始官网。X 帖子的研究范围更宽，可以围绕帖子中的人物或公司查证近期相关事件；这两类内容不会共用同一套发散策略。
 
-设置 `OPENROUTER_API_KEY` 后，`generate --provider auto` 会在每天第一条任务前同时读取 OpenRouter 的官方 Models API 和 [`discount=true` 模型页](https://openrouter.ai/models?discount=true)，并缓存当天快照。折扣页只提供折扣候选；最终选择使用 API 返回的实际输入/输出价格、上下文、输入/输出模态、结构化输出能力和 Artificial Analysis intelligence 下限。候选过质量门后才按一次典型内容任务的预估成本排序，并在请求中要求 OpenRouter 的 provider router 优先选择低价 endpoint。可用环境变量：
+设置 `OPENROUTER_API_KEY` 后，`generate --provider auto` 会在每天第一条任务前同时读取 OpenRouter 的官方 Models API 和 [`discount=true` 模型页](https://openrouter.ai/models?discount=true)，并缓存当天快照。折扣页只用于发现值得报道的价格事件，不再影响生产模型路由；故事、独立审稿、翻译和视觉任务分别通过输入模态、上下文、结构化输出和 Artificial Analysis intelligence 门槛后，始终按一次典型任务的有效成本选择最便宜的合格模型。更强模型只在便宜模型耗尽有界修复后升级。请求中的 OpenRouter provider router 仍优先选择低价 endpoint。可用环境变量：
 
 - `OPENROUTER_TEXT_MODELS`、`OPENROUTER_VISION_MODELS`：逗号分隔的人工准入名单；
-- `OPENROUTER_MIN_INTELLIGENCE`：未设置名单时的最低 intelligence index，默认 35；
-- `OPENROUTER_PREFER_DISCOUNTS=0`：不强制优先折扣池；
+- `OPENROUTER_MIN_INTELLIGENCE`：未设置名单时的最低 intelligence index；故事/审稿默认 55、视觉默认 45、翻译默认 30；
 - `OPENROUTER_DATA_COLLECTION=deny`、`OPENROUTER_ZDR=1`：供应商数据策略。
 
 资源发现还把 OpenRouter 当作独立的两小时渠道，但它不是“折扣播报”。程序先从折扣页取得候选，再读取每个模型的 endpoint API，以最近 30 分钟可用率不低于 99% 的实际供应商价格计算一次典型开发任务（18K 输入 + 4K 输出）。只有以下价格异常之一成立、且 `temptation_score >= 70` 才会进入视频：可靠线路比模型原厂谷时价至少便宜 50%；折扣至少 75%；或发布 21 天内的新模型折扣至少 50%。10%–20% 的日常促销只保存候选并标记 `promotion_not_compelling`，不会自动生成。

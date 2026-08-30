@@ -129,15 +129,126 @@ class WebScrollVideoAdapter:
         return runner
 
     def capture(self, request: WebCaptureRequest) -> Path:
-        cue_path = self.write_cue(request)
-        request.storyboard_dir.mkdir(parents=True, exist_ok=True)
-        runner_path = self._write_padded_runner(cue_path)
-        subprocess.run(self.build_command(cue_path, request.storyboard_dir, runner_path), check=True)
-        if not request.output.is_file():
-            raise RuntimeError(f"web-scroll-video did not create {request.output}")
-        highlight_boxes = self._validate_recorded_highlights(request)
-        self._write_capture_metadata(request, highlight_boxes)
-        return request.output
+        working = request
+        repairs: list[dict[str, str]] = []
+        highlight_boxes: dict[str, dict[str, int]] = {}
+        for attempt in range(4):
+            cue_path = self.write_cue(working)
+            working.storyboard_dir.mkdir(parents=True, exist_ok=True)
+            runner_path = self._write_padded_runner(cue_path)
+            try:
+                subprocess.run(
+                    self.build_command(cue_path, working.storyboard_dir, runner_path), check=True,
+                )
+            except subprocess.CalledProcessError:
+                missing = self._missing_text_from_error(cue_path)
+                if attempt >= 3 or not missing:
+                    raise
+                repaired = self._repair_missing_text_request(working, missing)
+                if repaired.cues == working.cues:
+                    raise
+                repairs.append({
+                    "kind": "missing_visible_text",
+                    "missing_target": missing,
+                    "repair": "scroll to source-page bottom and hold without a false highlight",
+                })
+                working = repaired
+                continue
+            if not working.output.is_file():
+                raise RuntimeError(f"web-scroll-video did not create {working.output}")
+            try:
+                highlight_boxes = self._validate_recorded_highlights(working)
+                break
+            except RuntimeError as error:
+                shot_id = self._unreadable_highlight_shot(str(error))
+                if attempt >= 3 or not shot_id:
+                    raise
+                repaired = self._repair_unreadable_highlight_request(working, shot_id)
+                if repaired.cues == working.cues:
+                    raise
+                repairs.append({
+                    "kind": "unreadable_highlight",
+                    "shot_id": shot_id,
+                    "repair": "keep the source-page position and hold without a tiny or missing highlight",
+                })
+                working = repaired
+        else:
+            raise RuntimeError("web-scroll-video exhausted deterministic capture repairs")
+        self._write_capture_metadata(working, highlight_boxes)
+        if repairs:
+            working.output.with_suffix(".capture-repairs.json").write_text(
+                json.dumps(repairs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+            )
+        return working.output
+
+    @staticmethod
+    def _missing_text_from_error(cue_path: Path) -> str:
+        path = cue_path.with_suffix(".error.json")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        message = str(payload.get("message") or "")
+        match = re.search(r'^Could not find text "(.+)"$', message, re.DOTALL)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _repair_missing_text_request(
+        request: WebCaptureRequest, missing: str,
+    ) -> WebCaptureRequest:
+        normalized_missing = WebScrollVideoAdapter._visible_anchor(missing)
+        cues: list[CaptureCue] = []
+        for cue in request.cues:
+            raw_target = str(cue.target or "").strip().strip('"')
+            target = WebScrollVideoAdapter._visible_anchor(raw_target)
+            if target != normalized_missing or cue.selector:
+                cues.append(cue)
+            elif cue.action == CueAction.SCROLL:
+                cues.append(CaptureCue(
+                    CueAction.SCROLL,
+                    cue.instruction + " (missing-text fallback)",
+                    target="bottom", wait_ms=cue.wait_ms, shot_id=cue.shot_id,
+                    translation=cue.translation,
+                ))
+            elif cue.action == CueAction.HIGHLIGHT:
+                cues.append(CaptureCue(
+                    CueAction.WAIT,
+                    cue.instruction + " (source-page hold; no false highlight)",
+                    wait_ms=cue.wait_ms, shot_id=cue.shot_id,
+                    translation=cue.translation,
+                ))
+            else:
+                cues.append(cue)
+        return WebCaptureRequest(
+            request.url, cues, request.output, request.storyboard_dir,
+            request.width, request.height, request.fps, request.cursor,
+        )
+
+    @staticmethod
+    def _unreadable_highlight_shot(message: str) -> str:
+        match = re.search(
+            r"visual gate: (?:highlight for|yellow highlight missing for) ([^: ]+)", message,
+        )
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _repair_unreadable_highlight_request(
+        request: WebCaptureRequest, shot_id: str,
+    ) -> WebCaptureRequest:
+        cues = [
+            CaptureCue(
+                CueAction.WAIT,
+                cue.instruction + " (source-page hold; unreadable highlight removed)",
+                wait_ms=cue.wait_ms, shot_id=cue.shot_id,
+                translation=cue.translation,
+            )
+            if cue.action == CueAction.HIGHLIGHT and cue.shot_id == shot_id else cue
+            for cue in request.cues
+        ]
+        return WebCaptureRequest(
+            request.url, cues, request.output, request.storyboard_dir,
+            request.width, request.height, request.fps, request.cursor,
+        )
 
     @staticmethod
     def _cue_duration(cue: CaptureCue) -> float:
@@ -312,17 +423,31 @@ class WebScrollVideoAdapter:
             addition = min(remaining, maximum - durations[key])
             durations[key] += addition
             remaining -= addition
+        description_target = WebScrollVideoAdapter._visible_anchor(
+            brief.repo_description_target,
+        )
+        description_visible = description_target.casefold() not in {
+            "", "no repository description", "no description", "none", "null",
+        }
+        if not description_visible:
+            # GitHub's API placeholder is evidence about missing metadata, not
+            # text rendered on the repository page. Preserve duration without
+            # asking the browser to find an element that cannot exist.
+            durations["overview"] += durations["description"]
         cues = [
             CaptureCue(CueAction.SCROLL, "return to repository top", target="top", wait_ms=200),
             CaptureCue(CueAction.WAIT, "hold the complete repository overview", wait_ms=round(durations["overview"] * 1000), shot_id="repo_overview"),
             CaptureCue(CueAction.HIGHLIGHT, "identify the repository", selector='strong[itemprop="name"] a', wait_ms=round(durations["repo_name"] * 1000), shot_id="repo_name"),
-            CaptureCue(
+        ]
+        if description_visible:
+            cues.append(CaptureCue(
                 CueAction.HIGHLIGHT, "state the repository purpose", target=brief.repo_description_target,
                 wait_ms=round(durations["description"] * 1000), shot_id="repo_description",
                 translation=WebScrollVideoAdapter._adjacent_translation(
                     brief.repo_description_target, brief.repo_description_translation,
                 ),
-            ),
+            ))
+        cues.extend([
             CaptureCue(
                 CueAction.HIGHLIGHT, "show a representative file in the real file tree", target=brief.file_tree_target,
                 wait_ms=round(durations["file_tree"] * 1000), shot_id="file_tree",
@@ -335,7 +460,7 @@ class WebScrollVideoAdapter:
                     brief.readme_claim_target, brief.readme_claim_translation,
                 ),
             ),
-        ]
+        ])
         current_url = repo_url
         for index, focus in enumerate(focuses, start=1):
             capture_target = focus.browser_target or focus.target
@@ -403,7 +528,13 @@ class WebScrollVideoAdapter:
     @staticmethod
     def _visible_anchor(anchor: str) -> str:
         """README evidence is Markdown; browser targets must be rendered text."""
-        return re.sub(r"^\s{0,3}#{1,6}\s*", "", anchor).strip()
+        rendered = re.sub(r"^\s{0,3}#{1,6}\s*", "", anchor).strip()
+        # Browser text lookup is element-scoped. A model may quote several
+        # adjacent rendered lines as one evidence string even though the DOM
+        # exposes them as separate elements; use the first concrete line as a
+        # stable, still evidence-bound anchor.
+        lines = [re.sub(r"\s+", " ", line).strip() for line in rendered.splitlines()]
+        return next((line for line in lines if len(line) >= 3), rendered)
 
     @staticmethod
     def _encode_cue(cue: CaptureCue) -> str:
@@ -413,6 +544,7 @@ class WebScrollVideoAdapter:
             raw = (cue.target or "").strip()
             if len(raw) >= 2 and raw[0] == raw[-1] == '"':
                 raw = raw[1:-1]
+            raw = WebScrollVideoAdapter._visible_anchor(raw)
             return "text " + json.dumps(raw, ensure_ascii=False)
 
         if cue.action == CueAction.WAIT:
@@ -428,6 +560,7 @@ class WebScrollVideoAdapter:
                 raw = (cue.target or "").strip()
                 if len(raw) >= 2 and raw[0] == raw[-1] == '"':
                     raw = raw[1:-1]
+                raw = WebScrollVideoAdapter._visible_anchor(raw)
                 target = json.dumps(raw, ensure_ascii=False)
             return f"scroll to {target} over {(cue.wait_ms or 1000) / 1000:g}"
         if cue.action == CueAction.HIGHLIGHT:

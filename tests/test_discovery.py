@@ -4,7 +4,7 @@ import unittest
 import json
 import re
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +16,7 @@ from video_factory.discovery import (
     select_parallel_candidates, XDiscoveryAdapter,
 )
 from video_factory.openrouter import DISCOUNTS_READER, ENDPOINTS_API, MODELS_API, parse_discounted_models
+from video_factory.quality import CheckResult
 from video_factory.storage import Workspace
 
 
@@ -183,8 +184,14 @@ class DiscoveryTest(unittest.TestCase):
             "<description>发布</description>"
             '<source url="https://www.36kr.com">36Kr</source></item></channel></rss>'
         ).encode()
-        english_adapter = RSSDiscoveryAdapter(DiscoveryChannel.NEWS, fetcher=lambda url: ("AI launch. " * 80, url))
-        chinese_adapter = RSSDiscoveryAdapter(DiscoveryChannel.NEWS_ZH, fetcher=lambda url: ("智谱发布新模型。" * 80, url))
+        english_adapter = RSSDiscoveryAdapter(
+            DiscoveryChannel.NEWS,
+            fetcher=lambda url: ("AI launch. " * 80, "https://www.reuters.com/ai-launch"),
+        )
+        chinese_adapter = RSSDiscoveryAdapter(
+            DiscoveryChannel.NEWS_ZH,
+            fetcher=lambda url: ("智谱发布新模型。" * 80, "https://www.36kr.com/p/ai-launch"),
+        )
         english_adapter._download = lambda url: english
         chinese_adapter._download = lambda url: chinese
 
@@ -263,6 +270,27 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(found[0].metadata["source_class"], "official")
         self.assertEqual(found[0].metadata["language"], "zh")
         self.assertEqual(found[0].url, "https://docs.bigmodel.cn/cn/guide/models/glm-5-3-flash")
+
+    def test_official_channel_rejects_unresolved_google_news_wrapper(self) -> None:
+        payload = (
+            "<rss><channel><item><title>Official model launch</title>"
+            "<link>https://news.google.com/rss/articles/wrapper</link>"
+            "<pubDate>Fri, 28 Aug 2026 05:58:00 GMT</pubDate>"
+            "<description>Official launch</description>"
+            '<source url="https://x.ai">X.ai</source>'
+            "</item></channel></rss>"
+        ).encode()
+        adapter = RSSDiscoveryAdapter(
+            DiscoveryChannel.OFFICIAL,
+            fetcher=lambda url: ("Google News wrapper", url),
+        )
+        adapter._download = lambda url: payload
+
+        found = adapter.search(ChannelConfig.from_dict(DiscoveryChannel.OFFICIAL, {
+            "queries": ["model launch"], "seed_domains": ["x.ai"], "probe_limit": 1,
+        }), NOW)
+
+        self.assertEqual(found, [])
 
     def test_small_chinese_llm_promotion_is_rejected(self) -> None:
         body = (
@@ -481,6 +509,105 @@ class DiscoveryTest(unittest.TestCase):
             self.assertEqual(len(adoption["attempts"]), 3)
             self.assertEqual(len(factory.generate_calls), 3)
 
+    def test_x_canonical_author_url_reuses_failed_manifest_without_llm_retry(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            job = workspace.root / "jobs" / "failed-x-capture"
+            job.mkdir(parents=True)
+            manifest = job / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            (job / "result.json").write_text(json.dumps({
+                "url": "https://x.com/Builder/status/2093612518396871075",
+                "status": "failed", "manifest": str(manifest),
+            }), encoding="utf-8")
+            item = x_candidate("x-2093612518396871075", "Acme launches an agent SDK")
+            item.url = "https://x.com/i/status/2093612518396871075"
+            factory = FakeFactory([RuntimeError("capture failed")])
+            factory.rerender = MagicMock(return_value={
+                "status": "completed", "publishable": True, "video": "final.mp4",
+                "manifest": str(manifest),
+            })
+            delays: list[int] = []
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=delays.append,
+            )
+
+            result = service._adopt(
+                item, ResourceDiscoveryConfig(retry_backoff_seconds=[0, 30]), "auto", None,
+            )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(len(factory.generate_calls), 1)
+            factory.rerender.assert_called_once_with(manifest)
+            self.assertEqual(delays, [])
+            self.assertEqual(result["attempts"][1]["mode"], "deterministic_rerender")
+
+    def test_needs_human_candidate_resumes_from_manifest_before_any_llm_call(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            job = workspace.root / "jobs" / "prior-x-attempt"
+            job.mkdir(parents=True)
+            manifest = job / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            (job / "result.json").write_text(json.dumps({
+                "url": "https://x.com/Builder/status/42", "status": "completed",
+                "manifest": str(manifest),
+            }), encoding="utf-8")
+            item = x_candidate("x-42", "Acme launches an agent SDK")
+            item.url = "https://x.com/i/status/42"
+            item.status = "needs_human"
+            factory = FakeFactory([])
+            factory.rerender = MagicMock(return_value={
+                "status": "completed", "publishable": True, "video": "final.mp4",
+                "manifest": str(manifest),
+            })
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+
+            result = service._adopt(
+                item, ResourceDiscoveryConfig(retry_backoff_seconds=[0]), "auto", None,
+            )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(factory.generate_calls, [])
+            factory.rerender.assert_called_once_with(manifest)
+            self.assertEqual(result["attempts"][0]["mode"], "deterministic_rerender")
+
+    def test_scheduled_blocked_candidate_uses_cost_cooldown_then_needs_human(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            item = x_candidate("x-cost", "Acme launches an agent SDK")
+            adapter = StaticAdapter([item])
+            factory = FakeFactory([RuntimeError("model failed")] * 6)
+            current = [NOW]
+            service = ResourceDiscoveryService(
+                workspace, adapters={DiscoveryChannel.X: adapter}, factory=factory,
+                clock=lambda: current[0], sleeper=lambda _: None,
+            )
+            config = ResourceDiscoveryConfig(
+                retry_backoff_seconds=[0, 0, 0], blocked_retry_delay_hours=6,
+                max_blocked_retry_runs=2,
+            )
+            for channel in DiscoveryChannel:
+                config.channels[channel].enabled = channel == DiscoveryChannel.X
+
+            first = service.run(config)
+            current[0] = NOW + timedelta(hours=3)
+            cooldown = service.run(config)
+            current[0] = NOW + timedelta(hours=7)
+            exhausted = service.run(config)
+
+            self.assertEqual(first.channels["x"].status, "blocked")
+            self.assertEqual(cooldown.channels["x"].status, "blocked_retry_wait")
+            self.assertEqual(exhausted.channels["x"].status, "needs_human")
+            self.assertEqual(len(factory.generate_calls), 6)
+            state = workspace.load_discovery_state()
+            self.assertNotIn("blocked_candidate", state["channels"]["x"])
+            self.assertEqual(state["needs_human_candidates"][-1]["candidate_id"], "x-cost")
+
     def test_adoption_retries_when_final_video_checks_fail(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
@@ -506,6 +633,89 @@ class DiscoveryTest(unittest.TestCase):
             self.assertEqual(adoption["status"], "blocked")
             self.assertEqual(len(adoption["attempts"]), 3)
 
+    def test_youtube_adoption_reuses_complete_assets_from_failed_job(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            old_job = workspace.root / "jobs" / "old-youtube-attempt"
+            old_job.mkdir(parents=True)
+            source_url = "https://www.youtube.com/watch?v=tech123"
+            (old_job / "result.json").write_text(json.dumps({
+                "url": source_url, "status": "failed",
+            }), encoding="utf-8")
+            media = old_job / "tech123.mkv"
+            subtitles = old_job / "tech123.en.json3"
+            translation_plan = old_job / "translation-plan.json"
+            media.write_bytes(b"video")
+            subtitles.write_text("{}", encoding="utf-8")
+            translation_plan.write_text("{}", encoding="utf-8")
+            item = DiscoveryCandidate(
+                id="youtube-tech123", channel=DiscoveryChannel.YOUTUBE,
+                url=source_url, title="Agent SDK architecture tutorial",
+                author="Builder", publisher="Builder", published_at=NOW.isoformat(),
+                summary="technical tutorial", body_text="technical tutorial",
+                stable_id="youtube:tech123", discovered_at=NOW.isoformat(), eligible=True,
+            )
+            factory = FakeFactory([{
+                "status": "completed", "publishable": True,
+                "collection_manifest": "collection.json",
+            }])
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+            config = ResourceDiscoveryConfig(retry_backoff_seconds=[0])
+
+            result = service._adopt(item, config, "deepseek", None)
+
+            self.assertEqual(result["status"], "generated")
+            options = factory.generate_calls[0][1]
+            self.assertEqual(options.youtube_media, str(media))
+            self.assertEqual(options.youtube_subtitles, str(subtitles))
+            self.assertEqual(options.youtube_translation_plan, str(translation_plan))
+
+    def test_youtube_audio_failure_is_repaired_and_revalidated_in_same_attempt(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            collection_path = workspace.root / "job-collection.json"
+            collection_path.write_text("{}", encoding="utf-8")
+            item = DiscoveryCandidate(
+                id="youtube-audio", channel=DiscoveryChannel.YOUTUBE,
+                url="https://www.youtube.com/watch?v=audio", title="Agent engineering talk",
+                eligible=True, discovered_at=NOW.isoformat(),
+            )
+            factory = FakeFactory([{
+                "status": "completed", "publishable": False,
+                "collection_manifest": str(collection_path),
+                "checks": [{
+                    "name": "render:item:wechat_vertical:audible_audio",
+                    "passed": False, "detail": "silent",
+                }],
+            }])
+            collection = MagicMock()
+            collection.id = "collection-audio"
+            collection.to_dict.return_value = {"id": "collection-audio"}
+            renderer = MagicMock()
+            renderer.repair_silent_audio.return_value = ["renders/fixed.mp4"]
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+            with patch("video_factory.discovery.load_collection_manifest", return_value=collection), patch(
+                "video_factory.discovery.YouTubeCollectionRenderer", return_value=renderer,
+            ), patch(
+                "video_factory.discovery.validate_collection",
+                return_value=[CheckResult("audio", True, "audible")],
+            ):
+                result = service._adopt(
+                    item, ResourceDiscoveryConfig(retry_backoff_seconds=[0]), "deepseek", None,
+                )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(len(result["attempts"]), 1)
+            repair = result["attempts"][0]["result"]["automatic_repairs"][0]
+            self.assertEqual(repair["kind"], "silent_or_truncated_audio")
+            renderer.repair_silent_audio.assert_called_once_with(collection)
+
     def test_three_failures_block_channel_until_skip(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
@@ -526,6 +736,31 @@ class DiscoveryTest(unittest.TestCase):
             self.assertEqual(result.channels["x"].status, "blocked")
             self.assertEqual(skipped["status"], "skipped")
             self.assertNotIn("blocked_candidate", state["channels"]["x"])
+
+    def test_forced_blocked_retry_skips_a_redundant_channel_search(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            item = x_candidate("x-1", "Acme launches an agent SDK")
+            adapter = StaticAdapter([item])
+            factory = FakeFactory([
+                RuntimeError("fail one"), RuntimeError("fail two"), RuntimeError("fail three"),
+                {"status": "completed", "publishable": True, "video": "final.mp4"},
+            ])
+            service = ResourceDiscoveryService(
+                workspace, adapters={DiscoveryChannel.X: adapter}, factory=factory,
+                clock=lambda: NOW, sleeper=lambda _: None,
+            )
+            config = ResourceDiscoveryConfig(retry_backoff_seconds=[0, 0, 0])
+            for channel in DiscoveryChannel:
+                config.channels[channel].enabled = channel == DiscoveryChannel.X
+
+            first = service.run(config, scheduled=False)
+            second = service.run(config, scheduled=False)
+
+            self.assertEqual(first.channels["x"].status, "blocked")
+            self.assertEqual(second.channels["x"].status, "generated")
+            self.assertEqual(adapter.calls, 1)
+            self.assertEqual(len(factory.generate_calls), 4)
 
 
 if __name__ == "__main__":

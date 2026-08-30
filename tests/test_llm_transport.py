@@ -291,6 +291,25 @@ class LLMTransportTests(unittest.TestCase):
         self.assertEqual(draft, {"ok": True})
         self.assertEqual(opened.call_count, 2)
 
+    def test_transport_stops_after_two_bounded_attempts(self) -> None:
+        writer = OpenAICompatibleStoryWriter(LLMSettings(
+            "openrouter", "https://openrouter.example/api/v1", "test-key", "cheap-model",
+            timeout_seconds=17,
+        ))
+        invalid = _Response({
+            "choices": [{"message": {"content": "provider overloaded"}, "finish_reason": "error"}],
+        })
+        with (
+            patch("video_factory.llm.urlopen", side_effect=[invalid, invalid, AssertionError("third attempt")]) as opened,
+            patch("video_factory.llm.time.sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "after 2 attempts"),
+        ):
+            writer._request_json([{"role": "user", "content": "return json"}], 100)
+
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual([call.kwargs["timeout"] for call in opened.call_args_list], [17, 17])
+        sleep.assert_called_once_with(0.6)
+
     def test_final_unknown_shot_uses_bounded_editorial_copy_repair(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(
             "deepseek", "https://example.invalid", "test-key", "test-model",

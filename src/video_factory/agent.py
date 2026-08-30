@@ -596,10 +596,62 @@ class BoundedContentAgent:
                                 "provenance": last_provenance,
                             })
                             if last_issues:
-                                raise ValueError(
-                                    "semantic copy critic still rejects third repaired draft: "
+                                previous_signature = {
+                                    (str(item.get("field_path") or ""), str(item.get("category") or ""))
+                                    for item in final_issues if isinstance(item, dict)
+                                }
+                                current_signature = {
+                                    (str(item.get("field_path") or ""), str(item.get("category") or ""))
+                                    for item in last_issues if isinstance(item, dict)
+                                }
+                                converging = bool(current_signature) and current_signature != previous_signature
+                                if not converging or calls > self.budget.max_llm_calls - 2:
+                                    raise ValueError(
+                                        "semantic copy critic still rejects third repaired draft: "
+                                        + json.dumps(last_issues, ensure_ascii=False)
+                                    )
+                                # A changed issue signature means the previous
+                                # repair worked and exposed the next bounded
+                                # defect. Spend one final repair+verify pair;
+                                # do not continue when the critic repeats the
+                                # same field/category, which would be a loop.
+                                calls += 1
+                                convergence_error = (
+                                    "semantic copy critic issues after third repair; the prior issue changed, "
+                                    "so apply exactly one final targeted repair: "
                                     + json.dumps(last_issues, ensure_ascii=False)
                                 )
+                                request, convergence_provenance, convergence_repaired = self.primary.repair(
+                                    writing_packet, raw_draft, convergence_error,
+                                )
+                                preflight = _request_preflight_errors(request)
+                                if preflight:
+                                    raise ValueError("; ".join(preflight))
+                                manifest = self.director.direct(request)
+                                blocking = _blocking_quality_errors(manifest)
+                                if blocking:
+                                    raise ValueError("; ".join(blocking))
+                                raw_draft = convergence_repaired
+                                trace.append({
+                                    "step": "copy_review_convergence_repair", "status": "ok",
+                                    "provenance": convergence_provenance,
+                                    "reason": "critic issue signature changed after the prior repair",
+                                })
+                                calls += 1
+                                convergence_issues, convergence_verify_provenance = review_method(
+                                    writing_packet, raw_draft,
+                                )
+                                trace.append({
+                                    "step": "copy_review_convergence_verify",
+                                    "status": "approved" if not convergence_issues else "failed",
+                                    "issues": convergence_issues,
+                                    "provenance": convergence_verify_provenance,
+                                })
+                                if convergence_issues:
+                                    raise ValueError(
+                                        "semantic copy critic still rejects convergence repair: "
+                                        + json.dumps(convergence_issues, ensure_ascii=False)
+                                    )
             except (StoryDraftError, ValueError, RuntimeError) as error:
                 manifest = None
                 failure = f"copy review failed: {error}"
