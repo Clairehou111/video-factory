@@ -409,5 +409,16 @@
     "tests": [
       "tests/test_factory.py::VideoFactoryTest::test_generation_cache_isolated_by_render_profile"
     ]
+  },
+  {
+    "id": "VF-20260830-036",
+    "title": "Mechanical Radar contract errors consumed repeated LLM repair calls",
+    "stage": "content_agent",
+    "reproduction": "Return an otherwise grounded Radar brief with an unsupported label, over-budget visible copy, an invalid narrative beat, or a selected hook outside the candidate list.",
+    "impact": "The agent repeatedly called writer and fallback models for deterministic formatting defects, increasing latency and cost while still failing to produce a manifest.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_canonicalizer_repairs_mechanical_contract_errors_without_llm"
+    ]
   }
 ]

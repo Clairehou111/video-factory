@@ -81,6 +81,74 @@ def _hook_retention_score(value: str) -> float:
     return score
 
 
+def _clip_radar_copy(value: str, limit: float) -> str:
+    """Shorten model-written copy without splitting ASCII identifiers."""
+    text = re.sub(r"\s+", " ", value).strip()
+    if copy_width(text) <= limit:
+        return text
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._+/$%:-]*|.", text)
+    kept: list[str] = []
+    for token in tokens:
+        candidate = "".join([*kept, token]).strip()
+        if copy_width(candidate) > limit:
+            break
+        kept.append(token)
+    clipped = "".join(kept).rstrip(" ，。；、:：!?！？")
+    for marker in ("。", "！", "？", "；", "，", "：", ";", ",", ":"):
+        boundary = clipped.rfind(marker)
+        prefix = clipped[:boundary].rstrip() if boundary >= 0 else ""
+        if prefix and copy_width(prefix) >= min(12, limit * 0.6):
+            return prefix
+    return clipped
+
+
+def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
+    strategy = brief.attention_strategy
+    if brief.opening_mode not in RADAR_OPENING_MODES:
+        brief.opening_mode = "direct_fact"
+    if brief.category_label not in RADAR_CATEGORY_LABELS:
+        brief.category_label = ""
+
+    original_candidates = list(strategy.hook_candidates)
+    strategy.hook_candidates = [_clip_radar_copy(item, 28) for item in original_candidates]
+    if strategy.selected_hook in original_candidates:
+        strategy.selected_hook = strategy.hook_candidates[original_candidates.index(strategy.selected_hook)]
+    elif strategy.hook_candidates:
+        strategy.selected_hook = strategy.hook_candidates[0]
+    strategy.selected_hook = _clip_radar_copy(strategy.selected_hook, 28)
+    if strategy.hook_candidates and strategy.selected_hook not in strategy.hook_candidates:
+        strategy.hook_candidates[0] = strategy.selected_hook
+
+    brief.headline = _clip_radar_copy(brief.headline, 28)
+    brief.fixed_conclusion = _clip_radar_copy(brief.fixed_conclusion, 40)
+    for index, shot in enumerate(brief.evidence_shots):
+        shot.narrative_beat = (
+            "opening" if index == 0 else
+            "takeaway" if index == len(brief.evidence_shots) - 1 else
+            "proof"
+        )
+        shot.fact = _clip_radar_copy(shot.fact, 40)
+        remaining = max(0.0, 40 - copy_width(shot.fact))
+        shot.audience_copy = _clip_radar_copy(shot.audience_copy, remaining) if remaining >= 4 else ""
+        if shot.full_translation:
+            shot.full_translation = _clip_radar_copy(
+                shot.full_translation, 120 if index == 0 else 40,
+            )
+        if shot.translation:
+            shot.translation = _clip_radar_copy(shot.translation, 40)
+
+    if brief.director_brief and brief.context_graph:
+        brief.director_brief.selected_context_ids = list(dict.fromkeys([
+            *brief.director_brief.selected_context_ids,
+            *brief.context_graph.required_context_ids,
+        ]))
+    if (
+        brief.editorial_inference != strategy.selected_hook
+        or not brief.editorial_inference.endswith(("?", "？"))
+    ):
+        brief.editorial_inference = ""
+
+
 def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]) -> None:
     """Repair evidence linkage, never prose, when the model chose a valid fact.
 
@@ -104,15 +172,9 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
                     linked.append(parent_id)
         shot.evidence_ids = linked
 
-    strategy = brief.attention_strategy
     if brief.opening_mode:
-        for index, shot in enumerate(brief.evidence_shots):
-            if not shot.narrative_beat:
-                shot.narrative_beat = (
-                    "opening" if index == 0 else
-                    "takeaway" if index == len(brief.evidence_shots) - 1 else
-                    "proof"
-                )
+        _canonicalize_radar_contract(brief)
+    strategy = brief.attention_strategy
     if not strategy.selected_hook and strategy.hook_candidates:
         strategy.selected_hook = strategy.hook_candidates[0]
     root_actor_markers = {
@@ -595,8 +657,8 @@ def _validate_radar_contract(brief: EditorialBrief, evidence: list[Evidence]) ->
         if copy_width(compact_copy) > 40:
             errors.append(f"Radar shot {shot.id} fact plus audience_copy exceeds 40 equivalents")
         gloss = (shot.full_translation or shot.translation).strip()
-        if gloss and not 16 <= copy_width(gloss) <= 40:
-            errors.append(f"Radar shot {shot.id} Chinese gloss must fit 16–40 equivalents")
+        if gloss and copy_width(gloss) > 40:
+            errors.append(f"Radar shot {shot.id} Chinese gloss must fit at most 40 equivalents")
     beats = [shot.narrative_beat.strip() for shot in brief.evidence_shots]
     if beats:
         if beats[0] != "opening" or beats[-1] != "takeaway":

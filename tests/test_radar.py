@@ -16,6 +16,7 @@ from video_factory.compositor import (
     render_spotlight_overlay,
 )
 from video_factory.editorial import _validate_radar_contract, canonicalize_editorial_brief
+from video_factory.github_editor import copy_width
 from video_factory.models import (
     AttentionStrategy, Candidate, ContentType, EditorialBrief, Evidence, EvidenceShot,
     EvidenceShotKind, InformationRenderProfile, MaterialRole, RenderManifest, Scene,
@@ -99,6 +100,34 @@ class RadarV2Test(unittest.TestCase):
             ["opening", "proof", "takeaway"],
         )
         self.assertEqual(_validate_radar_contract(brief, evidence), [])
+
+    def test_radar_canonicalizer_repairs_mechanical_contract_errors_without_llm(self) -> None:
+        brief = _brief(category_label="开源神器", editorial_inference="not a question")
+        brief.attention_strategy.hook_candidates = [
+            "GLM-5.3-Flash 发布了一个非常非常长而且不适合手机首屏阅读的模型更新说明",
+            "GLM-5.3-Flash 的第二个同样非常长的候选标题需要被机械压缩",
+            "GLM-5.3-Flash 的第三个候选标题也不能突破手机画面预算",
+        ]
+        brief.attention_strategy.selected_hook = "不在候选列表里的标题"
+        brief.fixed_conclusion = "开发者现在可以下载模型权重并在本地进行红蓝对抗和安全测试验证完整工作流"
+        brief.evidence_shots[0].narrative_beat = "shock"
+        brief.evidence_shots[0].fact = "GLM-5.3-Flash 发布了非常长的事实描述并且继续堆叠不必要的解释"
+        brief.evidence_shots[0].audience_copy = "这段附加说明也远远超过单屏预算"
+        brief.evidence_shots[0].full_translation = "模型发布说明" * 20
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+        self.assertEqual(brief.category_label, "")
+        self.assertIn(brief.attention_strategy.selected_hook, brief.attention_strategy.hook_candidates)
+        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 28)
+        self.assertLessEqual(copy_width(brief.fixed_conclusion), 40)
+        self.assertLessEqual(
+            copy_width(brief.evidence_shots[0].fact + brief.evidence_shots[0].audience_copy), 40,
+        )
+        self.assertLessEqual(copy_width(brief.evidence_shots[0].full_translation), 120)
+        self.assertEqual(
+            [shot.narrative_beat for shot in brief.evidence_shots],
+            ["opening", "proof", "takeaway"],
+        )
+        self.assertEqual(brief.editorial_inference, "")
 
     def test_radar_rejects_marketing_category_and_unsupported_identifier(self) -> None:
         brief = _brief(category_label="开源神器", direct_identifier="pip install invented")
