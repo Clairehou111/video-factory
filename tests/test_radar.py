@@ -22,8 +22,8 @@ from video_factory.models import (
     SourceType, StorySubject, TopicType,
 )
 from video_factory.radar import (
-    AdvisoryRecoveryAction, build_tencent_radar_copy, extract_direct_identifier,
-    plan_advisory_recovery,
+    AdvisoryRecoveryAction, TechnicalArtifactKind, build_tencent_radar_copy,
+    extract_direct_identifier, extract_technical_artifact, plan_advisory_recovery,
 )
 from video_factory.quality import validate_manifest
 from video_factory.tracks import TrackSegment, build_dip_to_color_track
@@ -219,6 +219,26 @@ class RadarV2Test(unittest.TestCase):
             "thumbnail", "web:source_image",
         ))
         self.assertEqual(extract_direct_identifier(manifest), "HF: OrcaRouter/GLM-5.3-Flash")
+        artifact = extract_technical_artifact(manifest)
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(artifact.kind, TechnicalArtifactKind.HUGGING_FACE_MODEL)
+        self.assertEqual(artifact.value, "OrcaRouter/GLM-5.3-Flash")
+        self.assertEqual(artifact.source, manifest.evidence[1].url)
+
+    def test_technical_artifact_preserves_type_and_provenance(self) -> None:
+        manifest = _manifest(InformationRenderProfile.RADAR_V2.value)
+        manifest.editorial_brief.direct_identifier = ""
+        manifest.source_urls = ["https://x.com/example/status/1"]
+        manifest.evidence[0].url = manifest.source_urls[0]
+        manifest.evidence[0].quote = "Install it with pip install radar-kit today."
+        artifact = extract_technical_artifact(manifest)
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(artifact.kind, TechnicalArtifactKind.PYTHON_PACKAGE)
+        self.assertEqual(artifact.value, "radar-kit")
+        self.assertEqual(artifact.source, "archived_evidence_text")
+        self.assertEqual(extract_direct_identifier(manifest), "pip install radar-kit")
 
     def test_writer_prompt_exposes_four_opening_modes_and_optional_factual_label(self) -> None:
         candidate = Candidate("c-1", SourceType.TWEET, "https://x.com/a/status/1", "GLM")

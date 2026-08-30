@@ -386,5 +386,17 @@
       "tests/test_radar.py::RadarV2Test::test_advisory_recovery_never_enables_paid_key_implicitly",
       "tests/test_radar.py::RadarV2Test::test_advisory_recovery_uses_clean_session_then_stops_boundedly"
     ]
+  },
+  {
+    "id": "VF-20260830-034",
+    "title": "Developer artifact extraction discarded type and provenance",
+    "stage": "content_agent",
+    "reproduction": "Extract a package, model, container, or repository identifier for the Radar metadata rail and receive only a presentation string.",
+    "impact": "Adding new ecosystems required more display-oriented regex patches, while downstream validation could not distinguish artifact kind or trace the source used for the badge.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_technical_artifact_preserves_type_and_provenance",
+      "tests/test_radar.py::RadarV2Test::test_identifier_skips_huggingface_social_thumbnail_paths"
+    ]
   }
 ]

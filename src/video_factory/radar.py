@@ -31,6 +31,23 @@ class AdvisoryRecoveryDecision:
     reason: str = ""
 
 
+class TechnicalArtifactKind(StrEnum):
+    HUGGING_FACE_MODEL = "hugging_face_model"
+    PYTHON_PACKAGE = "python_package"
+    CONTAINER_IMAGE = "container_image"
+    GITHUB_REPOSITORY = "github_repository"
+    MODEL_ID = "model_id"
+    EXPLICIT = "explicit"
+
+
+@dataclass(frozen=True)
+class TechnicalArtifact:
+    kind: TechnicalArtifactKind
+    value: str
+    display: str
+    source: str
+
+
 def plan_advisory_recovery(
     error: str, *, attachment_count: int, media_kind: str, attempt: int,
 ) -> AdvisoryRecoveryDecision:
@@ -95,10 +112,30 @@ def plan_advisory_recovery(
     )
 
 
-def extract_direct_identifier(manifest: RenderManifest) -> str:
-    """Return only an identifier copied from archived source material."""
+def _explicit_artifact(value: str) -> TechnicalArtifact:
+    normalized = value.strip()
+    for prefix, kind in (
+        ("HF: ", TechnicalArtifactKind.HUGGING_FACE_MODEL),
+        ("pip install ", TechnicalArtifactKind.PYTHON_PACKAGE),
+        ("docker pull ", TechnicalArtifactKind.CONTAINER_IMAGE),
+        ("github.com/", TechnicalArtifactKind.GITHUB_REPOSITORY),
+        ("Model: ", TechnicalArtifactKind.MODEL_ID),
+    ):
+        if normalized.casefold().startswith(prefix.casefold()):
+            return TechnicalArtifact(
+                kind, normalized[len(prefix):].strip(), normalized,
+                "editorial_brief.direct_identifier",
+            )
+    return TechnicalArtifact(
+        TechnicalArtifactKind.EXPLICIT, normalized, normalized,
+        "editorial_brief.direct_identifier",
+    )
+
+
+def extract_technical_artifact(manifest: RenderManifest) -> TechnicalArtifact | None:
+    """Extract one typed, source-backed developer artifact from archived material."""
     if manifest.editorial_brief and manifest.editorial_brief.direct_identifier.strip():
-        return manifest.editorial_brief.direct_identifier.strip()
+        return _explicit_artifact(manifest.editorial_brief.direct_identifier)
     urls = [
         *manifest.source_urls,
         *(item.url for item in manifest.evidence),
@@ -125,7 +162,10 @@ def extract_direct_identifier(manifest: RenderManifest) -> str:
             continue
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) >= 2 and parts[0].casefold() not in reserved_hf_roots:
-            return "HF: " + "/".join(parts[:2])
+            value = "/".join(parts[:2])
+            return TechnicalArtifact(
+                TechnicalArtifactKind.HUGGING_FACE_MODEL, value, "HF: " + value, url,
+            )
     texts = [
         *(item.quote for item in manifest.evidence),
         *(scene.source_excerpt or "" for scene in manifest.scenes),
@@ -138,16 +178,35 @@ def extract_direct_identifier(manifest: RenderManifest) -> str:
     ):
         match = re.search(pattern, joined, re.IGNORECASE)
         if match:
-            return prefix + match.group(1)
+            value = match.group(1)
+            kind = (
+                TechnicalArtifactKind.PYTHON_PACKAGE
+                if prefix.startswith("pip") else TechnicalArtifactKind.CONTAINER_IMAGE
+            )
+            return TechnicalArtifact(kind, value, prefix + value, "archived_evidence_text")
     for url in urls:
         match = re.search(r"github\.com/([^/?#]+/[^/?#]+)", url, re.IGNORECASE)
         if match:
-            return "github.com/" + match.group(1).removesuffix(".git")
+            value = match.group(1).removesuffix(".git")
+            return TechnicalArtifact(
+                TechnicalArtifactKind.GITHUB_REPOSITORY, value,
+                "github.com/" + value, url,
+            )
     for item in manifest.evidence:
         price_event = item.metadata.get("price_event")
         if isinstance(price_event, dict) and str(price_event.get("model_id") or "").strip():
-            return "Model: " + str(price_event["model_id"]).strip()
-    return ""
+            value = str(price_event["model_id"]).strip()
+            return TechnicalArtifact(
+                TechnicalArtifactKind.MODEL_ID, value, "Model: " + value,
+                f"evidence:{item.id}:price_event.model_id",
+            )
+    return None
+
+
+def extract_direct_identifier(manifest: RenderManifest) -> str:
+    """Return the presentation form of a typed, source-backed artifact."""
+    artifact = extract_technical_artifact(manifest)
+    return artifact.display if artifact else ""
 
 
 def factual_category_label(manifest: RenderManifest) -> str:
