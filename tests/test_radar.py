@@ -233,6 +233,40 @@ class RadarV2Test(unittest.TestCase):
                 canonicalize_editorial_brief(cached, [_manifest().evidence[0]])
                 self.assertEqual(cached.evidence_shots[0].audience_copy, "")
 
+    def test_radar_hook_falls_back_to_complete_model_written_headline(self) -> None:
+        brief = _brief()
+        brief.headline = "照Tibo配置接GPT-5.6 Sol后自称被封"
+        brief.attention_strategy.hook_candidates = [
+            "用户照Tibo的配置把Claude Code接到GPT-5.6 Sol后账号被停用",
+            "Sam Altman发帖夸OpenAI团队",
+            "用户公开完整实现：用CLIProxyAPI让Claude Code接入其他模型",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(
+            brief.attention_strategy.selected_hook,
+            "照Tibo配置接GPT-5.6 Sol后自称被封",
+        )
+        self.assertFalse(brief.attention_strategy.selected_hook.endswith(("到", "让", "用")))
+
+    def test_radar_explains_harness_once_in_first_relevant_shot(self) -> None:
+        brief = _brief()
+        brief.attention_strategy.hook_candidates = [
+            "把 Anthropic harness 接其他模型后被封号",
+            "Tibo 质疑这次封号",
+            "Boris 在争议串下回复招聘",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(
+            brief.evidence_shots[0].audience_copy,
+            "harness：模型的测试与运行框架。",
+        )
+
     def test_radar_model_hook_accepts_evidence_preserving_artifact_base_name(self) -> None:
         brief = _brief()
         brief.subjects = [
@@ -332,6 +366,10 @@ class RadarV2Test(unittest.TestCase):
         errors = _validate_radar_contract(brief, [_manifest().evidence[0]])
         self.assertTrue(any("category_label" in error for error in errors))
         self.assertTrue(any("direct_identifier" in error for error in errors))
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+        self.assertEqual(brief.category_label, "")
+        self.assertEqual(brief.direct_identifier, "")
 
     def test_spotlight_uses_adaptive_40_and_55_percent_dimming(self) -> None:
         with TemporaryDirectory() as temp:

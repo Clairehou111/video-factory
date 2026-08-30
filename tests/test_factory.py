@@ -11,8 +11,10 @@ from unittest.mock import MagicMock, patch
 from video_factory.agent import ContentAgentError
 from video_factory.factory import GenerateOptions, VideoFactory
 from video_factory.models import (
-    ColdOpenBeat, ContentType, Evidence, MaterialRole, RenderManifest, Scene,
+    AttentionStrategy, ColdOpenBeat, ContentType, EditorialBrief, Evidence, EvidenceShot,
+    EvidenceShotKind, MaterialRole, RenderManifest, Scene,
 )
+from video_factory.serde import load_manifest
 from video_factory.storage import Workspace
 
 
@@ -154,6 +156,8 @@ class VideoFactoryTest(unittest.TestCase):
         self.assertIn("同一句或同一屏", direction)
         self.assertIn("是否由此触发尚无定论", direction)
         self.assertIn("禁止用‘导致、触发、秒封、随即被封、照做就被封’", direction)
+        self.assertIn("不能取代故事本身", direction)
+        self.assertIn("不得把‘截图只能证明/不能读成因果’写成整条视频的 Hook 或结论", direction)
 
     def test_no_causal_uncertainty_rule_without_explicit_source_boundary(self) -> None:
         evidence = [Evidence(
@@ -161,6 +165,92 @@ class VideoFactoryTest(unittest.TestCase):
             "The vendor confirmed that the policy caused the suspension.", "x:thread_post",
         )]
         self.assertEqual(VideoFactory._causal_uncertainty_direction(evidence), "")
+
+    def test_openrouter_discount_index_skips_routine_fifteen_percent_promotion(self) -> None:
+        evidence = [Evidence(
+            "discount-page", "openrouter", "https://openrouter.ai/models?discount=true",
+            "[Wan 3.0](https://openrouter.ai/alibaba/wan-3) 15% off",
+            "web:primary_page",
+        )]
+
+        gate = VideoFactory._openrouter_discount_story_gate(
+            "https://openrouter.ai/models?discount=true", evidence, None,
+        )
+
+        self.assertIsNotNone(gate)
+        self.assertFalse(gate["eligible"])
+        self.assertEqual(gate["threshold_percent"], 75.0)
+        self.assertEqual(gate["effective_discount_percent"], 15.0)
+
+    def test_openrouter_discount_index_accepts_exceptional_effective_savings(self) -> None:
+        evidence = [Evidence(
+            "discount-page", "openrouter", "https://openrouter.ai/models?discount=true",
+            "OpenRouter discounted models", "web:primary_page",
+        )]
+        metadata = {
+            "discount_percent": 0,
+            "official_comparison": {"savings_offpeak_percent": 85.8},
+        }
+
+        gate = VideoFactory._openrouter_discount_story_gate(
+            "https://openrouter.ai/models?discount=true", evidence, metadata,
+        )
+
+        self.assertTrue(gate["eligible"])
+        self.assertEqual(gate["effective_discount_percent"], 85.8)
+
+    def test_ui_rerender_recompiles_scenes_without_rewriting_editorial_story(self) -> None:
+        manifest = basic_manifest()
+        manifest.editorial_brief = MagicMock()
+        original_hook = manifest.fixed_hook
+        original_footer = manifest.fixed_footer
+
+        with (
+            patch("video_factory.factory.canonicalize_editorial_brief") as canonicalize,
+            patch("video_factory.factory.compile_evidence_shots", return_value=[]),
+        ):
+            VideoFactory._recompile_editorial_manifest(
+                manifest, MagicMock(), normalize_story=False,
+            )
+
+        canonicalize.assert_not_called()
+        self.assertEqual(manifest.fixed_hook, original_hook)
+        self.assertEqual(manifest.fixed_footer, original_footer)
+
+    def test_ui_rerender_load_freezes_approved_editorial_copy(self) -> None:
+        manifest = basic_manifest()
+        manifest.editorial_brief = EditorialBrief(
+            "标题", "副标题", "结论",
+            AttentionStrategy(
+                "事实", "冲突", "意外", "影响", "判断", "回报",
+                ["候选一", "候选二", "候选三"], [manifest.evidence[0].id], "候选一",
+            ),
+            [], [], [EvidenceShot(
+                "shot-1", EvidenceShotKind.BROWSER_SECTION, "发生了什么？", "原事实", "解释",
+                [manifest.evidence[0].id], ["proof"],
+            )], 10.0,
+        )
+        manifest.editorial_brief.evidence_shots[0].fact = (
+            "alex getman：照 Tibo 配置后账号被停用，是否由此触发未定，已申诉"
+        )
+        manifest.fixed_hook = "已审核 Hook"
+        manifest.fixed_title = "已审核标题"
+        manifest.fixed_footer = "已审核结论"
+
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "manifest.json"
+            path.write_text(
+                json.dumps(manifest.to_dict(), ensure_ascii=False), encoding="utf-8",
+            )
+            loaded = load_manifest(path, normalize_story=False)
+
+        self.assertEqual(
+            loaded.editorial_brief.evidence_shots[0].fact,
+            "alex getman：照 Tibo 配置后账号被停用，是否由此触发未定，已申诉",
+        )
+        self.assertEqual(loaded.fixed_hook, "已审核 Hook")
+        self.assertEqual(loaded.fixed_title, "已审核标题")
+        self.assertEqual(loaded.fixed_footer, "已审核结论")
 
     def test_employee_reply_cannot_be_promoted_to_official_company_response(self) -> None:
         evidence = [Evidence(

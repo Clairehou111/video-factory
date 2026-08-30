@@ -259,6 +259,41 @@ class ContextResearchTests(unittest.TestCase):
             self.assertNotIn("people", plan.expansion_dimensions)
             self.assertEqual(plan.search_queries, ["Tibo OpenAI Anthropic"])
 
+    def test_recruiting_reply_inside_a_quoted_dispute_is_an_event_chain_not_people_move(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp) / "workspace")
+            workspace.initialize()
+            packet = self._packet(workspace)
+            packet.candidate.title = "lol another one of the things i like most about openai is tibo"
+            packet.evidence[0].quote = packet.candidate.title
+            packet.evidence[1].quote = (
+                "A user appealed an account suspension. Tibo replied that the ban seemed odd. "
+                "Boris replied: We are hiring if you would like to work at Anthropic."
+            )
+            draft = {
+                "angle": "Sam 点名 Tibo，引用一串封号申诉与招聘回复",
+                "audience_value": "看懂多方公开互动",
+                "selected_evidence_ids": ["root", "quoted"],
+                "requested_urls": [], "unresolved_questions": ["封号原因未知"],
+                "ready_to_write": True, "why_now": "刚刚发生",
+                "why_audience": "开发者关心账号风险与公司互动",
+                "audience_pain_or_desire": "risk",
+                "selection_reasons": [{
+                    "id": "interaction", "dimension": "competition",
+                    "rationale": "多方公开回复形成完整事件链",
+                    "evidence_ids": ["root", "quoted"],
+                }],
+                "expansion_dimensions": ["people", "cause", "later_update"],
+                "context_questions": ["封号原因是否确认"],
+                "search_queries": ["OpenAI Anthropic talent departures"],
+                "story_archetype": "people_change",
+            }
+
+            plan = OpenAICompatibleStoryWriter._parse_plan(packet, draft)
+
+            self.assertEqual(plan.story_archetype, "event_chain")
+            self.assertNotIn("people", plan.expansion_dimensions)
+
     def test_reported_context_needs_a_headline_entity_bridge(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp) / "workspace")

@@ -107,7 +107,8 @@ class VideoFactory:
                 result["model_selection"] = selection
             else:
                 self._generate_cached_manifest(source, url, job, options, result)
-            result["status"] = "completed"
+            if result.get("status") == "running":
+                result["status"] = "completed"
         except Exception as error:
             result["status"] = "failed"
             result["error"] = f"{type(error).__name__}: {error}"
@@ -178,12 +179,10 @@ class VideoFactory:
 
     def rerender(self, manifest_path: Path) -> dict[str, object]:
         """Retry deterministic rendering without reacquisition or LLM calls."""
-        manifest = load_manifest(manifest_path.resolve())
+        manifest = load_manifest(manifest_path.resolve(), normalize_story=False)
         candidate = self.workspace.load_candidate(manifest.candidate_id)
-        if manifest.github_brief:
-            canonicalize_github_brief(manifest.github_brief, manifest.evidence)
-        else:
-            self._recompile_editorial_manifest(manifest, candidate)
+        if not manifest.github_brief:
+            self._recompile_editorial_manifest(manifest, candidate, normalize_story=False)
         slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", candidate.id).strip("-") or "video"
         job_id = f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         job = self.jobs_dir / job_id
@@ -223,11 +222,16 @@ class VideoFactory:
         return result
 
     @staticmethod
-    def _recompile_editorial_manifest(manifest, candidate) -> None:
+    def _recompile_editorial_manifest(manifest, candidate, *, normalize_story: bool = True) -> None:
         brief = manifest.editorial_brief
         if brief is None:
             raise ValueError("rerender currently requires an editorial manifest")
-        canonicalize_editorial_brief(brief, manifest.evidence)
+        # A UI rerender is not editorial authorization. Existing hooks,
+        # conclusions, evidence facts, and shot order are already reviewed
+        # story decisions and must remain byte-for-byte stable. Fresh
+        # generation and explicit semantic repair may still normalize drafts.
+        if normalize_story:
+            canonicalize_editorial_brief(brief, manifest.evidence)
         proposals = compile_evidence_shots(brief, candidate)
         scenes: list[Scene] = []
         cursor = 0.0
@@ -499,7 +503,7 @@ class VideoFactory:
             "research": options.research, "linked_sources": options.linked_sources,
             "supplemental_context": options.supplemental_context,
             "price_event_metadata": options.price_event_metadata,
-            "render_profile": options.render_profile, "schema": 46,
+            "render_profile": options.render_profile, "schema": 50,
         }, sort_keys=True, ensure_ascii=False)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return self.cache_dir / "generations" / f"{digest}.manifest.json"
@@ -554,6 +558,16 @@ class VideoFactory:
             "name": "ingest", "status": "ok", "candidate": candidate.id,
             "method": acquired.method, "artifact": str(acquired.artifact),
         })
+        discount_gate = self._openrouter_discount_story_gate(
+            url, evidence, options.price_event_metadata,
+        )
+        if discount_gate is not None:
+            result["stages"].append({"name": "editorial_selection_gate", **discount_gate})
+            if not discount_gate["eligible"]:
+                result["status"] = "skipped"
+                result["reason"] = discount_gate["reason"]
+                result["publishable"] = False
+                return
         route = route_content(
             candidate, evidence, options.topic, options.content_type, options.duration,
         )
@@ -647,6 +661,13 @@ class VideoFactory:
                 + self._causal_uncertainty_direction(evidence)
                 + self._source_identity_direction(evidence)
                 + (
+                    "OpenRouter 折扣页只有达到高折扣选题门槛的价格异常才能成片；"
+                    f"本次最高可验证折扣/同模型节省为 {discount_gate['effective_discount_percent']:.1f}%。"
+                    "Hook、标题、证明镜头和结论必须围绕这个高折扣价格事件，"
+                    "不得改写成折扣筛选功能介绍，也不得选择更低的普通促销作为主角。"
+                    if discount_gate is not None else ""
+                )
+                + (
                     "这是价格异常线索：用每百万 token 实价、指定工作负载总价和可靠端点做钩子；"
                     "若与原厂比较，必须同时交代峰谷价、缓存条件、供应商和抓取时间。"
                     "不要把折扣写成无条件的模型能力推荐。若 intelligence 低于内部 55 分门槛，"
@@ -732,8 +753,54 @@ class VideoFactory:
             "证据明确说因果关系尚未确定。任何可见字段只要同时提到前一操作与后一结果，"
             "必须在同一句或同一屏明确写出‘当事人说不确定两者是否相关/是否由此触发尚无定论’；"
             "禁止用‘导致、触发、秒封、随即被封、照做就被封’偷渡确定因果。可以写时间顺序，"
-            "但不能让观众离开这一语义单元后才看到范围限定。"
+            "但不能让观众离开这一语义单元后才看到范围限定。因果限定只负责修正该事实，"
+            "不能取代故事本身：不得把‘截图只能证明/不能读成因果’写成整条视频的 Hook 或结论，"
+            "也不得为规避风险而删除连接多方对话所必需的人物、回复或时间顺序。"
         )
+
+    @staticmethod
+    def _openrouter_discount_story_gate(
+        url: str, evidence: list[Evidence], metadata: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Only turn the discount index into a story for an exceptional price event.
+
+        The discovery channel already treats 75% as an extreme discount. Direct
+        URL generation must obey the same editorial threshold instead of turning
+        whichever routine promotion happens to be visually prominent into news.
+        """
+        parsed = urlparse(url)
+        if (
+            (parsed.hostname or "").casefold() != "openrouter.ai"
+            or parsed.path.rstrip("/").casefold() != "/models"
+            or "discount=true" not in parsed.query.casefold()
+        ):
+            return None
+
+        threshold = 75.0
+        observed: list[float] = []
+        corpus = "\n".join(item.quote for item in evidence)
+        observed.extend(
+            float(match.group(1))
+            for match in re.finditer(r"\b(\d{1,3}(?:\.\d+)?)%\s*off\b", corpus, re.IGNORECASE)
+        )
+        if metadata:
+            observed.append(float(metadata.get("discount_percent") or 0))
+            comparison = metadata.get("official_comparison")
+            if isinstance(comparison, dict):
+                observed.append(float(comparison.get("savings_offpeak_percent") or 0))
+        effective = max(observed, default=0.0)
+        eligible = effective >= threshold
+        return {
+            "status": "passed" if eligible else "skipped",
+            "eligible": eligible,
+            "threshold_percent": threshold,
+            "effective_discount_percent": round(effective, 1),
+            "reason": (
+                f"OpenRouter price event clears the {threshold:.0f}% high-discount story gate"
+                if eligible else
+                f"OpenRouter discount {effective:.1f}% is below the {threshold:.0f}% story threshold"
+            ),
+        }
 
     @staticmethod
     def _source_identity_direction(evidence: list[Evidence]) -> str:

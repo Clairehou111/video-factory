@@ -98,7 +98,7 @@ class LLMTransportTests(unittest.TestCase):
             })
         self.assertEqual(issues, [])
 
-    def test_visible_copy_review_rejects_hook_that_only_rephrases_headline(self) -> None:
+    def test_visible_copy_review_allows_hook_to_keep_the_headline_story_axis(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(
             "openrouter", "https://openrouter.example/api/v1", "test-key", "cheap-model",
         ))
@@ -134,8 +134,46 @@ class LLMTransportTests(unittest.TestCase):
                     },
                 },
             })
-        self.assertEqual(len(issues), 1)
-        self.assertEqual(issues[0]["category"], "retention_hook")
+        self.assertEqual(issues, [])
+
+    def test_visible_copy_review_does_not_demand_harness_definition_in_every_field(self) -> None:
+        writer = OpenAICompatibleStoryWriter(LLMSettings(
+            "openrouter", "https://openrouter.example/api/v1", "test-key", "critic",
+        ))
+        candidate = Candidate(
+            "tweet-1", SourceType.TWEET, "https://x.com/vendor/status/1", "Harness dispute",
+        )
+        evidence = Evidence(
+            "evidence-1", candidate.id, candidate.source_url,
+            "A user used the Anthropic harness with another model and appealed a suspension.",
+            "x:thread_post",
+        )
+        packet = StoryWriterPacket(
+            candidate, [evidence], TopicType.PRACTICE_POST, ContentType.FLASH, 12,
+        )
+        fields = [
+            "editorial_brief.headline",
+            "editorial_brief.attention_strategy.selected_hook",
+        ]
+        reviews = [{
+            "field_path": path, "verdict": "fail",
+            "actor_action_object_recipient": "user used harness", "certainty": "reported_claim",
+            "naturalness_score": 4, "attention_score": 4,
+            "evidence_ids": [evidence.id], "category": "technical_specificity",
+            "problem": "harness 未解释", "repair_instruction": "重复写成测试框架（harness）",
+        } for path in fields]
+        with patch.object(writer, "_request_json", return_value=(
+            {"approved": False, "field_reviews": reviews}, {"model": "critic"},
+        )):
+            issues, _ = writer.review_visible_copy(packet, {
+                "editorial_brief": {
+                    "headline": "Anthropic harness 跨模型封号争议",
+                    "attention_strategy": {
+                        "selected_hook": "用户称 Anthropic harness 接其他模型后被封",
+                    },
+                },
+            })
+        self.assertEqual(issues, [])
 
     def test_visible_copy_review_includes_browser_target_as_proof(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(

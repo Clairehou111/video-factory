@@ -18,7 +18,7 @@ from video_factory.compositor import (
 from video_factory.llm import OpenAICompatibleStoryWriter, _compile_evidence_shot_kind
 from video_factory.models import (
     AttentionStrategy, Candidate, ContentType, EditorialBrief, Evidence, EvidenceShot,
-    ContextGraph, DirectorBrief, EditorialOpportunity, EvidenceShotKind, MaterialRole, Scene,
+    ContextEvent, ContextGraph, DirectorBrief, EditorialOpportunity, EvidenceShotKind, MaterialRole, Scene,
     SelectionReason, SourceType, StoryArcBeat, StorySubject, TopicType,
 )
 from video_factory.quality import _quantity_supported, validate_manifest
@@ -524,6 +524,9 @@ Markdown Content:
         self.assertNotIn('"scenes"', prompt)
         self.assertIn('"director_brief"', prompt)
         self.assertIn("Investigate like an editor", prompt)
+        self.assertIn("Optimize the selected hook aggressively for first-1.5-second retention", prompt)
+        self.assertIn("locked primary story promise", prompt)
+        self.assertIn("never fabricate shock", prompt)
 
     def test_model_prompt_requires_exact_name_and_plain_metric_explanation(self):
         candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
@@ -867,6 +870,147 @@ Markdown Content:
         brief.attention_strategy.hook_evidence_ids = [root.id]
         canonicalize_editorial_brief(brief, [root, related])
         self.assertEqual(brief.attention_strategy.hook_evidence_ids, [root.id, related.id])
+
+    def test_people_change_hook_cannot_pivot_to_secondary_product_capability(self):
+        candidate = Candidate(
+            "x-company", SourceType.TWEET,
+            "https://x.com/JeffDean/status/1", "Discovery Loop", author="JeffDean",
+        )
+        brief, item = brief_for(candidate)
+        people = SelectionReason(
+            "people-move", "important_person", "四位 Google 核心人物集体创业", [item.id],
+        )
+        capability = SelectionReason(
+            "product-capability", "capability_shift", "自动化科研实验", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "Jeff Dean 与三位老搭档离开 Google 创业", "刚刚官宣", "AI 人才流动",
+            "行业格局", [people, capability], story_archetype="people_change",
+        )
+        brief.attention_strategy.hook_candidates = [
+            "Discovery Loop 要并行数千个实验", "Jeff Dean 与三位老搭档创业",
+            "Google 一口气失去四位 AI 老将",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        brief.fixed_conclusion = "这套系统将并行执行数千个实验，大幅压缩迭代时间"
+        brief.evidence_shots[-1].selection_reason_ids = [capability.id]
+
+        errors = validate_editorial_brief(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        structure_errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+
+        self.assertIn(
+            "people-change hook abandoned the primary person/team move for a secondary story",
+            errors,
+        )
+        self.assertIn(
+            "people-change conclusion must resolve the primary person/team move, not a secondary capability",
+            errors,
+        )
+        self.assertIn(
+            "people-change final payoff must return to the primary selection reason", errors,
+        )
+        self.assertIn(
+            "people-change hook abandoned the primary person/team move for a secondary story",
+            structure_errors,
+        )
+
+        brief.attention_strategy.hook_candidates[0] = "Google 一口气失去四位 AI 老将"
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        brief.fixed_conclusion = "四位 Google 老搭档把下一步押在 Discovery Loop"
+        brief.evidence_shots[-1].selection_reason_ids = [people.id]
+        repaired_errors = validate_editorial_brief(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertFalse(any("people-change hook abandoned" in error for error in repaired_errors))
+        self.assertFalse(any("people-change conclusion must resolve" in error for error in repaired_errors))
+        self.assertFalse(any("people-change final payoff" in error for error in repaired_errors))
+
+    def test_multi_party_reply_chain_rejects_missing_intervening_response(self):
+        candidate = Candidate(
+            "x-sam", SourceType.TWEET, "https://x.com/sama/status/1",
+            "Sam praises Tibo", author="sama",
+        )
+        brief, item = brief_for(candidate)
+        item.quote = (
+            "Alex said his account was suspended and appealed. Tibo replied that he does not "
+            "work at Anthropic and questioned the ban. Boris Cherny replied: We are hiring."
+        )
+        brief.subjects = [
+            StorySubject("Sam Altman", "person", "发帖夸 Tibo", "把对话带入公众视野", [item.id]),
+            StorySubject("alex getman", "person", "自称账号被停用并申诉", "引发讨论", [item.id]),
+            StorySubject("Tibo", "person", "回复并质疑封号", "解释 Sam 为何称赞", [item.id]),
+            StorySubject("Boris Cherny", "person", "回复正在招聘", "形成最后反应", [item.id]),
+        ]
+        brief.evidence_shots = [
+            EvidenceShot(
+                "root", EvidenceShotKind.TWEET_CARD, "Sam 说了什么", "Sam Altman 发帖夸 Tibo",
+                "建立根帖", [item.id], ["event"], visual_family="tweet",
+                retention_job="hook_proof", narrative_beat="opening",
+            ),
+            EvidenceShot(
+                "alex", EvidenceShotKind.BROWSER_SECTION, "发生了什么", "alex getman 称账号被停用并申诉",
+                "交代起点", [item.id], ["proof"], target="Alex said his account was suspended and appealed.",
+                translation="账号被停用并已申诉", relation_to_previous="解释根帖背景",
+                visual_family="quote_card", retention_job="reveal", narrative_beat="proof",
+            ),
+            EvidenceShot(
+                "boris", EvidenceShotKind.BROWSER_SECTION, "最后谁回复", "Boris Cherny 回复正在招聘",
+                "最后反应", [item.id], ["impact"], target="Boris Cherny replied: We are hiring.",
+                translation="Boris Cherny 回复正在招聘", relation_to_previous="同一串下方的回复",
+                visual_family="impact_card", retention_job="payoff", narrative_beat="takeaway",
+            ),
+        ]
+        brief.fixed_conclusion = "截图只证明申诉、否认和招聘回复同时出现，不能读成因果"
+
+        errors = validate_editorial_brief(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        structure_errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+
+        self.assertIn(
+            "multi-party reply chain needs at least four shots so the intervening response remains visible",
+            errors,
+        )
+        self.assertIn("multi-party reply chain omits Tibo's visible action", errors)
+        self.assertIn(
+            "causal-safety note replaced the story payoff; keep the event meaning first and qualify only the disputed link",
+            errors,
+        )
+        self.assertIn("multi-party reply chain omits Tibo's visible action", structure_errors)
+
+        chain_reason = SelectionReason(
+            "interaction", "competition", "多方公开回复构成完整事件链", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "Sam 转发一串封号争议互动", "刚刚发生", "开发者关心账号风险",
+            "risk", [chain_reason], story_archetype="event_chain",
+        )
+        brief.context_graph = ContextGraph(
+            events=[ContextEvent(
+                "alex getman", "earlier setup", "2026-08-09",
+                "exact earlier post that explains the current event", [item.id], "ctx-setup",
+            )],
+            required_context_ids=["ctx-setup"],
+        )
+        brief.fixed_conclusion = "Sam 借这场争议公开力挺 Tibo；封号原因仍无官方结论"
+        canonicalize_editorial_brief(brief, [item])
+        repaired_errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        visible_facts = "\n".join(shot.fact for shot in brief.evidence_shots)
+        self.assertIn("Tibo", visible_facts)
+        self.assertIn("Boris Cherny", visible_facts)
+        self.assertTrue(any(
+            "ctx-setup" in shot.context_event_ids for shot in brief.evidence_shots
+        ))
+        self.assertFalse(any("multi-party reply chain" in error for error in repaired_errors))
+        self.assertFalse(any("causal-safety note replaced" in error for error in repaired_errors))
 
     def test_billing_correlation_is_not_rewritten_as_vulnerability_mechanism(self):
         candidate = Candidate("x-security", SourceType.TWEET, "https://x.com/dev/status/1", "API research", author="dev")

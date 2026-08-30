@@ -618,5 +618,119 @@
     "tests": [
       "tests/test_radar.py::RadarV2Test::test_radar_drops_optional_second_line_instead_of_showing_a_fragment"
     ]
+  },
+  {
+    "id": "VF-20260831-055",
+    "title": "UI rerender silently re-authored an approved story",
+    "stage": "rerender",
+    "reproduction": "Rerender an approved manifest with a new compositor while rerender still calls canonicalize_editorial_brief.",
+    "impact": "A visual-only change could replace the hook, conclusion, evidence copy, or shot order and make a better-looking video tell a different story.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_ui_rerender_recompiles_scenes_without_rewriting_editorial_story"
+    ]
+  },
+  {
+    "id": "VF-20260831-056",
+    "title": "High-attention hook optimization abandoned the selected story axis",
+    "stage": "content_agent",
+    "reproduction": "Start with a people-change angle about Jeff Dean and three Google collaborators, then let the critic demand a hook different from the descriptive headline.",
+    "impact": "The hook, conclusion, and final payoff pivoted from the Google team move to Discovery Loop's secondary parallel-experiment capability.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_people_change_hook_cannot_pivot_to_secondary_product_capability",
+      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_allows_hook_to_keep_the_headline_story_axis"
+    ]
+  },
+  {
+    "id": "VF-20260831-057",
+    "title": "Direct OpenRouter discount-page generation bypassed the high-discount selection gate",
+    "stage": "editorial_selection",
+    "reproduction": "Generate the OpenRouter discount index directly while the most prominent current promotion is only 15% off.",
+    "impact": "A routine promotion became a finished news video even though the product only wants exceptional price anomalies such as the verified 85.8% same-model saving.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_openrouter_discount_index_skips_routine_fifteen_percent_promotion",
+      "tests/test_factory.py::VideoFactoryTest::test_openrouter_discount_index_accepts_exceptional_effective_savings"
+    ]
+  },
+  {
+    "id": "VF-20260831-058",
+    "title": "Causal-safety copy replaced the bridge in a multi-party reply chain",
+    "stage": "content_agent",
+    "reproduction": "Tell the Sam Altman/Tibo account-suspension thread in three shots and omit Tibo's intervening reply while using a screenshot-proof disclaimer as the conclusion.",
+    "impact": "Viewers saw Sam praise Tibo, an account suspension, and an Anthropic hiring reply without the response that explains why those events belong in one story.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_multi_party_reply_chain_rejects_missing_intervening_response",
+      "tests/test_context_research.py::ContextResearchTests::test_recruiting_reply_inside_a_quoted_dispute_is_an_event_chain_not_people_move"
+    ]
+  },
+  {
+    "id": "VF-20260831-059",
+    "title": "Radar headline width clipping produced an unfinished hook",
+    "stage": "content_agent",
+    "reproduction": "Clip a hook such as '用户照 Tibo 的配置把 Claude Code 接到 GPT-5.6 Sol 后账号被停用' at the mobile width boundary.",
+    "impact": "The permanent top rail ended at '接到', so the most important sentence looked broken even though the writer had supplied a complete shorter headline.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_hook_falls_back_to_complete_model_written_headline"
+    ]
+  },
+  {
+    "id": "VF-20260831-060",
+    "title": "Both writer tiers exhausted repairs while omitting one reply-chain actor",
+    "stage": "content_agent_fallback",
+    "reproduction": "Ask the primary and fallback writers to preserve alex, Tibo, Boris, and Sam in one short event chain; each repair continues to omit Tibo or Boris.",
+    "impact": "The agent correctly refused an unclear story but still required Codex intervention instead of recovering from its own structured subjects and evidence links.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_multi_party_reply_chain_rejects_missing_intervening_response"
+    ]
+  },
+  {
+    "id": "VF-20260831-061",
+    "title": "Event-chain fallback dropped required context labels while preserving their evidence",
+    "stage": "content_agent_fallback",
+    "reproduction": "Rebuild a multi-party chain from subjects after context research marked the quoted setup and appeal posts as required.",
+    "impact": "The facts remained visible, but exact causal setup validation rejected the fallback because context_event_ids were not migrated with overlapping evidence.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_multi_party_reply_chain_rejects_missing_intervening_response"
+    ]
+  },
+  {
+    "id": "VF-20260831-062",
+    "title": "Copy critic demanded the same harness glossary in every visible field",
+    "stage": "copy_review",
+    "reproduction": "Use the specialist term harness in a hook, conclusion, and evidence translation after the first relevant shot can carry one adjacent definition.",
+    "impact": "Repeated glossary demands overflowed mobile rails and exhausted both writer tiers even though one explanation was sufficient for comprehension.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_explains_harness_once_in_first_relevant_shot",
+      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_does_not_demand_harness_definition_in_every_field"
+    ]
+  },
+  {
+    "id": "VF-20260831-063",
+    "title": "Optional invented direct identifier exhausted an otherwise valid story",
+    "stage": "content_agent",
+    "reproduction": "Return a strong grounded brief plus a direct_identifier that cannot be found verbatim in archived evidence.",
+    "impact": "An optional metadata badge consumed semantic repair rounds and blocked the entire video instead of safely disappearing.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_rejects_marketing_category_and_unsupported_identifier"
+    ]
+  },
+  {
+    "id": "VF-20260831-064",
+    "title": "Manifest loading rewrote story before a UI-only rerender",
+    "stage": "rerender_load",
+    "reproduction": "Load an approved Radar manifest for rerender after disabling canonicalization only in the scene recompilation method.",
+    "impact": "The loader still clipped an approved Sam event-chain fact to an unfinished phrase before the visual renderer received it.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_ui_rerender_load_freezes_approved_editorial_copy"
+    ]
   }
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from difflib import SequenceMatcher
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ def _is_multi_model_price_evidence(evidence: list[Evidence]) -> bool:
 # Explain one decision-critical specialist term at its first relevant shot.
 # Definitions are audience UI copy, not claims about the selected source.
 AUDIENCE_GLOSSARY: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("harness",), "harness：模型的测试与运行框架。", r"(?:测试|运行).{0,4}框架"),
     (("pass@1",), "pass@1：代码只生成一次就通过测试的比例。", r"只生成一次.{0,12}通过测试.{0,8}(?:比例|占比)"),
     (("首 Token 延迟", "TTFT"), "{term}：发出请求到看到第一个 Token 的等待时间。", r"发出请求.{0,12}第一个\s*Token.{0,10}(?:等待|时间)"),
     (("FP8", "INT8", "INT4", "量化"), "{term} 量化：用更低数值精度减少模型的显存和计算占用。", r"低.{0,6}(?:数值)?精度.{0,12}(?:减少|降低).{0,12}(?:显存|计算)"),
@@ -150,7 +152,7 @@ def _complete_radar_conclusion(brief: EditorialBrief, limit: float = 40) -> str:
 
 def _looks_like_radar_fragment(value: str) -> bool:
     compact = re.sub(r"\s+", " ", value).strip().rstrip("，,：:")
-    return bool(re.search(r"(?:模|直接|每秒|从|至|为|在|与|和|或|的|把|将)$", compact))
+    return bool(re.search(r"(?:模|直接|每秒|从|至|为|在|与|和|或|的|把|将|到|让|用)$", compact))
 
 
 def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
@@ -172,12 +174,24 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
         return clipped
 
     original_candidates = list(strategy.hook_candidates)
+    original_headline = brief.headline
     strategy.hook_candidates = [headline_copy(item) for item in original_candidates]
     if strategy.selected_hook in original_candidates:
         strategy.selected_hook = strategy.hook_candidates[original_candidates.index(strategy.selected_hook)]
     elif strategy.hook_candidates:
         strategy.selected_hook = strategy.hook_candidates[0]
     strategy.selected_hook = headline_copy(strategy.selected_hook)
+    if _looks_like_radar_fragment(strategy.selected_hook):
+        complete_alternatives = [
+            headline_copy(original_headline),
+            *(headline_copy(item) for item in original_candidates),
+        ]
+        complete_alternatives = [
+            item for item in complete_alternatives
+            if item and not _looks_like_radar_fragment(item)
+        ]
+        if complete_alternatives:
+            strategy.selected_hook = max(complete_alternatives, key=_hook_retention_score)
     if strategy.hook_candidates and strategy.selected_hook not in strategy.hook_candidates:
         strategy.hook_candidates[0] = strategy.selected_hook
 
@@ -231,6 +245,148 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
         brief.editorial_inference = ""
 
 
+def _chain_action_markers(value: str) -> list[str]:
+    markers = (
+        "不解", "奇怪", "质疑", "征集", "澄清", "否认", "不在", "回复", "回应", "表示",
+        "招人", "招聘", "停用", "被封", "封号", "封禁", "申诉",
+    )
+    return [marker for marker in markers if marker in value]
+
+
+def _chain_display_name(value: str) -> str:
+    return re.split(r"\s*[（(]|\s*@", value, maxsplit=1)[0].strip()
+
+
+def _chain_source_target(subject_name: str, evidence_items: list[Evidence]) -> str:
+    """Extract one exact self-contained source block for a subject action."""
+    for item in evidence_items:
+        text = item.quote
+        if item.source_kind == "x:visual_analysis":
+            try:
+                payload = json.loads(text)
+                text = str(payload.get("visible_text") or text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        match = re.search(re.escape(subject_name), text, re.IGNORECASE)
+        if not match:
+            continue
+        tail = text[match.start():]
+        block = re.split(r"\n\s*\n", tail, maxsplit=1)[0].strip()
+        if len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", block)) >= 4:
+            return block[:320]
+    return ""
+
+
+def _repair_multi_party_event_chain(brief: EditorialBrief, evidence: list[Evidence]) -> None:
+    """Deterministic fallback when prose repair keeps dropping a bridge actor.
+
+    It compiles only model-written subject actions that already cite archived
+    evidence. No new factual claim is authored here.
+    """
+    if not (
+        brief.opportunity
+        and brief.opportunity.story_archetype == "event_chain"
+        and len(brief.subjects) >= 4
+        and brief.evidence_shots
+    ):
+        return
+    evidence_by_id = {item.id: item for item in evidence}
+    root = brief.evidence_shots[0]
+    later = brief.evidence_shots[1:]
+
+    def covers(shot: EvidenceShot, subject) -> bool:
+        copy = " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+        name = _chain_display_name(subject.name)
+        if not name or name.casefold() not in copy.casefold():
+            return False
+        markers = _chain_action_markers(subject.action)
+        return not markers or any(marker in copy for marker in markers)
+
+    ordered = [root]
+    used_ids: set[str] = {root.id}
+    for index, subject in enumerate(brief.subjects[1:4], start=1):
+        existing = next((shot for shot in later if shot.id not in used_ids and covers(shot, subject)), None)
+        if existing is not None:
+            original_id = existing.id
+            existing.id = (
+                f"chain-{index}-{re.sub(r'[^a-z0-9]+', '-', _chain_display_name(subject.name).casefold()).strip('-') or index}"
+            )
+            existing.fact = f"{_chain_display_name(subject.name)}：{subject.action}"
+            ordered.append(existing)
+            used_ids.add(original_id)
+            continue
+        cited = [evidence_by_id[item] for item in subject.evidence_ids if item in evidence_by_id]
+        target = _chain_source_target(_chain_display_name(subject.name), cited)
+        linked_ids = list(subject.evidence_ids)
+        for item in cited:
+            if item.source_kind == "x:visual_analysis":
+                parent = str(item.metadata.get("parent_image_id") or "")
+                if parent in evidence_by_id and parent not in linked_ids:
+                    linked_ids.append(parent)
+        reason_ids = [
+            reason.id for reason in brief.opportunity.selection_reasons
+            if set(reason.evidence_ids) & set(subject.evidence_ids)
+        ]
+        ordered.append(EvidenceShot(
+            id=f"chain-{index}-{re.sub(r'[^a-z0-9]+', '-', _chain_display_name(subject.name).casefold()).strip('-') or index}",
+            kind=EvidenceShotKind.BROWSER_SECTION,
+            question=f"{_chain_display_name(subject.name)} 做了什么？",
+            fact=f"{_chain_display_name(subject.name)}：{subject.action}",
+            interpretation="补齐多方事件链中不可缺少的一步",
+            evidence_ids=linked_ids,
+            beat_ids=["evidence_context"],
+            source_url=cited[0].url if cited else "",
+            target=target,
+            translation=(
+                f"{_chain_display_name(subject.name)}：{subject.action}"
+                if target and re.search(r"[A-Za-z]", target) else ""
+            ),
+            duration=2.2,
+            relation_to_previous="按公开对话顺序推进到下一位参与者",
+            visual_family="quote_card" if index % 2 else "timeline",
+            retention_job="turn" if index < 3 else "impact",
+            selection_reason_ids=reason_ids,
+        ))
+
+    scope = next((
+        shot for shot in later
+        if shot.id not in used_ids and "scope" in shot.beat_ids
+    ), None)
+    if scope is not None and len(ordered) < 5:
+        ordered.append(scope)
+    if brief.context_graph:
+        required_context = set(brief.context_graph.required_context_ids)
+        for shot in ordered:
+            linked = set(shot.evidence_ids)
+            inherited = [
+                event.id for event in brief.context_graph.events
+                if event.id in required_context and linked & set(event.evidence_ids)
+            ]
+            shot.context_event_ids = list(dict.fromkeys([
+                *shot.context_event_ids, *inherited,
+            ]))
+        for event in brief.context_graph.events:
+            if event.id not in required_context or any(
+                event.id in shot.context_event_ids for shot in ordered
+            ):
+                continue
+            actor_key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", event.actor.casefold())
+            target = next((
+                shot for shot in ordered[1:]
+                if actor_key and (
+                    actor_key in re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", shot.fact.casefold())
+                    or re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", shot.fact.casefold()) in actor_key
+                )
+            ), ordered[0] if event.relation == "background" else ordered[1])
+            target.evidence_ids = list(dict.fromkeys([
+                *target.evidence_ids, *event.evidence_ids,
+            ]))
+            target.context_event_ids = list(dict.fromkeys([
+                *target.context_event_ids, event.id,
+            ]))
+    brief.evidence_shots = ordered
+
+
 def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]) -> None:
     """Repair evidence linkage, never prose, when the model chose a valid fact.
 
@@ -239,6 +395,14 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
     proof deterministically; it may not invent or soften the claim itself.
     """
     evidence_by_id = {item.id: item for item in evidence}
+    if brief.direct_identifier.strip():
+        corpus = "\n".join([*(item.url for item in evidence), *(item.quote for item in evidence)])
+        needle = re.sub(
+            r"^(?:HF:\s*|pip install\s+|docker pull\s+)",
+            "", brief.direct_identifier.strip(), flags=re.IGNORECASE,
+        )
+        if not needle or needle.casefold() not in corpus.casefold():
+            brief.direct_identifier = ""
     # Multimodal analysis explains an archived image but is not itself a
     # renderable asset. Attach its parent before presentation compilation so
     # the first use renders the real pixels; later reuse becomes a derived
@@ -254,6 +418,7 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
                     linked.append(parent_id)
         shot.evidence_ids = linked
 
+    _repair_multi_party_event_chain(brief, evidence)
     if brief.opening_mode:
         _canonicalize_radar_contract(brief)
     strategy = brief.attention_strategy
@@ -734,6 +899,8 @@ def _validate_radar_contract(brief: EditorialBrief, evidence: list[Evidence]) ->
     )
     if width > 28 or (width > 20 and not exact_subject):
         errors.append("Radar headline must fit 20 equivalents, or 28 only to preserve an exact subject name")
+    if _looks_like_radar_fragment(headline):
+        errors.append("Radar selected hook must be a complete phrase, not a mechanically clipped fragment")
     visible_fields = [
         brief.headline, brief.subheadline, brief.fixed_conclusion,
         strategy.selected_hook, *strategy.hook_candidates,
@@ -903,6 +1070,104 @@ def validate_editorial_brief(
             errors.append("every subject needs name, action, and consequence")
         if not set(subject.evidence_ids) <= evidence_ids:
             errors.append(f"subject {subject.name or '<missing>'} references unknown evidence")
+
+    # Story-axis lock: the hook may become sharper, but it cannot replace a
+    # people-move story with a secondary product capability or metric. The
+    # first selection reason is the publication promise chosen before writing.
+    if (
+        brief.opportunity
+        and brief.opportunity.story_archetype == "people_change"
+        and brief.opportunity.selection_reasons
+    ):
+        primary_reason = brief.opportunity.selection_reasons[0]
+        movement = re.compile(
+            r"离开|离职|出走|失去|加入|入职|创立|创办|创业|联合创始|另起炉灶|挖角|"
+            r"押在|集体|\b(?:leave|left|depart|join|found|co-founder|poach)",
+            re.IGNORECASE,
+        )
+        people_frame = re.compile(
+            r"四位|三位|两位|团队|创始人|老将|老搭档|人才|核心人物|研究者|员工",
+            re.IGNORECASE,
+        )
+        primary_names = [
+            subject.name for subject in brief.subjects
+            if set(subject.evidence_ids) & set(primary_reason.evidence_ids)
+        ]
+
+        def keeps_people_axis(copy: str) -> bool:
+            named = any(name and name.casefold() in copy.casefold() for name in primary_names)
+            return bool(movement.search(copy) and (named or people_frame.search(copy)))
+
+        if not keeps_people_axis(visible_hook):
+            errors.append(
+                "people-change hook abandoned the primary person/team move for a secondary story"
+            )
+        if not keeps_people_axis(brief.fixed_conclusion):
+            errors.append(
+                "people-change conclusion must resolve the primary person/team move, not a secondary capability"
+            )
+        if (
+            brief.evidence_shots
+            and brief.evidence_shots[-1].selection_reason_ids
+            and primary_reason.id not in brief.evidence_shots[-1].selection_reason_ids
+        ):
+            errors.append(
+                "people-change final payoff must return to the primary selection reason"
+            )
+
+    # A multi-party reply chain needs its bridge on screen. Naming a responder
+    # in the root headline is not enough when their actual reply explains why
+    # the final reaction happened.
+    reply_subjects = [
+        subject for subject in brief.subjects
+        if re.search(r"回复|回应|质疑|评论|表示|澄清|征集|reply|respond|question", subject.action, re.IGNORECASE)
+    ]
+    is_multi_party_chain = (
+        candidate.source_type == SourceType.TWEET
+        and len(brief.subjects) >= 3
+        and (
+            len(reply_subjects) >= 2
+            or bool(brief.opportunity and brief.opportunity.story_archetype == "event_chain")
+        )
+    )
+    if is_multi_party_chain:
+        if len(brief.evidence_shots) < 4:
+            errors.append(
+                "multi-party reply chain needs at least four shots so the intervening response remains visible"
+            )
+        later_copy = "\n".join(
+            " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+            for shot in brief.evidence_shots[1:]
+        )
+        action_markers = (
+            "不解", "质疑", "征集", "澄清", "否认", "不在", "回复", "回应", "表示",
+            "招人", "招聘", "停用", "封号", "封禁", "申诉",
+        )
+        for subject in brief.subjects[1:]:
+            display_name = re.split(r"\s*\(|\s*@", subject.name, maxsplit=1)[0].strip()
+            subject_shots = [
+                " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+                for shot in brief.evidence_shots[1:]
+                if display_name and display_name.casefold() in " ".join((
+                    shot.fact, shot.audience_copy, shot.translation, shot.full_translation,
+                )).casefold()
+            ]
+            if not subject_shots:
+                errors.append(
+                    f"multi-party reply chain omits {display_name or subject.name}'s visible action"
+                )
+                continue
+            required_markers = [marker for marker in action_markers if marker in subject.action]
+            if required_markers and not any(
+                marker in "\n".join(subject_shots) for marker in required_markers
+            ):
+                errors.append(
+                    f"multi-party reply chain names {display_name or subject.name} but omits their actual action"
+                )
+        if re.match(r"^(?:截图|画面).{0,8}(?:只|仅).{0,8}证明", brief.fixed_conclusion):
+            errors.append(
+                "causal-safety note replaced the story payoff; keep the event meaning first and qualify only the disputed link"
+            )
     if content_type == ContentType.FLASH and brief.duration_target > 15:
         errors.append("flash duration must not exceed 15 seconds")
     if not brief.evidence_shots:
@@ -1183,6 +1448,107 @@ def validate_editorial_brief(
     return errors
 
 
+def _validate_story_axis_structure(brief: EditorialBrief, candidate: Candidate) -> list[str]:
+    """Keep retention optimization inside the selected story promise."""
+    errors: list[str] = []
+    strategy = brief.attention_strategy
+    visible_hook = strategy.selected_hook.strip()
+    if (
+        brief.opportunity
+        and brief.opportunity.story_archetype == "people_change"
+        and brief.opportunity.selection_reasons
+    ):
+        primary_reason = brief.opportunity.selection_reasons[0]
+        movement = re.compile(
+            r"离开|离职|出走|失去|加入|入职|创立|创办|创业|联合创始|另起炉灶|挖角|"
+            r"押在|集体|\b(?:leave|left|depart|join|found|co-founder|poach)",
+            re.IGNORECASE,
+        )
+        people_frame = re.compile(
+            r"四位|三位|两位|团队|创始人|老将|老搭档|人才|核心人物|研究者|员工",
+            re.IGNORECASE,
+        )
+        primary_names = [
+            subject.name for subject in brief.subjects
+            if set(subject.evidence_ids) & set(primary_reason.evidence_ids)
+        ]
+
+        def keeps_people_axis(copy: str) -> bool:
+            named = any(name and name.casefold() in copy.casefold() for name in primary_names)
+            return bool(movement.search(copy) and (named or people_frame.search(copy)))
+
+        if not keeps_people_axis(visible_hook):
+            errors.append(
+                "people-change hook abandoned the primary person/team move for a secondary story"
+            )
+        if not keeps_people_axis(brief.fixed_conclusion):
+            errors.append(
+                "people-change conclusion must resolve the primary person/team move, not a secondary capability"
+            )
+        if (
+            brief.evidence_shots
+            and brief.evidence_shots[-1].selection_reason_ids
+            and primary_reason.id not in brief.evidence_shots[-1].selection_reason_ids
+        ):
+            errors.append("people-change final payoff must return to the primary selection reason")
+
+    reply_subjects = [
+        subject for subject in brief.subjects
+        if re.search(
+            r"回复|回应|质疑|评论|表示|澄清|征集|reply|respond|question",
+            subject.action, re.IGNORECASE,
+        )
+    ]
+    is_multi_party_chain = (
+        candidate.source_type == SourceType.TWEET
+        and len(brief.subjects) >= 3
+        and (
+            len(reply_subjects) >= 2
+            or bool(brief.opportunity and brief.opportunity.story_archetype == "event_chain")
+        )
+    )
+    if not is_multi_party_chain:
+        return errors
+    if len(brief.evidence_shots) < 4:
+        errors.append(
+            "multi-party reply chain needs at least four shots so the intervening response remains visible"
+        )
+    action_markers = (
+        "不解", "奇怪", "质疑", "征集", "澄清", "否认", "不在", "回复", "回应", "表示",
+        "招人", "招聘", "停用", "封号", "封禁", "申诉",
+    )
+    for subject in brief.subjects[1:]:
+        display_name = re.split(r"\s*[（(]|\s*@", subject.name, maxsplit=1)[0].strip()
+        subject_shot_objects = [
+            shot
+            for shot in brief.evidence_shots[1:]
+            if display_name and display_name.casefold() in " ".join((
+                shot.fact, shot.audience_copy, shot.translation, shot.full_translation,
+            )).casefold()
+        ]
+        if not subject_shot_objects:
+            errors.append(f"multi-party reply chain omits {display_name or subject.name}'s visible action")
+            continue
+        if any(shot.id.startswith("chain-") for shot in subject_shot_objects):
+            continue
+        subject_shots = [
+            " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+            for shot in subject_shot_objects
+        ]
+        required_markers = [marker for marker in action_markers if marker in subject.action]
+        if required_markers and not any(
+            marker in "\n".join(subject_shots) for marker in required_markers
+        ):
+            errors.append(
+                f"multi-party reply chain names {display_name or subject.name} but omits their actual action"
+            )
+    if re.match(r"^(?:截图|画面).{0,8}(?:只|仅).{0,8}证明", brief.fixed_conclusion):
+        errors.append(
+            "causal-safety note replaced the story payoff; keep the event meaning first and qualify only the disputed link"
+        )
+    return errors
+
+
 def validate_editorial_structure(
     brief: EditorialBrief, candidate: Candidate, evidence: list[Evidence],
     topic: TopicType, content_type: ContentType,
@@ -1196,6 +1562,7 @@ def validate_editorial_structure(
     """
     errors: list[str] = []
     errors.extend(_validate_radar_contract(brief, evidence))
+    errors.extend(_validate_story_axis_structure(brief, candidate))
     evidence_ids = {item.id for item in evidence}
     strategy = brief.attention_strategy
     for name, value in {

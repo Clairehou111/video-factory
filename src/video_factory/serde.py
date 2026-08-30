@@ -17,7 +17,9 @@ from .github_editor import canonicalize_github_brief
 from .editorial import canonicalize_editorial_brief
 
 
-def manifest_from_dict(data: dict[str, Any]) -> RenderManifest:
+def manifest_from_dict(
+    data: dict[str, Any], *, normalize_story: bool = True,
+) -> RenderManifest:
     evidence = [Evidence(**item) for item in data.get("evidence", [])]
     story_beats = [StoryBeat(**item) for item in data.get("story_beats", [])]
     walkthrough_data = data.get("github_walkthrough")
@@ -36,7 +38,7 @@ def manifest_from_dict(data: dict[str, Any]) -> RenderManifest:
     brief = None if not brief_data else GitHubProjectBrief(
         **{**brief_data, "focus_candidates": focus_items},
     )
-    if brief:
+    if brief and normalize_story:
         canonicalize_github_brief(brief, evidence)
     editorial_data = data.get("editorial_brief")
     editorial_brief = None
@@ -71,7 +73,8 @@ def manifest_from_dict(data: dict[str, Any]) -> RenderManifest:
             direct_identifier=str(editorial_data.get("direct_identifier", "")),
             editorial_inference=str(editorial_data.get("editorial_inference", "")),
         )
-        canonicalize_editorial_brief(editorial_brief, evidence)
+        if normalize_story:
+            canonicalize_editorial_brief(editorial_brief, evidence)
     scenes = []
     for item in data.get("scenes", []):
         scene = dict(item)
@@ -92,13 +95,13 @@ def manifest_from_dict(data: dict[str, Any]) -> RenderManifest:
         editorial_brief=editorial_brief,
         cold_open_beats=cold_open_beats,
     )
-    if manifest.github_brief:
+    if manifest.github_brief and normalize_story:
         repo_url = next((url for url in manifest.source_urls if "github.com/" in url), "")
         repo_name = repo_url.rstrip("/").rsplit("/", 1)[-1] if repo_url else ""
         current_title = (manifest.fixed_title or manifest.github_brief.project_title).strip()
         if repo_name and repo_name.casefold() not in current_title.casefold():
             manifest.fixed_title = f"{repo_name}｜{current_title}"
-    elif manifest.editorial_brief:
+    elif manifest.editorial_brief and normalize_story:
         strategy = manifest.editorial_brief.attention_strategy
         selected = strategy.selected_hook or (strategy.hook_candidates[0] if strategy.hook_candidates else manifest.fixed_hook)
         manifest.fixed_hook = selected
@@ -107,8 +110,10 @@ def manifest_from_dict(data: dict[str, Any]) -> RenderManifest:
     return manifest
 
 
-def load_manifest(path: Path) -> RenderManifest:
-    return manifest_from_dict(json.loads(path.read_text(encoding="utf-8")))
+def load_manifest(path: Path, *, normalize_story: bool = True) -> RenderManifest:
+    return manifest_from_dict(
+        json.loads(path.read_text(encoding="utf-8")), normalize_story=normalize_story,
+    )
 
 
 def collection_manifest_from_dict(data: dict[str, Any]) -> VideoCollectionManifest:
