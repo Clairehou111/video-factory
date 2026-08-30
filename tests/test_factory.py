@@ -29,6 +29,53 @@ def basic_manifest() -> RenderManifest:
 
 
 class VideoFactoryTest(unittest.TestCase):
+    def test_native_media_master_is_primary_and_does_not_invoke_mpt(self) -> None:
+        with TemporaryDirectory() as temp:
+            job = Path(temp)
+            framed = job / "framed.mp4"
+            mastered = job / "native-ffmpeg-master.mp4"
+            result: dict[str, object] = {"stages": []}
+            with (
+                patch("video_factory.factory.MPTSettings.from_environment", return_value=MagicMock()),
+                patch(
+                    "video_factory.factory.NativeFFmpegAssemblyAdapter.assemble",
+                    return_value=mastered,
+                ) as native,
+                patch("video_factory.factory.MPTAssemblyAdapter.assemble") as mpt,
+            ):
+                selected = VideoFactory._assemble_master(basic_manifest(), framed, job, result)
+
+            self.assertEqual(selected, mastered)
+            native.assert_called_once()
+            mpt.assert_not_called()
+            self.assertEqual(result["stages"][0]["backend"], "native_ffmpeg")
+            self.assertFalse(result["stages"][0]["fallback_used"])
+
+    def test_media_master_records_native_failure_before_mpt_fallback(self) -> None:
+        with TemporaryDirectory() as temp:
+            job = Path(temp)
+            framed = job / "framed.mp4"
+            fallback = job / "mpt-master.mp4"
+            result: dict[str, object] = {"stages": []}
+            with (
+                patch("video_factory.factory.MPTSettings.from_environment", return_value=MagicMock()),
+                patch(
+                    "video_factory.factory.NativeFFmpegAssemblyAdapter.assemble",
+                    side_effect=RuntimeError("native encoder failed"),
+                ),
+                patch(
+                    "video_factory.factory.MPTAssemblyAdapter.assemble",
+                    return_value=fallback,
+                ) as mpt,
+            ):
+                selected = VideoFactory._assemble_master(basic_manifest(), framed, job, result)
+
+            self.assertEqual(selected, fallback)
+            mpt.assert_called_once()
+            failure = json.loads((job / "assembly-primary-error.json").read_text(encoding="utf-8"))
+            self.assertEqual(failure["fallback"], "money_printer_turbo")
+            self.assertEqual([stage["status"] for stage in result["stages"]], ["fallback", "ok"])
+
     def test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted(self) -> None:
         with TemporaryDirectory() as temp:
             factory = VideoFactory(Workspace(Path(temp) / "workspace"))

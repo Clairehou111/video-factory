@@ -15,7 +15,8 @@ from video_factory.models import (
     GitHubProjectBrief, GitHubWalkthrough, MaterialRole, RenderManifest, Scene,
     SourceType, StoryBeat, TopicType,
 )
-from video_factory.mpt import MPTAssemblyAdapter, MPTSettings
+from video_factory.mpt import MPTAssemblyAdapter, MPTSettings, NativeFFmpegAssemblyAdapter
+from video_factory.compositor import resolve_font_path
 from video_factory.media import VideoProbe
 from video_factory.publish import PublicationState, PublishDraft, WeChatVideoAccountSelectors, WeChatVideoAccountUploader, prepare_publish_draft
 from video_factory.quality import is_publishable, validate_manifest
@@ -237,6 +238,69 @@ class QualityTest(unittest.TestCase):
             "[1:a]volume=0.05,atrim=duration=8.000,asetpts=N/SR/TB,"
             "afade=t=out:st=7.200:d=0.800[a]",
         )
+
+    def test_native_ffmpeg_master_skips_the_mpt_render_pipeline(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            native = root / "native.mp4"
+            music = root / "music.mp3"
+            output = root / "master.mp4"
+            native.write_bytes(b"video")
+            music.write_bytes(b"music")
+            manifest = RenderManifest(
+                "render-1", "candidate-1", ContentType.FLASH,
+                [Scene("s-1", 0, 8, "n", "c", ["e-1"], MaterialRole.PROOF, "show")],
+                [Evidence("e-1", "candidate-1", "https://example.com", "claim", "web")],
+                ["https://example.com"], fixed_footer="结论",
+            )
+            adapter = NativeFFmpegAssemblyAdapter(MPTSettings(root, root / "python", str(music)))
+            with patch("video_factory.mpt.probe_video", return_value=VideoProbe(
+                native, 8.0, 1080, 1920, "h264", "yuv420p", None,
+            )):
+                command = adapter.build_command(manifest, native, output)
+
+            self.assertEqual(command[0], "ffmpeg")
+            self.assertEqual(command[command.index("-i") + 1], str(native))
+            self.assertNotIn("cli.py", command)
+            self.assertIn(str(music), command)
+
+    def test_capture_uses_unpatched_runner_when_optional_patch_is_incompatible(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "capture.mp4"
+            request = WebCaptureRequest(
+                "https://example.com",
+                [CaptureCue(CueAction.WAIT, "hold", wait_ms=1000, shot_id="hold")],
+                output, root / "frames",
+            )
+            adapter = WebScrollVideoAdapter(WebScrollVideoSettings(root / "web-scroll-video"))
+
+            def create_capture(*_args, **_kwargs):
+                output.write_bytes(b"video")
+
+            with (
+                patch.object(adapter, "_write_padded_runner", side_effect=RuntimeError("patch marker changed")),
+                patch("video_factory.webcapture.subprocess.run", side_effect=create_capture) as run,
+            ):
+                adapter.capture(request)
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[1], str(root / "web-scroll-video/src/scroll-video.mjs"))
+            metadata = json.loads(output.with_suffix(".capture.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["runner_strategy"], "upstream_unpatched_runner")
+            self.assertTrue(metadata["fallback_used"])
+            repairs = json.loads(output.with_suffix(".capture-repairs.json").read_text(encoding="utf-8"))
+            self.assertEqual(repairs[0]["kind"], "runner_patch_incompatible")
+
+    def test_font_resolution_falls_back_after_invalid_local_configuration(self) -> None:
+        with TemporaryDirectory() as temp:
+            fallback = Path(temp) / "portable-font.ttc"
+            fallback.write_bytes(b"font")
+            with (
+                patch.dict("os.environ", {"VIDEO_FACTORY_FONT": str(Path(temp) / "missing.ttc")}),
+                patch("video_factory.compositor.FONT_CANDIDATES", (fallback,)),
+            ):
+                self.assertEqual(resolve_font_path(), fallback.resolve())
 
     def test_github_capture_does_not_translate_chinese_source_again(self) -> None:
         self.assertEqual(WebScrollVideoAdapter._adjacent_translation("输入主题即可生成视频", "输入主题即可生成视频"), "")

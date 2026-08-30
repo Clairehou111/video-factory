@@ -12,7 +12,17 @@ from .media import probe_video
 
 
 CANVAS = (1080, 1920)
-DEFAULT_FONT = "/Users/clairehou/pyProjects/MoneyPrinterTurbo/resource/fonts/STHeitiMedium.ttc"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FONT_CANDIDATES = (
+    PROJECT_ROOT / "assets/fonts/NotoSansCJK-Regular.ttc",
+    Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+    Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+    Path("C:/Windows/Fonts/msyh.ttc"),
+)
+DEFAULT_FONT = str(FONT_CANDIDATES[0])
 # WeChat overlays the device/status chrome at the top and the post title plus
 # action controls at the bottom.  These bands are intentionally content-free:
 # rails may paint their background through them, but no essential glyph or
@@ -31,11 +41,26 @@ GITHUB_COLD_OPEN_LAYOUTS = (
 )
 
 
+def resolve_font_path(font_path: Path | None = None) -> Path:
+    candidates: list[Path] = []
+    if font_path is not None:
+        candidates.append(font_path.expanduser())
+    configured = os.environ.get("VIDEO_FACTORY_FONT", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(FONT_CANDIDATES)
+    for candidate in dict.fromkeys(candidates):
+        if candidate.is_file():
+            return candidate.resolve()
+    searched = ", ".join(str(item) for item in candidates)
+    raise FileNotFoundError(
+        "no Chinese-capable TTF/TTC was found; set VIDEO_FACTORY_FONT or install one of: "
+        + searched
+    )
+
+
 def _font_path(font_path: Path | None = None) -> Path:
-    selected = font_path or Path(os.environ.get("VIDEO_FACTORY_FONT", DEFAULT_FONT))
-    if not selected.is_file():
-        raise FileNotFoundError(f"set VIDEO_FACTORY_FONT to a Chinese-capable TTF/TTC: {selected}")
-    return selected
+    return resolve_font_path(font_path)
 
 
 def _wrapped_lines(draw: object, text: str, font: object, width: int, max_lines: int) -> list[str]:

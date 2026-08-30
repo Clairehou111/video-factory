@@ -132,16 +132,41 @@ class WebScrollVideoAdapter:
         working = request
         repairs: list[dict[str, str]] = []
         highlight_boxes: dict[str, dict[str, int]] = {}
+        runner_strategy = "patched_runner"
+        fallback_reason = ""
+        prefer_upstream_runner = False
         for attempt in range(4):
             cue_path = self.write_cue(working)
             working.storyboard_dir.mkdir(parents=True, exist_ok=True)
-            runner_path = self._write_padded_runner(cue_path)
+            runner_path: Path | None = None
+            if not prefer_upstream_runner:
+                try:
+                    runner_path = self._write_padded_runner(cue_path)
+                except RuntimeError as error:
+                    prefer_upstream_runner = True
+                    runner_strategy = "upstream_unpatched_runner"
+                    fallback_reason = str(error)
+                    repairs.append({
+                        "kind": "runner_patch_incompatible",
+                        "error": str(error),
+                        "repair": "run the pinned upstream capture runner without optional visual patches",
+                    })
             try:
                 subprocess.run(
                     self.build_command(cue_path, working.storyboard_dir, runner_path), check=True,
                 )
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as error:
                 missing = self._missing_text_from_error(cue_path)
+                if not missing and not prefer_upstream_runner:
+                    prefer_upstream_runner = True
+                    runner_strategy = "upstream_unpatched_runner"
+                    fallback_reason = f"patched runner exited {error.returncode}"
+                    repairs.append({
+                        "kind": "patched_runner_failed",
+                        "error": fallback_reason,
+                        "repair": "retry once with the pinned upstream capture runner",
+                    })
+                    continue
                 if attempt >= 3 or not missing:
                     raise
                 repaired = self._repair_missing_text_request(working, missing)
@@ -174,7 +199,10 @@ class WebScrollVideoAdapter:
                 working = repaired
         else:
             raise RuntimeError("web-scroll-video exhausted deterministic capture repairs")
-        self._write_capture_metadata(working, highlight_boxes)
+        self._write_capture_metadata(
+            working, highlight_boxes, runner_strategy=runner_strategy,
+            fallback_reason=fallback_reason,
+        )
         if repairs:
             working.output.with_suffix(".capture-repairs.json").write_text(
                 json.dumps(repairs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
@@ -289,9 +317,17 @@ class WebScrollVideoAdapter:
     @classmethod
     def _write_capture_metadata(
         cls, request: WebCaptureRequest, highlight_boxes: dict[str, dict[str, int]] | None = None,
+        *, runner_strategy: str = "patched_runner", fallback_reason: str = "",
     ) -> Path:
         sidecar = request.output.with_suffix(".capture.json")
-        sidecar.write_text(json.dumps(cls.capture_metadata(request, highlight_boxes), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        metadata = cls.capture_metadata(request, highlight_boxes)
+        metadata["runner_strategy"] = runner_strategy
+        metadata["fallback_used"] = runner_strategy != "patched_runner"
+        if fallback_reason:
+            metadata["fallback_reason"] = fallback_reason
+        sidecar.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
         return sidecar
 
     @staticmethod

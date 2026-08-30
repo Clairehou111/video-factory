@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -22,7 +23,7 @@ from .github_editor import canonicalize_github_brief
 from .llm import LLMSettings, OpenAICompatibleStoryWriter
 from .media import probe_video, validate_wechat_mp4
 from .models import ContentType, CueAction, Evidence, EvidenceShotKind, Scene, TopicType
-from .mpt import MPTAssemblyAdapter, MPTSettings
+from .mpt import MPTAssemblyAdapter, MPTSettings, NativeFFmpegAssemblyAdapter
 from .multimodal import OpenRouterVisualAnalyst, find_high_value_visuals
 from .openrouter import ModelQuote, ModelRequirements, OpenRouterCatalog
 from .quality import is_publishable, validate_manifest
@@ -465,7 +466,7 @@ class VideoFactory:
         framed = job / "framed-visual.mp4"
         compose_information_frame(manifest, browser, framed)
         result["stages"].append({"name": "compose", "status": "ok", "video": str(framed)})
-        mastered = MPTAssemblyAdapter(MPTSettings.from_environment()).assemble(manifest, framed, job.name)
+        mastered = self._assemble_master(manifest, framed, job, result)
         final = job / "final.mp4"
         shutil.copy2(mastered, final)
         manifest.video_path = str(final.relative_to(self.workspace.root))
@@ -478,7 +479,6 @@ class VideoFactory:
             probe_video(final), max_duration=duration_limits[manifest.content_type], require_audio=True,
         )
         checks = validate_manifest(manifest, self.workspace.root)
-        result["stages"].append({"name": "mpt_master", "status": "ok", "video": str(final)})
         result["video"] = str(final)
         result["video_checks"] = video_checks
         result["checks"] = [check.to_dict() for check in checks]
@@ -864,7 +864,7 @@ class VideoFactory:
         framed = job / "framed-visual.mp4"
         compose_information_frame(manifest, browser, framed)
         result["stages"].append({"name": "compose", "status": "ok", "video": str(framed)})
-        mastered = MPTAssemblyAdapter(MPTSettings.from_environment()).assemble(manifest, framed, job.name)
+        mastered = self._assemble_master(manifest, framed, job, result)
         final = job / "final.mp4"
         shutil.copy2(mastered, final)
         manifest.video_path = str(final.relative_to(self.workspace.root))
@@ -875,11 +875,45 @@ class VideoFactory:
             require_audio=True,
         )
         checks = validate_manifest(manifest, self.workspace.root)
-        result["stages"].append({"name": "mpt_master", "status": "ok", "video": str(final)})
         result["video"] = str(final)
         result["video_checks"] = video_checks
         result["checks"] = [check.to_dict() for check in checks]
         result["publishable"] = is_publishable(checks) and all(item["passed"] for item in video_checks)
+
+    @staticmethod
+    def _assemble_master(
+        manifest, framed: Path, job: Path, result: dict[str, object],
+    ) -> Path:
+        settings = MPTSettings.from_environment()
+        native_output = job / "native-ffmpeg-master.mp4"
+        try:
+            mastered = NativeFFmpegAssemblyAdapter(settings).assemble(
+                manifest, framed, native_output,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            failure = {
+                "backend": "native_ffmpeg",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "fallback": "money_printer_turbo",
+            }
+            (job / "assembly-primary-error.json").write_text(
+                json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+            )
+            result["stages"].append({
+                "name": "media_master", "status": "fallback", **failure,
+            })
+            mastered = MPTAssemblyAdapter(settings).assemble(manifest, framed, job.name)
+            result["stages"].append({
+                "name": "media_master", "status": "ok", "backend": "money_printer_turbo",
+                "video": str(mastered), "fallback_for": "native_ffmpeg",
+            })
+            return mastered
+        result["stages"].append({
+            "name": "media_master", "status": "ok", "backend": "native_ffmpeg",
+            "video": str(mastered), "fallback_used": False,
+        })
+        return mastered
 
     @staticmethod
     def _apply_default_music_license(manifest) -> None:

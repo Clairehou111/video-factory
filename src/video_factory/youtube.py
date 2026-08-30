@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .llm import OpenAICompatibleStoryWriter
+from .compositor import resolve_font_path
 from .media import probe_audio_loudness, probe_video
 from .models import (
     Candidate, CollectionItem, CollectionItemKind, Evidence, FramingMode, PlatformRender,
@@ -2389,14 +2390,7 @@ def _write_subtitle_overlay_concat(
     height = 250 if profile == RenderProfile.BILIBILI_LANDSCAPE else 330
     english_size = 24 if profile == RenderProfile.BILIBILI_LANDSCAPE else 28
     chinese_size = 40 if profile == RenderProfile.BILIBILI_LANDSCAPE else 44
-    configured_font = Path(os.environ.get(
-        "VIDEO_FACTORY_FONT",
-        "/Users/clairehou/pyProjects/MoneyPrinterTurbo/resource/fonts/STHeitiMedium.ttc",
-    ))
-    if not configured_font.is_file():
-        configured_font = Path("/System/Library/Fonts/Hiragino Sans GB.ttc")
-    if not configured_font.is_file():
-        raise FileNotFoundError("set VIDEO_FACTORY_FONT to a Chinese-capable TTF/TTC")
+    configured_font = resolve_font_path()
     english_font = ImageFont.truetype(str(configured_font), english_size)
     chinese_font = ImageFont.truetype(str(configured_font), chinese_size)
     frame_dir = output.with_suffix(".subtitle-frames")
@@ -2535,12 +2529,7 @@ def _write_slide_translation_overlay_concat(
     width, height = (1920, 1080) if is_bilibili else (1080, 720)
     font_size = 34
     wrap_limit = 28 if is_bilibili else 20
-    configured_font = Path(os.environ.get(
-        "VIDEO_FACTORY_FONT",
-        "/Users/clairehou/pyProjects/MoneyPrinterTurbo/resource/fonts/STHeitiMedium.ttc",
-    ))
-    if not configured_font.is_file():
-        configured_font = Path("/System/Library/Fonts/Hiragino Sans GB.ttc")
+    configured_font = resolve_font_path()
     font = ImageFont.truetype(str(configured_font), font_size)
     frame_dir = output.with_suffix(".slide-translation-frames")
     frame_dir.mkdir(parents=True, exist_ok=True)
@@ -2630,12 +2619,7 @@ def _write_hook_overlay_concat(
     is_bilibili = profile == RenderProfile.BILIBILI_LANDSCAPE
     identity_style = bool(hook.speaker_label.strip()) and not is_bilibili
     width, height = (1920, 240) if is_bilibili else (1080, 300 if identity_style else 250)
-    configured_font = Path(os.environ.get(
-        "VIDEO_FACTORY_FONT",
-        "/Users/clairehou/pyProjects/MoneyPrinterTurbo/resource/fonts/STHeitiMedium.ttc",
-    ))
-    if not configured_font.is_file():
-        configured_font = Path("/System/Library/Fonts/Hiragino Sans GB.ttc")
+    configured_font = resolve_font_path()
     hero_font = ImageFont.truetype(str(configured_font), 66 if is_bilibili else 58)
     compact_font = ImageFont.truetype(str(configured_font), 32)
     identity_font = ImageFont.truetype(str(configured_font), 42)

@@ -139,3 +139,53 @@ class MPTAssemblyAdapter:
         if source.resolve() != destination.resolve():
             shutil.copy2(source, destination)
         return str(destination.resolve())
+
+
+class NativeFFmpegAssemblyAdapter:
+    """Master the native visual directly; MPT remains an emergency fallback only."""
+
+    def __init__(self, settings: MPTSettings):
+        self.settings = settings
+
+    def build_command(
+        self, manifest: RenderManifest, native_track: Path, output: Path,
+        bgm_file: str | None = None,
+    ) -> list[str]:
+        if native_track.suffix.lower() != ".mp4":
+            raise ValueError("native assembly input must be an MP4")
+        if not manifest.fixed_footer or manifest.footer_shows_source_url:
+            raise ValueError("native assembly requires a fixed conclusion footer and no source URL in the picture")
+        if not all(scene.end > scene.start for scene in manifest.scenes):
+            raise ValueError("all scenes need valid timing before assembly")
+        music = Path(bgm_file or self.settings.bgm_file).expanduser()
+        if not music.is_absolute():
+            music = music.resolve()
+        if not music.is_file():
+            raise FileNotFoundError(f"native assembly BGM does not exist: {music}")
+        duration = probe_video(native_track).duration
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return [
+            "ffmpeg", "-y", "-i", str(native_track),
+            "-stream_loop", "-1", "-i", str(music),
+            "-filter_complex", self._master_audio_filter(duration),
+            "-map", "0:v:0", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-shortest", str(output),
+        ]
+
+    def assemble(
+        self, manifest: RenderManifest, native_track: Path, output: Path,
+        bgm_file: str | None = None,
+    ) -> Path:
+        command = self.build_command(manifest, native_track, output, bgm_file)
+        subprocess.run(command, check=True)
+        if not output.is_file():
+            raise RuntimeError(f"FFmpeg reported success but did not produce {output}")
+        return output
+
+    def _master_audio_filter(self, duration: float) -> str:
+        fade = min(self.settings.audio_fade_seconds, max(duration / 2, 0.1))
+        start = max(duration - fade, 0.0)
+        return (
+            f"[1:a]volume=0.05,atrim=duration={duration:.3f},asetpts=N/SR/TB,"
+            f"afade=t=out:st={start:.3f}:d={fade:.3f}[a]"
+        )

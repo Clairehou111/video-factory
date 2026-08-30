@@ -247,5 +247,40 @@
     "tests": [
       "tests/test_publish_batch.py::PublishBatchTest::test_publisher_policy_patch_requires_verified_wechat_original_declaration"
     ]
+  },
+  {
+    "id": "VF-20260830-022",
+    "title": "Normal video mastering ran a redundant MoneyPrinterTurbo render before FFmpeg",
+    "stage": "assembly",
+    "reproduction": "Render an editorial or GitHub video and inspect the mastering path after the native visual track is complete.",
+    "impact": "Every job paid for an unnecessary external Python render and inherited its task-directory, placeholder-timing, and subprocess failure modes even though FFmpeg rebuilt the final output from the original native visual.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_native_ffmpeg_master_skips_the_mpt_render_pipeline",
+      "tests/test_factory.py::VideoFactoryTest::test_native_media_master_is_primary_and_does_not_invoke_mpt",
+      "tests/test_factory.py::VideoFactoryTest::test_media_master_records_native_failure_before_mpt_fallback"
+    ]
+  },
+  {
+    "id": "VF-20260830-023",
+    "title": "Capture stopped when optional web-scroll-video patch markers changed",
+    "stage": "browser_capture",
+    "reproduction": "Format or upgrade the pinned web-scroll-video runner so one exact source marker used by the padded-runner patch no longer matches.",
+    "impact": "A cosmetic integration patch became a single point of failure and required Codex to repair the dependency adapter before any video could be produced.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_capture_uses_unpatched_runner_when_optional_patch_is_incompatible"
+    ]
+  },
+  {
+    "id": "VF-20260830-024",
+    "title": "Default Chinese font resolved to one developer's MoneyPrinterTurbo checkout",
+    "stage": "composition",
+    "reproduction": "Run composition outside /Users/clairehou/pyProjects without setting VIDEO_FACTORY_FONT.",
+    "impact": "Rendering failed on otherwise valid macOS, Linux, Windows, CI, or container installations even when a Chinese-capable system font was available.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_font_resolution_falls_back_after_invalid_local_configuration"
+    ]
   }
 ]
