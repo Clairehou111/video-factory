@@ -349,7 +349,7 @@
     "impact": "The badge overlapped the page headline and price proof, reducing readability while trying to add navigation metadata.",
     "status": "fixed",
     "tests": [
-      "tests/test_radar.py::RadarV2Test::test_identifier_and_category_stay_in_reserved_metadata_rail"
+      "tests/test_radar.py::RadarV2Test::test_identifier_and_date_stay_in_reserved_metadata_rail_without_pills"
     ]
   },
   {
@@ -371,7 +371,7 @@
     "impact": "The compositor still reserved 88 pixels and drew a link-only badge, adding noise while shrinking the real evidence pane.",
     "status": "fixed",
     "tests": [
-      "tests/test_radar.py::RadarV2Test::test_story_without_identifier_or_fact_label_gets_no_empty_metadata_rail"
+      "tests/test_radar.py::RadarV2Test::test_flash_story_uses_source_date_instead_of_category_label"
     ]
   },
   {
@@ -731,6 +731,87 @@
     "status": "fixed",
     "tests": [
       "tests/test_factory.py::VideoFactoryTest::test_ui_rerender_load_freezes_approved_editorial_copy"
+    ]
+  },
+  {
+    "id": "VF-20260831-065",
+    "title": "Person-first hook assumed a technical figure was already famous",
+    "stage": "content_agent",
+    "reproduction": "Lead a Jeff Dean departure story with 'Jeff Dean announced' even though Google is the more recognizable audience anchor.",
+    "impact": "The hook read like a neutral bulletin and gave mainland viewers no immediate reason to care.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_people_change_requires_an_early_identity_anchor_for_unfamiliar_viewers",
+      "tests/test_editorial.py::EditorialContractTests::test_people_change_hook_cannot_pivot_to_secondary_product_capability"
+    ]
+  },
+  {
+    "id": "VF-20260831-066",
+    "title": "Discount video treated low price as sufficient production guidance",
+    "stage": "content_agent",
+    "reproduction": "Describe a 90% OpenRouter discount without the model workload or route-specific uptime and response-time question.",
+    "impact": "Developers learned the price but not whether the route fit their work or could safely serve production traffic.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_openrouter_discount_story_requires_use_case_and_service_quality_question"
+    ]
+  },
+  {
+    "id": "VF-20260831-067",
+    "title": "Company conflict was diluted into a sequence of personal replies",
+    "stage": "content_agent",
+    "reproduction": "Tell the Sam/Tibo/Boris thread without naming OpenAI and Anthropic in the hook.",
+    "impact": "The strongest reason to stop scrolling—the public tension between two AI vendors—disappeared.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_company_competition_reply_chain_hook_names_both_sides"
+    ]
+  },
+  {
+    "id": "VF-20260831-068",
+    "title": "Original-post Chinese translation was unreadably small on mobile",
+    "stage": "render",
+    "reproduction": "Render a root X-card translation at 21–27px on a 1384px intermediate card and then scale it down into a 1080px WeChat frame.",
+    "impact": "The most important Chinese explanation was technically present but not comfortably readable on a phone.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_chinese_source_translation_uses_mobile_readable_type_size"
+    ]
+  },
+  {
+    "id": "VF-20260831-069",
+    "title": "A fixed 40-character screen budget removed useful context instead of adding reading time",
+    "stage": "editorial_timing",
+    "reproduction": "Apply the same 40-equivalent limit to every two-to-four-second evidence shot regardless of typography and duration.",
+    "impact": "The system produced sparse but shallow cards while other readable videos kept larger type and simply held denser screens longer.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_keeps_large_type_and_extends_duration_for_denser_evidence_copy"
+    ]
+  },
+  {
+    "id": "VF-20260831-070",
+    "title": "Category pills displaced useful date context in time-sensitive flash videos",
+    "stage": "render",
+    "reproduction": "Render a current X/news Flash with a large generic category capsule and a second link-hint capsule in the metadata rail.",
+    "impact": "The interface looked templated while viewers could not see when the news happened.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_identifier_and_date_stay_in_reserved_metadata_rail_without_pills",
+      "tests/test_radar.py::RadarV2Test::test_flash_story_uses_source_date_instead_of_category_label",
+      "tests/test_radar.py::RadarV2Test::test_publish_copy_uses_optional_factual_label_and_source_identifier"
+    ]
+  },
+  {
+    "id": "VF-20260831-071",
+    "title": "A concrete earlier Google departure was rewritten as an abstract talent-war summary",
+    "stage": "context_direction",
+    "reproduction": "Use the Axios headline 'Google takes the hit in AI's talent war' as a visible pattern beat without opening the sourced event details.",
+    "impact": "Viewers heard that Google was under pressure but never learned who left, where they went, or why the current four-person startup was part of a sequence.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_context_research.py::ContextResearchTests::test_people_move_adds_prior_incumbent_query_and_rejects_same_day_headlines",
+      "tests/test_editorial.py::EditorialContractTests::test_people_change_pattern_context_requires_a_concrete_move"
     ]
   }
 ]

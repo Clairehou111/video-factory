@@ -4,6 +4,7 @@ import json
 import re
 from difflib import SequenceMatcher
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from .director import SceneProposal
 from .github_editor import copy_width
@@ -155,6 +156,11 @@ def _looks_like_radar_fragment(value: str) -> bool:
     return bool(re.search(r"(?:模|直接|每秒|从|至|为|在|与|和|或|的|把|将|到|让|用)$", compact))
 
 
+def _radar_shot_copy_budget(duration: float) -> float:
+    """Allow more evidence copy only when the shot earns more reading time."""
+    return min(64.0, max(40.0, 24.0 + max(0.0, duration) * 10.0))
+
+
 def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
     strategy = brief.attention_strategy
     if brief.opening_mode not in RADAR_OPENING_MODES:
@@ -203,17 +209,28 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
             "takeaway" if index == len(brief.evidence_shots) - 1 else
             "proof"
         )
+        raw_gloss = (shot.full_translation or shot.translation).strip()
+        raw_visible_width = max(
+            copy_width(shot.fact + shot.audience_copy),
+            copy_width(raw_gloss) if not (index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD) else 0,
+        )
+        desired_budget = min(64.0, max(40.0, raw_visible_width))
+        if desired_budget > 40:
+            shot.duration = max(shot.duration, (desired_budget - 24.0) / 10.0)
+        if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD and raw_gloss:
+            shot.duration = max(shot.duration, min(5.0, 2.4 + copy_width(raw_gloss) / 40.0))
+        screen_budget = _radar_shot_copy_budget(shot.duration)
         audience_is_glossary = is_audience_glossary_definition(shot.audience_copy)
         if audience_is_glossary and copy_width(shot.audience_copy) <= 32:
             # The one plain-language definition is more valuable than a
             # repeated long fact line. Reserve its full wording, then compact
             # the evidence headline into the remaining screen budget.
             audience_width = copy_width(shot.audience_copy)
-            shot.fact = _clip_radar_copy(shot.fact, max(8.0, 40 - audience_width))
+            shot.fact = _clip_radar_copy(shot.fact, max(8.0, screen_budget - audience_width))
             shot.audience_copy = re.sub(r"\s+", " ", shot.audience_copy).strip()
         else:
-            shot.fact = _clip_radar_copy(shot.fact, 40)
-            remaining = max(0.0, 40 - copy_width(shot.fact))
+            shot.fact = _clip_radar_copy(shot.fact, screen_budget)
+            remaining = max(0.0, screen_budget - copy_width(shot.fact))
             audience = re.sub(r"\s+", " ", shot.audience_copy).strip()
             shot.audience_copy = (
                 audience
@@ -224,10 +241,14 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
         if shot.full_translation:
             shot.full_translation = _clip_radar_copy(
                 shot.full_translation,
-                120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else 40,
+                120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else screen_budget,
             )
         if shot.translation:
-            shot.translation = _clip_radar_copy(shot.translation, 40)
+            shot.translation = _clip_radar_copy(shot.translation, screen_budget)
+
+    scheduled_duration = sum(shot.duration for shot in brief.evidence_shots)
+    if scheduled_duration <= 15:
+        brief.duration_target = max(brief.duration_target, scheduled_duration)
 
     if brief.director_brief and brief.context_graph:
         required = set(brief.context_graph.required_context_ids)
@@ -749,16 +770,24 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
             brief.evidence_shots[0].duration = 5.0
         return
 
-    # Timing is an execution parameter. Preserve enough time for the complete
-    # first X card, then distribute the remaining flash budget evenly.
-    count = len(brief.evidence_shots)
-    first_is_tweet = brief.evidence_shots[0].kind == EvidenceShotKind.TWEET_CARD
-    first_duration = min(3.2 if first_is_tweet else 2.8, max(1.3, brief.duration_target - 1.3 * (count - 1)))
-    remaining_duration = (brief.duration_target - first_duration) / max(1, count - 1)
-    later_duration = min(2.8, max(1.3, remaining_duration))
-    brief.evidence_shots[0].duration = round(first_duration, 3)
-    for shot in brief.evidence_shots[1:]:
-        shot.duration = round(later_duration, 3)
+    # Timing is an execution parameter, but a dense readable screen has
+    # already earned extra hold time during Radar canonicalization. Preserve
+    # those per-shot durations instead of flattening every flash back to an
+    # even 2.8-second cadence. If a weak model overschedules the target, shrink
+    # only the room above the 1.3-second readability floor proportionally.
+    desired = [min(5.0, max(1.3, shot.duration)) for shot in brief.evidence_shots]
+    desired_total = sum(desired)
+    if desired_total > brief.duration_target:
+        floor = 1.3
+        reducible = sum(max(0.0, duration - floor) for duration in desired)
+        excess = desired_total - brief.duration_target
+        if reducible > 0:
+            desired = [
+                duration - excess * max(0.0, duration - floor) / reducible
+                for duration in desired
+            ]
+    for shot, duration in zip(brief.evidence_shots, desired, strict=True):
+        shot.duration = round(max(1.3, duration), 3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -917,10 +946,15 @@ def _validate_radar_contract(brief: EditorialBrief, evidence: list[Evidence]) ->
         errors.append("Radar fixed_conclusion must fit the 40-equivalent screen budget")
     for index, shot in enumerate(brief.evidence_shots):
         compact_copy = "".join(filter(None, (shot.fact.strip(), shot.audience_copy.strip())))
-        if copy_width(compact_copy) > 40:
-            errors.append(f"Radar shot {shot.id} fact plus audience_copy exceeds 40 equivalents")
+        screen_budget = _radar_shot_copy_budget(shot.duration)
+        if copy_width(compact_copy) > screen_budget:
+            errors.append(
+                f"Radar shot {shot.id} fact plus audience_copy exceeds its {screen_budget:.0f}-equivalent time budget"
+            )
         gloss = (shot.full_translation or shot.translation).strip()
-        gloss_limit = 120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else 40
+        gloss_limit = (
+            120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else screen_budget
+        )
         if gloss and copy_width(gloss) > gloss_limit:
             errors.append(
                 f"Radar shot {shot.id} Chinese gloss must fit at most {gloss_limit} equivalents"
@@ -1029,6 +1063,21 @@ def validate_editorial_brief(
         errors.append("Google departure/exit hook is not supported by hook_evidence_ids")
     if re.search(r"持续|接连|集体流失|一波离职|人才外流", hook_claims) and len(brief.context_events) < 2:
         errors.append("trend language needs at least two dated context_events")
+    if brief.opportunity and brief.opportunity.story_archetype == "people_change" and brief.context_graph:
+        pattern_ids = set(brief.context_graph.pattern_context_ids)
+        for shot in brief.evidence_shots:
+            if not pattern_ids.intersection(shot.context_event_ids):
+                continue
+            visible_context = " ".join((shot.fact, shot.audience_copy, shot.translation))
+            if not re.search(
+                r"\b(?:leave|leaves|leaving|left|join|joins|joined|depart|departed|"
+                r"founded|launch(?:ed)?)\b|离开|离职|转投|加入|创办|创业",
+                visible_context, re.IGNORECASE,
+            ):
+                errors.append(
+                    "people-change pattern context must show a concrete departure, destination, or founding action"
+                )
+                break
     if re.search(r"股价|市值|蒸发|上涨|下跌", hook_claims) and not re.search(
         r"stock|share price|market cap|市值|股价|上涨|下跌", hook_source, re.IGNORECASE,
     ):
@@ -1101,6 +1150,25 @@ def validate_editorial_brief(
         if not keeps_people_axis(visible_hook):
             errors.append(
                 "people-change hook abandoned the primary person/team move for a secondary story"
+            )
+        axis_source = "\n".join([
+            brief.opportunity.event_claim,
+            *(reason.rationale for reason in brief.opportunity.selection_reasons),
+            *(subject.action + " " + subject.consequence for subject in brief.subjects),
+        ])
+        recognizable_incumbents = [
+            name for name in (
+                "Google", "OpenAI", "Anthropic", "Meta", "Microsoft", "Apple",
+                "Amazon", "NVIDIA", "字节跳动", "阿里", "腾讯", "百度", "华为",
+            )
+            if re.search(re.escape(name), axis_source, re.IGNORECASE)
+        ]
+        if recognizable_incumbents and not any(
+            re.search(re.escape(name), visible_hook, re.IGNORECASE)
+            for name in recognizable_incumbents
+        ):
+            errors.append(
+                "people-change hook must lead with the recognizable incumbent and its stake before relying on a lesser-known person"
             )
         if not keeps_people_axis(brief.fixed_conclusion):
             errors.append(
@@ -1491,6 +1559,50 @@ def _validate_story_axis_structure(brief: EditorialBrief, candidate: Candidate) 
             and primary_reason.id not in brief.evidence_shots[-1].selection_reason_ids
         ):
             errors.append("people-change final payoff must return to the primary selection reason")
+        early_identity_copy = "\n".join(
+            " ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+            for shot in brief.evidence_shots[:3]
+        )
+        role_anchor = re.search(
+            r"首席|负责人|研究员|工程师|科学家|创始人|联合创始|CEO|CTO|院士|"
+            r"chief|head|scientist|engineer|founder|fellow",
+            early_identity_copy, re.IGNORECASE,
+        )
+        work_anchor = re.search(
+            r"代表作|主导|打造|设计|开发|创建|创立|发明|提出|参与|负责|"
+            r"co-design|co-creat|built|created|designed|developed|led",
+            early_identity_copy, re.IGNORECASE,
+        )
+        if not (role_anchor and work_anchor):
+            errors.append(
+                "people-change story must establish the main person's role and recognizable work in an early identity-anchor beat"
+            )
+
+    parsed = urlparse(candidate.source_url)
+    is_openrouter_discount = (
+        (parsed.hostname or "").casefold() == "openrouter.ai"
+        and parsed.path.rstrip("/").casefold() == "/models"
+        and "discount=true" in parsed.query.casefold()
+    )
+    if is_openrouter_discount:
+        visible_price_copy = "\n".join([
+            visible_hook, brief.fixed_conclusion,
+            *(" ".join((shot.fact, shot.audience_copy, shot.translation, shot.full_translation))
+              for shot in brief.evidence_shots),
+        ])
+        if not re.search(r"适合|面向|用于|工作流|长任务|批处理|实时|agent", visible_price_copy, re.IGNORECASE):
+            errors.append("OpenRouter discount story must state a concrete workload or use case")
+        if not re.search(
+            r"稳定|可靠|uptime|延迟|TTFT|响应时间|吞吐|throughput",
+            visible_price_copy, re.IGNORECASE,
+        ):
+            errors.append(
+                "OpenRouter discount story must address route stability and response performance"
+            )
+        if not re.search(r"[？?]|是否|核对|先看|需看|检查", visible_price_copy):
+            errors.append(
+                "OpenRouter route without cited current performance metrics must ask the stability/RT question and give a verification action"
+            )
 
     reply_subjects = [
         subject for subject in brief.subjects
@@ -1509,6 +1621,32 @@ def _validate_story_axis_structure(brief: EditorialBrief, candidate: Candidate) 
     )
     if not is_multi_party_chain:
         return errors
+    competition_reason = bool(
+        brief.opportunity and any(
+            reason.dimension == "competition" for reason in brief.opportunity.selection_reasons
+        )
+    )
+    if competition_reason:
+        source_copy = "\n".join([
+            *(subject.name + " " + subject.action for subject in brief.subjects),
+            brief.opportunity.event_claim if brief.opportunity else "",
+            *(reason.rationale for reason in (brief.opportunity.selection_reasons if brief.opportunity else [])),
+        ])
+        known_companies = [
+            name for name in (
+                "OpenAI", "Anthropic", "Google", "DeepMind", "Meta", "Microsoft",
+                "Apple", "Amazon", "NVIDIA", "字节跳动", "阿里", "腾讯", "百度", "华为",
+            )
+            if re.search(re.escape(name), source_copy, re.IGNORECASE)
+        ]
+        hook_companies = [
+            name for name in known_companies
+            if re.search(re.escape(name), visible_hook, re.IGNORECASE)
+        ]
+        if len(known_companies) >= 2 and len(hook_companies) < 2:
+            errors.append(
+                "company-competition reply-chain hook must name both evidenced companies"
+            )
     if len(brief.evidence_shots) < 4:
         errors.append(
             "multi-party reply chain needs at least four shots so the intervening response remains visible"

@@ -10,7 +10,8 @@ from video_factory.factory import VideoFactory
 from video_factory.llm import EditorialPlan, OpenAICompatibleStoryWriter
 from video_factory.models import Candidate, ContentType, Evidence, SourceType, TopicType
 from video_factory.research import (
-    _archive_same_author_setup, _archive_visual_actor_context, _incumbent_history_query, _is_prior_distinct_event,
+    _archive_same_author_setup, _archive_visual_actor_context, _context_headline_specificity_score, _identity_anchor_query,
+    _identity_context_matches_subject, _incumbent_history_query, _is_prior_distinct_event,
     _reported_context_matches_root,
 )
 from video_factory.storage import Workspace
@@ -123,6 +124,7 @@ class ContextResearchTests(unittest.TestCase):
             base = self._packet(workspace)
             base.evidence[0].notes = "Author bio: Co-founder. Former Chief Scientist, Google."
             base.evidence[0].metadata["published_at"] = "Wed Aug 05 16:06:02 +0000 2026"
+            base.evidence[0].metadata["author_name"] = "Jeff Dean"
             base.candidate.author = "JeffDean"
             packet = StoryWriterPacket(
                 base.candidate, base.evidence, TopicType.COMPANY_OR_TEAM, ContentType.FLASH, 12,
@@ -132,8 +134,13 @@ class ContextResearchTests(unittest.TestCase):
                 story_archetype="people_change",
             )
             query = _incumbent_history_query(packet, plan)
+            identity_query = _identity_anchor_query(packet, plan)
             self.assertIn("Google", query or "")
             self.assertIn("Jeff Dean", query or "")
+            self.assertIn("Jeff Dean", identity_query or "")
+            self.assertTrue(_identity_context_matches_subject(
+                "JeffDean", "Jeff Dean built MapReduce and TensorFlow",
+            ))
             self.assertFalse(_is_prior_distinct_event(
                 packet.candidate, packet.evidence, "Four Google researchers launch a startup",
                 "Wed, 05 Aug 2026 07:00:00 GMT",
@@ -142,6 +149,14 @@ class ContextResearchTests(unittest.TestCase):
                 packet.candidate, packet.evidence, "Another Google AI leader left for a new lab",
                 "Mon, 20 Jul 2026 07:00:00 GMT",
             ))
+            self.assertGreater(
+                _context_headline_specificity_score(
+                    "John Jumper leaves Google DeepMind for Anthropic"
+                ),
+                _context_headline_specificity_score(
+                    "Google takes the hit in AI's talent war"
+                ),
+            )
 
     def test_context_graph_separates_setup_pattern_and_duplicate_confirmation(self) -> None:
         with TemporaryDirectory() as temp:
@@ -155,6 +170,11 @@ class ContextResearchTests(unittest.TestCase):
             history = Evidence(
                 "history", packet.candidate.id, "https://example.com/history", "Earlier incumbent move",
                 "web:reported_context", metadata={"context_role": "incumbent_history"},
+            )
+            identity = Evidence(
+                "identity", packet.candidate.id, "https://example.com/identity",
+                "Jeff Dean co-designed MapReduce, Bigtable, Spanner and TensorFlow",
+                "web:reported_context", metadata={"context_role": "identity_anchor"},
             )
             one = Evidence(
                 "confirm-1", packet.candidate.id, "https://example.com/one", "Current event confirmed",
@@ -180,10 +200,11 @@ class ContextResearchTests(unittest.TestCase):
                 story_archetype="people_change",
             )
             people_graph = _context_graph_from_evidence(
-                people_plan, [*packet.evidence, history],
+                people_plan, [*packet.evidence, history, identity],
             )
             people_ids = {event.evidence_ids[0]: event.id for event in people_graph.events}
             self.assertIn(people_ids["history"], people_graph.pattern_context_ids)
+            self.assertIn(people_ids["identity"], people_graph.required_context_ids)
 
             technical_plan = EditorialPlan(
                 "architecture analysis", "developers", ["root"], [], [], True,

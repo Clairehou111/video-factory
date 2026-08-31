@@ -16,7 +16,8 @@ from video_factory.compositor import (
     render_spotlight_overlay,
 )
 from video_factory.editorial import (
-    _validate_radar_contract, canonicalize_editorial_brief, validate_editorial_structure,
+    _radar_shot_copy_budget, _validate_radar_contract, canonicalize_editorial_brief,
+    validate_editorial_structure,
 )
 from video_factory.github_editor import copy_width
 from video_factory.models import (
@@ -122,9 +123,12 @@ class RadarV2Test(unittest.TestCase):
         self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 28)
         self.assertLessEqual(copy_width(brief.fixed_conclusion), 40)
 
+        first = brief.evidence_shots[0]
         self.assertLessEqual(
-            copy_width(brief.evidence_shots[0].fact + brief.evidence_shots[0].audience_copy), 40,
+            copy_width(first.fact + first.audience_copy),
+            _radar_shot_copy_budget(first.duration),
         )
+        self.assertLessEqual(_radar_shot_copy_budget(first.duration), 64)
         self.assertLessEqual(copy_width(brief.evidence_shots[0].full_translation), 120)
         self.assertFalse(any(
             "Chinese gloss" in error for error in _validate_radar_contract(
@@ -172,9 +176,10 @@ class RadarV2Test(unittest.TestCase):
         canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
 
         self.assertIn("拒绝回答", brief.evidence_shots[0].audience_copy)
+        first = brief.evidence_shots[0]
         self.assertLessEqual(
-            copy_width(brief.evidence_shots[0].fact + brief.evidence_shots[0].audience_copy),
-            40,
+            copy_width(first.fact + first.audience_copy),
+            _radar_shot_copy_budget(first.duration),
         )
 
         fp8_brief = _brief()
@@ -191,11 +196,10 @@ class RadarV2Test(unittest.TestCase):
         fp8_brief.attention_strategy.selected_hook = fp8_brief.attention_strategy.hook_candidates[0]
         canonicalize_editorial_brief(fp8_brief, [_manifest().evidence[0]])
         self.assertIn("低数值精度", fp8_brief.evidence_shots[0].audience_copy)
+        first = fp8_brief.evidence_shots[0]
         self.assertLessEqual(
-            copy_width(
-                fp8_brief.evidence_shots[0].fact + fp8_brief.evidence_shots[0].audience_copy
-            ),
-            40,
+            copy_width(first.fact + first.audience_copy),
+            _radar_shot_copy_budget(first.duration),
         )
 
     def test_radar_drops_optional_second_line_instead_of_showing_a_fragment(self) -> None:
@@ -216,7 +220,11 @@ class RadarV2Test(unittest.TestCase):
 
         canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
 
-        self.assertEqual(brief.evidence_shots[0].audience_copy, "")
+        self.assertEqual(
+            brief.evidence_shots[0].audience_copy,
+            "OpenRouter 模型库可直接筛选折扣线路",
+        )
+        self.assertGreater(brief.evidence_shots[0].duration, 2.0)
 
         for fragment in ("OpenRouter 模", "调用单价降至每秒", "视频生成模型直接"):
             with self.subTest(fragment=fragment):
@@ -266,6 +274,20 @@ class RadarV2Test(unittest.TestCase):
             brief.evidence_shots[0].audience_copy,
             "harness：模型的测试与运行框架。",
         )
+
+    def test_radar_keeps_large_type_and_extends_duration_for_denser_evidence_copy(self) -> None:
+        brief = _brief()
+        shot = brief.evidence_shots[1]
+        shot.duration = 2.0
+        shot.fact = "OpenRouter一折线路用于长任务与Agent工作流，上生产前需核对稳定性、TTFT、吞吐表现，压测后再接入生产"
+        original_width = copy_width(shot.fact)
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertGreater(original_width, 40)
+        self.assertGreater(shot.duration, 2.0)
+        self.assertGreater(copy_width(shot.fact), 40)
+        self.assertLessEqual(copy_width(shot.fact), 64)
 
     def test_radar_model_hook_accepts_evidence_preserving_artifact_base_name(self) -> None:
         brief = _brief()
@@ -338,7 +360,11 @@ class RadarV2Test(unittest.TestCase):
         brief.evidence_shots[0].kind = EvidenceShotKind.BROWSER_SECTION
         brief.evidence_shots[0].full_translation = "折扣页当前展示多个模型与供应商价格变化" * 10
         canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
-        self.assertLessEqual(copy_width(brief.evidence_shots[0].full_translation), 40)
+        first = brief.evidence_shots[0]
+        self.assertLessEqual(
+            copy_width(first.full_translation), _radar_shot_copy_budget(first.duration),
+        )
+        self.assertGreater(first.duration, 2.0)
         self.assertFalse(any(
             "Chinese gloss" in error for error in _validate_radar_contract(
                 brief, [_manifest().evidence[0]],
@@ -392,26 +418,27 @@ class RadarV2Test(unittest.TestCase):
         ))
         self.assertFalse(_dense_evidence({"id": "hero", "action": "hold"}, (1080, 1200)))
 
-    def test_identifier_and_category_stay_in_reserved_metadata_rail(self) -> None:
+    def test_identifier_and_date_stay_in_reserved_metadata_rail_without_pills(self) -> None:
         with TemporaryDirectory() as temp:
             output = Path(temp) / "badge.png"
             pane_top = 500
             render_direct_identifier_badge(
                 "Model: deepseek/deepseek-v4-flash-0731",
-                pane_top - RADAR_META_RAIL, output, category_label="价格变化",
+                pane_top - RADAR_META_RAIL, output, date_label="08-05 快报",
             )
             with Image.open(output) as image:
                 alpha = image.getchannel("A")
                 self.assertIsNone(alpha.crop((0, pane_top + 1, 1080, 1920)).getbbox())
 
-    def test_story_without_identifier_or_fact_label_gets_no_empty_metadata_rail(self) -> None:
+    def test_flash_story_uses_source_date_instead_of_category_label(self) -> None:
         manifest = _manifest(InformationRenderProfile.RADAR_V2.value)
         manifest.editorial_brief.direct_identifier = ""
         manifest.editorial_brief.category_label = ""
         manifest.source_urls = ["https://x.com/example/status/1"]
         manifest.evidence[0].url = manifest.source_urls[0]
         manifest.evidence[0].quote = "Jeff Dean announced a new research organization."
-        self.assertEqual(_radar_metadata(manifest), ("", ""))
+        manifest.evidence[0].metadata["published_at"] = "Wed Aug 05 16:06:02 +0000 2026"
+        self.assertEqual(_radar_metadata(manifest), ("", "08-05 快报"))
 
     def test_static_card_motion_is_opt_in_for_radar(self) -> None:
         with TemporaryDirectory() as temp:
@@ -469,7 +496,7 @@ class RadarV2Test(unittest.TestCase):
             manifest, fallback_title="fallback", publisher="OrcaRouter",
             source_url=manifest.source_urls[0],
         )
-        self.assertTrue(title.startswith("【模型发布】"))
+        self.assertFalse(title.startswith("【"))
         self.assertIn("HF: OrcaRouter/GLM-5.3-Flash", description)
         self.assertIn(manifest.source_urls[0], description)
         self.assertEqual(extract_direct_identifier(manifest), "HF: OrcaRouter/GLM-5.3-Flash")

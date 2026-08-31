@@ -9,6 +9,14 @@ from .editorial import is_audience_glossary_definition
 from .models import Candidate, Evidence, Scene
 
 
+# These cards are rendered at 1384px then scaled into a 1080px phone frame.
+# A 27px source-card translation became roughly 21px in the final video and
+# was unreadable in WeChat. Keep Chinese evidence copy at mobile subtitle size.
+TWEET_TRANSLATION_FONT_MIN = 46
+TWEET_TRANSLATION_FONT_MAX = 52
+EDITORIAL_TRANSLATION_FONT_SIZE = 46
+
+
 def _contextual_excerpt(source: str, target: str, limit: int = 340) -> str:
     """Return source-owned sentence context around an exact target."""
     compact = re.sub(r"\s+", " ", source).strip()
@@ -82,13 +90,13 @@ def render_tweet_card(
     translation_height = 0
     if translation:
         compact_translation = translation.replace("\n", "").replace(" ", "")
-        for size_px in range(27, 20, -1):
+        for size_px in range(TWEET_TRANSLATION_FONT_MAX, TWEET_TRANSLATION_FONT_MIN - 1, -2):
             candidate_font = ImageFont.truetype(font_file, size_px)
             candidate_lines = _wrapped_lines(draw, translation, candidate_font, width - 270, 8)
             if "".join(candidate_lines).replace(" ", "") == compact_translation:
                 translation_font = candidate_font
                 translation_lines = candidate_lines
-                translation_height = max(94, 28 + len(candidate_lines) * (size_px + 11))
+                translation_height = max(120, 34 + len(candidate_lines) * (size_px + 14))
                 break
         if translation_font is None:
             raise ValueError("adjacent Chinese translation does not fit the complete X card")
@@ -148,9 +156,9 @@ def render_tweet_card(
             (90, meta_top, width - 90, meta_top + translation_height), radius=22,
             fill="#eaf2ff", outline="#f0c419", width=3,
         )
-        translation_line_height = translation_font.size + 11
+        translation_line_height = translation_font.size + 14
         for index, line in enumerate(translation_lines):
-            draw.text((120, meta_top + 18 + index * translation_line_height), line, font=translation_font, fill="#12366b")
+            draw.text((120, meta_top + 22 + index * translation_line_height), line, font=translation_font, fill="#12366b")
         meta_top += translation_height + 18
 
     published = str(root.metadata.get("published_at") or candidate.published_at or "captured post")
@@ -222,7 +230,7 @@ def render_editorial_card(
     draw = ImageDraw.Draw(canvas)
     font_file = str(_font_path())
     fact_font = ImageFont.truetype(font_file, 61)
-    interpretation_font = ImageFont.truetype(font_file, 36)
+    interpretation_font = ImageFont.truetype(font_file, 46)
 
     fact = (scene.screen_fact or scene.caption).strip()
     fact_lines = _wrapped_lines(draw, fact, fact_font, width - 180, 5)
@@ -242,10 +250,10 @@ def render_editorial_card(
     if excerpt:
         quote_top = rule_top + 44
         excerpt_font = ImageFont.truetype(font_file, 39)
-        translation_font = ImageFont.truetype(font_file, 34)
+        translation_font = ImageFont.truetype(font_file, EDITORIAL_TRANSLATION_FONT_SIZE)
         excerpt_lines = _wrapped_lines(draw, excerpt, excerpt_font, width - 250, 5)
         translation_lines = _wrapped_lines(draw, translation, translation_font, width - 250, 3) if translation else []
-        quote_height = 118 + len(excerpt_lines) * 55 + len(translation_lines) * 48
+        quote_height = 118 + len(excerpt_lines) * 55 + len(translation_lines) * 60
         quote_bottom = min(height - 180, quote_top + max(270, quote_height))
         draw.rounded_rectangle(
             (76, quote_top, width - 76, quote_bottom), radius=30,
@@ -258,7 +266,7 @@ def render_editorial_card(
         if translation_lines:
             translation_y = excerpt_y + len(excerpt_lines) * 55 + 34
             for index, line in enumerate(translation_lines):
-                draw.text((146, translation_y + index * 48), line, font=translation_font, fill="#ffe063")
+                draw.text((146, translation_y + index * 60), line, font=translation_font, fill="#ffe063")
         else:
             translation_y = excerpt_y + len(excerpt_lines) * 55
         implication_top = quote_bottom + 38
@@ -296,7 +304,7 @@ def render_source_image(
     draw.rounded_rectangle((54, 1090, width - 54, height - 42), radius=28, fill="#061426")
     font_file = str(_font_path())
     fact_font = ImageFont.truetype(font_file, 45)
-    implication_font = ImageFont.truetype(font_file, 31)
+    implication_font = ImageFont.truetype(font_file, 40)
     fact = (scene.screen_fact or scene.caption).strip()
     implication = (scene.screen_interpretation or "").strip()
     fact_lines = _wrapped_lines(draw, fact, fact_font, width - 180, 3)

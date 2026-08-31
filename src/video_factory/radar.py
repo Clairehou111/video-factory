@@ -230,11 +230,7 @@ def build_tencent_radar_copy(
 ) -> tuple[str, str]:
     """Build factual external packaging; callers may still override it."""
     hook = (manifest.fixed_title or manifest.fixed_hook or fallback_title).strip()
-    label = factual_category_label(manifest)
-    prefix = f"【{label}】" if label else ""
-    title = prefix + hook
-    if len(title) > 30 and prefix and len(hook) <= 30:
-        title = hook
+    title = hook
     if len(title) > 30:
         title = title[:30]
         # Never leave half of an adjacent ASCII model/project token at the

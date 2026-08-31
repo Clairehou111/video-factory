@@ -5,12 +5,14 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .models import InformationRenderProfile, RenderManifest, Scene, TopicType
+from .models import ContentType, InformationRenderProfile, RenderManifest, Scene, TopicType
 from .media import probe_video
-from .radar import FACTUAL_CATEGORY_LABELS, extract_direct_identifier, factual_category_label
+from .radar import extract_direct_identifier
 
 
 CANVAS = (1080, 1920)
@@ -31,7 +33,7 @@ DEFAULT_FONT = str(FONT_CANDIDATES[0])
 # evidence is allowed there.
 WECHAT_TOP_UI_SAFE = 120
 WECHAT_BOTTOM_UI_SAFE = 400
-RADAR_META_RAIL = 88
+RADAR_META_RAIL = 58
 def _is_radar_v2(manifest: RenderManifest) -> bool:
     return str(manifest.render_profile or "classic") == InformationRenderProfile.RADAR_V2.value
 
@@ -39,7 +41,28 @@ def _is_radar_v2(manifest: RenderManifest) -> bool:
 def _radar_metadata(manifest: RenderManifest) -> tuple[str, str]:
     if not _is_radar_v2(manifest):
         return "", ""
-    return extract_direct_identifier(manifest), factual_category_label(manifest)
+    if manifest.content_type != ContentType.FLASH:
+        return extract_direct_identifier(manifest), ""
+    root_url = manifest.source_urls[0].rstrip("/") if manifest.source_urls else ""
+    ordered = sorted(
+        manifest.evidence,
+        key=lambda item: 0 if root_url and item.url.rstrip("/") == root_url else 1,
+    )
+    date_label = ""
+    for item in ordered:
+        raw = str(item.metadata.get("published_at") or item.captured_at or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        date_label = parsed.strftime("%m-%d 快报")
+        break
+    return extract_direct_identifier(manifest), date_label
 
 # Cold-open copy earns attention, but the repository must already feel like
 # the subject—not a small preview pushed below a title card.  Each tuple is
@@ -315,44 +338,25 @@ def render_single_header_frame(
 
 def render_direct_identifier_badge(
     identifier: str, pane_top: int, output: Path, font_path: Path | None = None,
-    category_label: str = "",
+    date_label: str = "",
 ) -> Path:
     from PIL import Image, ImageDraw, ImageFont
 
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     identifier = identifier.strip()
-    hint = "原帖/仓库链接见文案 ↗"
     font_file = str(_font_path(font_path))
-    identifier_font = ImageFont.truetype(font_file, 23)
-    hint_font = ImageFont.truetype(font_file, 18)
-    identifier_width = draw.textbbox((0, 0), identifier, font=identifier_font)[2] if identifier else 0
-    hint_width = draw.textbbox((0, 0), hint, font=hint_font)[2]
-    width = min(940, max(identifier_width, hint_width) + 42)
-    left = 1040 - width
-    top = pane_top + 16
-    height = 72 if identifier else 42
-    draw.rounded_rectangle(
-        (left, top, 1040, top + height), radius=14,
-        fill="#031126e8", outline="#ffd43b", width=2,
-    )
+    identifier_font = ImageFont.truetype(font_file, 20)
+    date_font = ImageFont.truetype(font_file, 20)
+    top = pane_top + 15
     if identifier:
-        while identifier_width > width - 32 and identifier_font.size > 16:
+        identifier_width = draw.textbbox((0, 0), identifier, font=identifier_font)[2]
+        while identifier_width > 720 and identifier_font.size > 16:
             identifier_font = ImageFont.truetype(font_file, identifier_font.size - 1)
             identifier_width = draw.textbbox((0, 0), identifier, font=identifier_font)[2]
-        draw.text((1024, top + 10), identifier, font=identifier_font, fill="#ffe063", anchor="ra")
-        draw.text((1024, top + 44), hint, font=hint_font, fill="#9eabc0", anchor="ra")
-    else:
-        draw.text((1024, top + 11), hint, font=hint_font, fill="#9eabc0", anchor="ra")
-    category_label = category_label.strip()
-    if category_label in FACTUAL_CATEGORY_LABELS:
-        category_font = ImageFont.truetype(font_file, 22)
-        category_width = draw.textbbox((0, 0), category_label, font=category_font)[2] + 34
-        draw.rounded_rectangle(
-            (40, top, 40 + category_width, top + 42), radius=21,
-            fill="#061a36e6", outline="#3b82f640", width=1,
-        )
-        draw.text((57, top + 9), category_label, font=category_font, fill="#f8fafc")
+        draw.text((1040, top), identifier, font=identifier_font, fill="#9eabc0", anchor="ra")
+    if date_label.strip():
+        draw.text((40, top), date_label.strip(), font=date_font, fill="#7f91aa")
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output)
     return output
@@ -627,7 +631,7 @@ def render_scene_copy(scene: Scene, output: Path, font_path: Path | None = None)
         canvas.save(output)
         return output
     draw = ImageDraw.Draw(canvas)
-    font = ImageFont.truetype(str(_font_path(font_path)), 27)
+    font = ImageFont.truetype(str(_font_path(font_path)), 40)
     lines = _wrapped_lines(draw, translation, font, 760, 2)
     line_height = draw.textbbox((0, 0), "中", font=font)[3] + 6
     height = 28 + len(lines) * line_height
@@ -658,7 +662,7 @@ def render_adjacent_gloss(
     translation = _translation_only(text)
     if translation and profile != InformationRenderProfile.RADAR_V2.value:
         draw = ImageDraw.Draw(canvas)
-        font = ImageFont.truetype(str(_font_path(font_path)), 28)
+        font = ImageFont.truetype(str(_font_path(font_path)), 40)
         text_width = 820
         center_x = 540
         top = 1030
@@ -691,7 +695,7 @@ def render_adjacent_gloss(
         return output
     if translation:
         draw = ImageDraw.Draw(canvas)
-        font = ImageFont.truetype(str(_font_path(font_path)), 28)
+        font = ImageFont.truetype(str(_font_path(font_path)), 40)
         text_width = 820
         center_x = 540
         top = 1030
@@ -761,8 +765,8 @@ def compose_information_frame(
     """Route flash to pinned rails and deep evidence to an expanded single-header viewport."""
     title = (manifest.fixed_title or manifest.scenes[0].caption).strip()
     radar = _is_radar_v2(manifest)
-    identifier, category_label = _radar_metadata(manifest)
-    metadata_rail = RADAR_META_RAIL if identifier or category_label else 0
+    identifier, date_label = _radar_metadata(manifest)
+    metadata_rail = RADAR_META_RAIL if identifier or date_label else 0
     expanded = _expanded_evidence_layout(manifest)
     if expanded:
         header_height, _ = _single_header_layout(title, font_path)
@@ -869,7 +873,7 @@ def compose_information_frame(
             badge = render_direct_identifier_badge(
                 identifier, pane_top - metadata_rail,
                 temp_root / "direct-identifier.png", font_path,
-                category_label=category_label,
+                date_label=date_label,
             )
             badge_index = input_count
             inputs.extend(["-loop", "1", "-i", str(badge)])
@@ -918,8 +922,7 @@ def compose_information_frame(
                 "pane": {"top": pane_top, "bottom": bottom_top, "height": content_height},
                 "metadata_rail": metadata_rail,
                 "direct_identifier": identifier,
-                "category_label": category_label,
-                "link_hint": "原帖/仓库链接见文案 ↗",
+                "date_label": date_label,
                 "spotlight_opacity": {"normal": 0.40, "dense": 0.55} if radar else None,
                 "focus_crop_factor": 1.5 if radar and _allow_radar_effects else None,
                 "effects_enabled": radar and _allow_radar_effects,

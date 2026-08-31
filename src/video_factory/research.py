@@ -45,6 +45,33 @@ def _run_opencli_json(args: list[str], timeout: int) -> list[dict[str, object]]:
     raise RuntimeError(last_detail or "OpenCLI failed")
 
 
+def _context_headline_specificity_score(title: str) -> int:
+    """Prefer a concrete personnel move over an abstract industry headline.
+
+    Search headlines are often the only safely archived text when Google News
+    wraps a publisher URL.  A pattern beat is useful only when that headline
+    carries audience-facing facts: named people/organizations and an explicit
+    move or destination.  Score those positive signals so the bounded search
+    selects the most informative result without inventing article-body detail.
+    """
+    movement = len(re.findall(
+        r"\b(?:leave|leaves|leaving|left|join|joins|joined|joining|depart|departs|"
+        r"departed|departing|found|founds|founded|launch|launches|launched|"
+        r"acqui-?hire|acqui-?hires|acqui-?hired)\b|离开|离职|转投|加入|创办|创业|收购",
+        title, re.IGNORECASE,
+    ))
+    destination = len(re.findall(
+        r"\b(?:for|to|at)\s+(?:OpenAI|Anthropic|Google|DeepMind|Meta|Microsoft|"
+        r"Nvidia|Apple|Amazon)\b|转投|加入|创办|创业",
+        title, re.IGNORECASE,
+    ))
+    named_tokens = {
+        token for token in re.findall(r"\b[A-Z][A-Za-z0-9.-]{2,}\b", title)
+        if token.casefold() not in {"the", "and", "new", "why", "how", "ai"}
+    }
+    return movement * 5 + destination * 4 + min(len(named_tokens), 6)
+
+
 class BoundedContextResearcher:
     """Small web-search tool for event context, never an unconstrained crawler."""
 
@@ -55,6 +82,7 @@ class BoundedContextResearcher:
     def research(
         self, candidate: Candidate, topic: TopicType, job: Path, seed_evidence: list[Evidence] | None = None,
         planned_queries: list[str] | None = None, pattern_query: str | None = None,
+        identity_query: str | None = None,
     ) -> tuple[list[Evidence], list[dict[str, object]]]:
         if topic == TopicType.GITHUB_PROJECT:
             return [], []
@@ -64,6 +92,8 @@ class BoundedContextResearcher:
         query_specs: list[tuple[str, str]] = []
         if pattern_query:
             query_specs.append((pattern_query, "incumbent_history"))
+        if identity_query:
+            query_specs.append((identity_query, "identity_anchor"))
         query_specs.extend((item, "event_context") for item in planned[: 3 - len(query_specs)])
         queries = [item[0] for item in query_specs]
         if not queries:
@@ -94,17 +124,29 @@ class BoundedContextResearcher:
                 host = (urlparse(publisher_url).hostname or "").casefold()
                 if not url or not any(host == domain or host.endswith("." + domain) for domain in TRUSTED_REPORTING):
                     continue
+                if query_role == "identity_anchor" and not _identity_context_matches_subject(
+                    subject, title,
+                ):
+                    continue
                 if query_role == "event_context" and not _reported_context_matches_root(
                     candidate, seed_evidence or [], title,
                 ):
                     continue
-                if query_role == "incumbent_history" and not _is_prior_distinct_event(candidate, seed_evidence or [], title, published):
-                    continue
+                if query_role == "incumbent_history":
+                    if not _is_prior_distinct_event(candidate, seed_evidence or [], title, published):
+                        continue
+                    # A generic "talent war" headline cannot prove the
+                    # concrete earlier move the audience needs.  Prefer a
+                    # named action-bearing result; when none exists, omit the
+                    # optional pattern instead of forcing a vague card.
+                    if _context_headline_specificity_score(title) < 7:
+                        continue
                 items.append((query_index, url, title, published, publisher_url))
         evidence: list[Evidence] = []
         acquirer = URLAcquirer(self.workspace)
         seen_titles: set[str] = set()
         ranked: list[tuple[int, str, str, str, str]] = []
+        items.sort(key=lambda item: (item[0], -_context_headline_specificity_score(item[2])))
         # First take one result per director query so a broad first query does
         # not consume the whole source budget; then fill remaining slots.
         for query_index in range(len(queries)):
@@ -211,9 +253,11 @@ class DirectorContextToolbox:
         )
         self.researcher.max_sources = max(0, limit - len(prior_evidence) - len(actor_evidence))
         pattern_query = _incumbent_history_query(packet, plan)
+        identity_query = _identity_anchor_query(packet, plan)
         found, actions = self.researcher.research(
             packet.candidate, packet.topic_type, self.job, packet.evidence,
             planned_queries=plan.search_queries, pattern_query=pattern_query,
+            identity_query=identity_query,
         )
         existing = {item.id for item in packet.evidence}
         evidence = [
@@ -291,6 +335,32 @@ def _incumbent_history_query(packet: StoryWriterPacket, plan: EditorialPlan) -> 
     author = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", author).strip()
     exclusion = f' -"{author}"' if author else ""
     return f'"{incumbent}" AI researchers departures {datetime.now(UTC).year}{exclusion}'
+
+
+def _identity_anchor_query(packet: StoryWriterPacket, plan: EditorialPlan) -> str | None:
+    """Research why a moving person matters instead of assuming celebrity."""
+    if plan.story_archetype != "people_change":
+        return None
+    root = next((
+        item for item in packet.evidence
+        if item.url.rstrip("/") == packet.candidate.source_url.rstrip("/")
+    ), None)
+    name = str(
+        (root.metadata.get("author_name") if root else "")
+        or packet.candidate.metadata.get("author_name")
+        or packet.candidate.author
+        or ""
+    ).strip("@ ")
+    name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name).strip()
+    if not name:
+        return None
+    return f'"{name}" known for built designed projects role'
+
+
+def _identity_context_matches_subject(subject: str, title: str) -> bool:
+    normalized_subject = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", subject.casefold())
+    normalized_title = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", title.casefold())
+    return bool(normalized_subject and normalized_subject in normalized_title)
 
 
 def _topic_terms(text: str) -> set[str]:

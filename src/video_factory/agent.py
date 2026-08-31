@@ -968,6 +968,7 @@ def _context_graph_from_evidence(plan: EditorialPlan, evidence: list[Evidence]) 
             "same_author_setup": "earlier same-author setup that explains the current post",
             "referenced_setup": "exact earlier post that explains the configuration or event shown in the screenshot",
             "incumbent_history": "earlier related move that tests whether the current event is part of a pattern",
+            "identity_anchor": "role and recognizable work that explains why this person matters to the audience",
             "event_context": "independent confirmation or direct background for the current event",
         }.get(role, "background")
         events.append(ContextEvent(
@@ -977,6 +978,8 @@ def _context_graph_from_evidence(plan: EditorialPlan, evidence: list[Evidence]) 
         ))
         if role == "incumbent_history" and plan.story_archetype == "people_change":
             pattern_ids.append(event_id)
+        elif role == "identity_anchor" and plan.story_archetype == "people_change":
+            required_ids.append(event_id)
         elif role == "incumbent_history":
             discarded_ids.append(event_id)
         elif item.source_kind == "x:quoted_post":

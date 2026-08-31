@@ -23,7 +23,10 @@ from video_factory.models import (
 )
 from video_factory.quality import _quantity_supported, validate_manifest
 from video_factory.storage import Workspace
-from video_factory.tweetcard import render_editorial_card, render_tweet_card
+from video_factory.tweetcard import (
+    EDITORIAL_TRANSLATION_FONT_SIZE, TWEET_TRANSLATION_FONT_MIN,
+    render_editorial_card, render_tweet_card,
+)
 from video_factory.webcapture import WebScrollVideoAdapter
 from video_factory.writer import StoryWriterPacket
 from video_factory.acquisition import URLAcquirer
@@ -670,6 +673,45 @@ Markdown Content:
 
         self.assertIn("funding is evidence of a bet, not the whole story", company_prompt)
         self.assertIn("Distinguish a protocol, pilot, or proposed method", research_prompt)
+        self.assertIn("name who left which organization and where they went", company_prompt)
+
+    def test_people_change_pattern_context_requires_a_concrete_move(self):
+        candidate = Candidate(
+            "x-company", SourceType.TWEET,
+            "https://x.com/JeffDean/status/1", "Discovery Loop", author="JeffDean",
+        )
+        brief, item = brief_for(candidate)
+        reason = SelectionReason(
+            "people-move", "important_person", "四位 Google 核心人物集体创业", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "四位 Google 老搭档创业", "刚刚官宣", "开发者关心核心人才流向",
+            "人才流向", [reason], story_archetype="people_change",
+        )
+        prior = Evidence(
+            "prior", candidate.id, "https://example.com/prior",
+            "Google takes the hit in AI's talent war", "web:reported_context",
+            metadata={"context_role": "incumbent_history"},
+        )
+        brief.context_graph = ContextGraph(
+            events=[ContextEvent(
+                "Axios", "Google talent headline", "2026-06-23", "earlier move", [prior.id], "context-prior",
+            )],
+            pattern_context_ids=["context-prior"],
+        )
+        brief.context_events = list(brief.context_graph.events)
+        brief.evidence_shots[1].fact = "Google 在 AI 人才战中承压"
+        brief.evidence_shots[1].evidence_ids = [prior.id]
+        brief.evidence_shots[1].context_event_ids = ["context-prior"]
+
+        errors = validate_editorial_brief(
+            brief, candidate, [item, prior], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+
+        self.assertIn(
+            "people-change pattern context must show a concrete departure, destination, or founding action",
+            errors,
+        )
 
     def test_contextual_flash_is_blocked_when_it_has_no_retention_cadence(self):
         candidate = Candidate("x-company", SourceType.TWEET, "https://x.com/JeffDean/status/1", "Discovery Loop", author="JeffDean")
@@ -749,6 +791,10 @@ Markdown Content:
                 # first-screen explanation; do not repeat scene copy in a
                 # separate dark subtitle chip at the bottom.
                 self.assertEqual(image.getpixel((700, 1450)), (255, 255, 255))
+
+    def test_chinese_source_translation_uses_mobile_readable_type_size(self):
+        self.assertGreaterEqual(TWEET_TRANSLATION_FONT_MIN, 46)
+        self.assertGreaterEqual(EDITORIAL_TRANSLATION_FONT_SIZE, 46)
 
     def test_program_compiles_semantic_card_family_into_material_kind(self):
         candidate = Candidate("tweet", SourceType.TWEET, "https://x.com/dev/status/1", "Post", author="dev")
@@ -907,6 +953,10 @@ Markdown Content:
             errors,
         )
         self.assertIn(
+            "people-change hook must lead with the recognizable incumbent and its stake before relying on a lesser-known person",
+            errors,
+        )
+        self.assertIn(
             "people-change conclusion must resolve the primary person/team move, not a secondary capability",
             errors,
         )
@@ -928,6 +978,107 @@ Markdown Content:
         self.assertFalse(any("people-change hook abandoned" in error for error in repaired_errors))
         self.assertFalse(any("people-change conclusion must resolve" in error for error in repaired_errors))
         self.assertFalse(any("people-change final payoff" in error for error in repaired_errors))
+
+    def test_people_change_requires_an_early_identity_anchor_for_unfamiliar_viewers(self):
+        candidate = Candidate(
+            "x-person", SourceType.TWEET,
+            "https://x.com/JeffDean/status/1", "Discovery Loop", author="JeffDean",
+        )
+        brief, item = brief_for(candidate)
+        reason = SelectionReason(
+            "people-move", "important_person", "Jeff Dean 与长期合作者创业", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "Jeff Dean 与三位合作者创业", "刚刚官宣", "AI 人才流动", "identity",
+            [reason], story_archetype="people_change",
+        )
+        brief.evidence_shots[-1].selection_reason_ids = [reason.id]
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertIn(
+            "people-change story must establish the main person's role and recognizable work in an early identity-anchor beat",
+            errors,
+        )
+
+        brief.evidence_shots[1].fact = (
+            "Jeff Dean：Google 前首席科学家，参与打造 MapReduce、Bigtable、Spanner 与 TensorFlow"
+        )
+        repaired = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertNotIn(
+            "people-change story must establish the main person's role and recognizable work in an early identity-anchor beat",
+            repaired,
+        )
+
+    def test_openrouter_discount_story_requires_use_case_and_service_quality_question(self):
+        candidate = Candidate(
+            "openrouter", SourceType.WEB,
+            "https://openrouter.ai/models?discount=true", "Discounted models",
+        )
+        brief, item = brief_for(candidate)
+        brief.attention_strategy.selected_hook = "OpenRouter 折扣最高 90% off"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.MODEL_OR_PRODUCT, ContentType.FLASH,
+        )
+        self.assertIn("OpenRouter discount story must state a concrete workload or use case", errors)
+        self.assertIn("OpenRouter discount story must address route stability and response performance", errors)
+        self.assertIn(
+            "OpenRouter route without cited current performance metrics must ask the stability/RT question and give a verification action",
+            errors,
+        )
+
+        brief.evidence_shots[1].fact = (
+            "Solar Pro 4 面向长任务与 Agent 工作流；一折线路稳定吗、TTFT 多久？上线前先看 uptime 与吞吐"
+        )
+        repaired = validate_editorial_structure(
+            brief, candidate, [item], TopicType.MODEL_OR_PRODUCT, ContentType.FLASH,
+        )
+        self.assertFalse(any("OpenRouter discount story" in error for error in repaired))
+        self.assertFalse(any("OpenRouter route without" in error for error in repaired))
+
+    def test_company_competition_reply_chain_hook_names_both_sides(self):
+        candidate = Candidate(
+            "x-sam", SourceType.TWEET, "https://x.com/sama/status/1",
+            "Sam praises Tibo", author="sama",
+        )
+        brief, item = brief_for(candidate)
+        reason = SelectionReason(
+            "vendor-conflict", "competition", "OpenAI 与 Anthropic 员工公开交锋", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "OpenAI 与 Anthropic 围绕封号争议公开互动", "刚刚发生", "大厂竞争",
+            "identity", [reason], story_archetype="event_chain",
+        )
+        brief.subjects = [
+            StorySubject("Sam Altman", "person", "代表 OpenAI 公开夸 Tibo", "放大争议", [item.id]),
+            StorySubject("alex getman", "person", "称被 Anthropic 停用账号并申诉", "引发讨论", [item.id]),
+            StorySubject("Tibo", "person", "OpenAI 员工回复质疑封号", "形成冲突", [item.id]),
+            StorySubject("Boris Cherny", "person", "Anthropic 员工回复招聘", "完成交锋", [item.id]),
+        ]
+        brief.attention_strategy.selected_hook = "封号争议里，Sam 公开夸 Tibo"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        brief.evidence_shots = [
+            EvidenceShot("root", EvidenceShotKind.TWEET_CARD, "Sam 说了什么", "Sam Altman 发帖夸 Tibo", "根帖", [item.id], ["event"], visual_family="tweet"),
+            EvidenceShot("chain-1-alex", EvidenceShotKind.BROWSER_SECTION, "起点", "alex getman 称被 Anthropic 停用账号并申诉", "起点", [item.id], ["proof"], visual_family="quote_card"),
+            EvidenceShot("chain-2-tibo", EvidenceShotKind.BROWSER_SECTION, "回应", "Tibo：OpenAI 员工质疑封号", "回应", [item.id], ["proof"], visual_family="timeline"),
+            EvidenceShot("chain-3-boris", EvidenceShotKind.BROWSER_SECTION, "结尾", "Boris Cherny：Anthropic 员工回复招聘", "结尾", [item.id], ["impact"], visual_family="impact_card"),
+        ]
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertIn("company-competition reply-chain hook must name both evidenced companies", errors)
+
+        brief.attention_strategy.selected_hook = "Anthropic 封号争议，Sam 公开力挺 OpenAI 员工"
+        repaired = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertNotIn("company-competition reply-chain hook must name both evidenced companies", repaired)
 
     def test_multi_party_reply_chain_rejects_missing_intervening_response(self):
         candidate = Candidate(
