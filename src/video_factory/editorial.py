@@ -22,6 +22,28 @@ RADAR_BANNED_COPY = (
     "反映了对齐机制的深度", "体现了生态多样性", "为从业者提供了新思考",
     "关于这一问题的探讨", "值得关注",
 )
+STATIC_RADAR_MAX_DURATION = 14.8
+STATIC_RADAR_RESEARCH_MAX_DURATION = 20.0
+
+
+def radar_has_source_video(brief: EditorialBrief) -> bool:
+    return any(
+        shot.kind == EvidenceShotKind.VIDEO or shot.visual_family == "source_video"
+        for shot in brief.evidence_shots
+    )
+
+
+def radar_duration_ceiling(brief: EditorialBrief) -> float:
+    """Static Radar evidence scans quickly; action footage earns more time."""
+    if not brief.opening_mode:
+        return 30.0
+    if radar_has_source_video(brief):
+        return 30.0
+    return (
+        STATIC_RADAR_RESEARCH_MAX_DURATION
+        if brief.duration_target > STATIC_RADAR_MAX_DURATION
+        else STATIC_RADAR_MAX_DURATION
+    )
 
 
 def _model_subject_aliases(name: str) -> tuple[str, ...]:
@@ -48,6 +70,10 @@ def _is_multi_model_price_evidence(evidence: list[Evidence]) -> bool:
 # Explain one decision-critical specialist term at its first relevant shot.
 # Definitions are audience UI copy, not claims about the selected source.
 AUDIENCE_GLOSSARY: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("LMP", "节点边际电价"), "{term}：电力在不同地点实时结算的批发价。", r"不同地点.{0,10}(?:实时)?结算.{0,8}批发价"),
+    (("纳什均衡", "Nash equilibrium"), "{term}：任何一方单独改价都无法多赚钱的竞争基准。", r"任何一方.{0,10}单独改价.{0,12}(?:无法|不能).{0,8}多赚钱"),
+    (("MARL", "多智能体强化学习"), "{term}：多个 AI 在同一环境里反复试错学习。", r"多个\s*AI.{0,12}反复试错学习"),
+    (("默契合谋", "tacit collusion"), "{term}：没有沟通，多个 AI 却一起维持高价。", r"没有沟通.{0,16}(?:一起|共同).{0,8}(?:维持|抬高).{0,6}高?价"),
     (("harness",), "harness：模型的测试与运行框架。", r"(?:测试|运行).{0,4}框架"),
     (("pass@1",), "pass@1：代码只生成一次就通过测试的比例。", r"只生成一次.{0,12}通过测试.{0,8}(?:比例|占比)"),
     (("首 Token 延迟", "TTFT"), "{term}：发出请求到看到第一个 Token 的等待时间。", r"发出请求.{0,12}第一个\s*Token.{0,10}(?:等待|时间)"),
@@ -90,6 +116,14 @@ def _hook_retention_score(value: str) -> float:
         "全部": 1.5, "所有": 1.2, "直降": 2.5, "反转": 2, "首次": 2,
         "正式可用": 0.2, "值得关注": -2, "迎来新变化": -1.5,
         "权衡": -2.5, "未公布": -3, "待公布": -3, "需验证": -3,
+        "一起": 1.2, "集体": 1.2, "抬价": 2.0, "降价": 1.0,
+        "默契合谋": -2.5, "超竞争": -2.5, "纳什均衡": -3.0,
+        # Conversational tension earns attention without inventing a claim.
+        # These markers describe the angle of an already-grounded candidate,
+        # not permission to add hype to a neutral event.
+        "为什么": 2.5, "偏要": 2.5, "竟然": 2.0, "居然": 2.0,
+        "不只": 1.5, "却": 1.5, "反而": 1.5, "都": 0.8,
+        "总结": -1.0, "评估": -0.8, "提出": -0.8,
     }
     for marker, weight in weights.items():
         if marker in value:
@@ -98,12 +132,55 @@ def _hook_retention_score(value: str) -> float:
         score += 1
     if "：" in value or ":" in value:
         score += 0.5
+    if value.rstrip().endswith(("？", "?")):
+        score += 1.5
     visual_length = len(re.sub(r"\s+", "", value))
     if 12 <= visual_length <= 38:
         score += 0.5
     elif visual_length > 52:
         score -= 1
     return score
+
+
+def _funding_story_audience_label(brief: EditorialBrief) -> tuple[str, tuple[str, ...]] | None:
+    """Return the most specific engineering role explicitly named by the opportunity."""
+    if brief.opportunity is None:
+        return None
+    audience_context = " ".join((
+        brief.opportunity.why_audience,
+        brief.opportunity.audience_pain_or_desire,
+        *(item.rationale for item in brief.opportunity.selection_reasons),
+    )).casefold()
+    groups = (
+        ("SRE", ("sre", "site reliability")),
+        ("DevOps", ("devops",)),
+        ("安全工程师", ("security engineer", "安全工程师")),
+        ("数据工程师", ("data engineer", "数据工程师")),
+        ("开发者", ("software developer", "software engineer", "开发者", "研发人员")),
+        ("运维", ("infrastructure engineer", "运维", "基础架构工程师")),
+    )
+    for label, aliases in groups:
+        if any(alias in audience_context for alias in aliases):
+            return label, aliases
+    return None
+
+
+def _hook_names_audience_role(value: str, role: tuple[str, tuple[str, ...]]) -> bool:
+    label, aliases = role
+    folded = value.casefold()
+    visible_aliases = {
+        label.casefold(), *aliases,
+        *(item for item in ("运维", "研发", "开发者") if item in label),
+    }
+    return any(alias and alias in folded for alias in visible_aliases)
+
+
+def _hook_is_led_by_financing(value: str) -> bool:
+    return bool(re.search(
+        r"融资|获.{0,8}(?:万美元|亿元|美元)|估值|独立(?:运营)?|拆分|spin.?out|"
+        r"\brais(?:e[sd]?|ing)\b|\bfunding\b|\bvaluation\b",
+        value, re.IGNORECASE,
+    ))
 
 
 def _clip_radar_copy(value: str, limit: float) -> str:
@@ -146,19 +223,217 @@ def _complete_radar_conclusion(brief: EditorialBrief, limit: float = 40) -> str:
         severed_list_name = index == 0 and bool(re.search(r"、[A-Z][A-Za-z0-9._-]*$", normalized))
         if severed_list_name:
             continue
+        if index > 0 and copy_width(normalized) < 12:
+            # A generic stance label such as “直接快报” is not a semantic
+            # replacement for the persistent conclusion.
+            continue
         if normalized and copy_width(normalized) <= limit:
             return normalized
-    return _clip_radar_copy(brief.fixed_conclusion, limit)
+    # Never manufacture a shorter but incomplete conclusion. Returning the
+    # intact model copy lets deterministic width validation send it through
+    # the bounded writer-repair loop.
+    return re.sub(r"\s+", " ", brief.fixed_conclusion).strip().rstrip("。！？!?;；")
 
 
 def _looks_like_radar_fragment(value: str) -> bool:
     compact = re.sub(r"\s+", " ", value).strip().rstrip("，,：:")
-    return bool(re.search(r"(?:模|直接|每秒|从|至|为|在|与|和|或|的|把|将|到|让|用)$", compact))
+    return bool(re.search(
+        r"(?:模|直接|每秒|从|至|为|在|与|和|或|的|把|将|到|让|用|被|财富全|自|即|时|"
+        r"发现|显示|表明|证明|指出|宣布|透露|意味着|结果是|答案是)$",
+        compact,
+    ))
+
+
+def repair_fragmented_radar_hook(brief: EditorialBrief) -> str | None:
+    """Select a complete model-written alternative for a severed pinned hook."""
+    strategy = brief.attention_strategy
+    current = strategy.selected_hook.strip()
+    if not current or not _looks_like_radar_fragment(current):
+        return None
+    candidates = [
+        re.sub(r"\s+", " ", item).strip()
+        for item in [*strategy.hook_candidates, brief.headline]
+        if item.strip() and item.strip() != current
+    ]
+    complete = [item for item in candidates if not _looks_like_radar_fragment(item)]
+    if not complete:
+        return None
+    selected = max(complete, key=_hook_retention_score)
+    strategy.selected_hook = selected
+    if selected not in strategy.hook_candidates:
+        strategy.hook_candidates[0] = selected
+    return selected
 
 
 def _radar_shot_copy_budget(duration: float) -> float:
     """Allow more evidence copy only when the shot earns more reading time."""
-    return min(64.0, max(40.0, 24.0 + max(0.0, duration) * 10.0))
+    return min(96.0, max(40.0, max(0.0, duration) * 12.0))
+
+
+def visible_copy_units(shot: EvidenceShot) -> float:
+    """Approximate the simultaneous mobile reading load in CJK-width units."""
+    gloss = (shot.full_translation or shot.translation).strip()
+    if shot.kind == EvidenceShotKind.VIDEO or shot.visual_family == "source_video":
+        return 0.0
+    if shot.visual_family in {"quote_card", "timeline", "impact_card", "stat_card"}:
+        return copy_width(" ".join(filter(None, (
+            shot.fact.strip(), shot.audience_copy.strip(), gloss,
+        ))))
+    if shot.kind == EvidenceShotKind.TWEET_CARD or shot.visual_family in {"tweet", "quoted_post"}:
+        # The complete X card renders source text plus the adjacent Chinese
+        # translation; scene.fact is intentionally not repeated on the card.
+        audience = shot.audience_copy.strip() if is_audience_glossary_definition(shot.audience_copy) else ""
+        return copy_width(" ".join(filter(None, (gloss, audience))))
+    if shot.kind == EvidenceShotKind.IMAGE or shot.visual_family == "source_image":
+        return copy_width(" ".join(filter(None, (
+            shot.fact.strip(), shot.audience_copy.strip(),
+        ))))
+    # Browser capture already contains the source fact. Only the adjacent
+    # generated Chinese gloss is an additional reading burden.
+    return copy_width(gloss)
+
+
+def visible_reading_rate(shot: EvidenceShot) -> float:
+    return visible_copy_units(shot) / max(0.1, shot.duration)
+
+
+def _shot_duration_limit(shot: EvidenceShot) -> float:
+    if shot.kind == EvidenceShotKind.VIDEO or shot.visual_family == "source_video":
+        return 12.0
+    if shot.kind == EvidenceShotKind.TWEET_CARD or shot.visual_family in {"tweet", "quoted_post"}:
+        return 10.0
+    return 10.0
+
+
+def _fit_rendered_shot_copy(shot: EvidenceShot) -> None:
+    """Fit only copy that the selected visual family renders together.
+
+    Each individual field can satisfy its own limit while fact, translation,
+    and optional implication still overload one derived card. Allocate one
+    shared pixel-time budget after material selection, preserving the source
+    translation and a concise fact before trimming optional audience copy.
+    """
+    budget = max(8.0, shot.duration * 11.5)
+    family = shot.visual_family
+    if shot.kind == EvidenceShotKind.TWEET_CARD and family in {"tweet", "quoted_post"}:
+        gloss_name = "full_translation" if shot.full_translation else "translation"
+        setattr(shot, gloss_name, re.sub(r"\s+", " ", getattr(shot, gloss_name)).strip())
+    elif family in {"quote_card", "timeline", "impact_card", "stat_card"}:
+        gloss_name = "full_translation" if shot.full_translation else "translation"
+        gloss = getattr(shot, gloss_name).strip()
+        fact = shot.fact.strip()
+        audience = shot.audience_copy.strip()
+        if _looks_like_radar_fragment(audience):
+            audience = ""
+        if (
+            audience
+            and copy_width(" ".join(filter(None, (fact, audience, gloss)))) > budget
+            and copy_width(" ".join(filter(None, (fact, gloss)))) <= budget
+        ):
+            # The second line is explicitly optional. Remove it only as a
+            # whole sentence when the complete fact + source translation fit;
+            # never shave characters from any field.
+            audience = ""
+        shot.fact = fact
+        shot.audience_copy = audience
+        setattr(shot, gloss_name, gloss)
+    elif shot.kind == EvidenceShotKind.IMAGE or family == "source_image":
+        fact = shot.fact.strip()
+        audience = shot.audience_copy.strip()
+        if _looks_like_radar_fragment(audience):
+            audience = ""
+        shot.fact = fact
+        shot.audience_copy = audience
+
+
+def apply_readable_radar_timing(brief: EditorialBrief) -> None:
+    """Give BGM-only Radar screens enough time to read and watch the source.
+
+    Timing is deterministic presentation policy, not an LLM story choice. Up
+    to four Flash shots receive a 3.5 second floor. Dense screens extend the
+    cut instead of being squeezed back into an unreadable fifteen seconds.
+    """
+    if not brief.opening_mode or not brief.evidence_shots or brief.duration_target > 30:
+        return
+    desired: list[float] = []
+    for shot in brief.evidence_shots:
+        gloss = (shot.full_translation or shot.translation).strip()
+        visible_width = max(
+            visible_copy_units(shot),
+            copy_width(" ".join(filter(None, (
+                shot.fact.strip(), shot.audience_copy.strip(),
+            )))),
+        )
+        maximum = _shot_duration_limit(shot)
+        desired.append(min(maximum, max(shot.duration, 3.5, 1.2 + visible_width / 11.5)))
+
+    maximum_total = radar_duration_ceiling(brief)
+    if sum(desired) > maximum_total:
+        floor = min(3.5, maximum_total / len(desired))
+        excess = sum(desired) - maximum_total
+        # An uninterrupted source action needs its setup and payoff. Reduce
+        # text-card holds first; only shorten source footage if the number of
+        # shots makes the bounded 24-second ceiling otherwise impossible.
+        card_indexes = [
+            index for index, shot in enumerate(brief.evidence_shots)
+            if shot.kind != EvidenceShotKind.VIDEO and shot.visual_family != "source_video"
+        ]
+        for indexes in (card_indexes, list(range(len(desired)))):
+            reducible = sum(max(0.0, desired[index] - floor) for index in indexes)
+            reduction = min(excess, reducible)
+            if reduction and reducible:
+                for index in indexes:
+                    share = reduction * max(0.0, desired[index] - floor) / reducible
+                    desired[index] -= share
+                excess -= reduction
+            if excess <= 1e-6:
+                break
+    for shot, duration in zip(brief.evidence_shots, desired, strict=True):
+        maximum = _shot_duration_limit(shot)
+        shot.duration = round(min(maximum, max(1.3, duration)), 3)
+    brief.duration_target = max(
+        brief.duration_target,
+        round(sum(shot.duration for shot in brief.evidence_shots), 3),
+    )
+
+
+def enforce_flash_time_budget(brief: EditorialBrief) -> None:
+    """Fit a canonicalized Flash story inside the product's hard 24s cap.
+
+    Model repair can add a proof beat after the first timing pass.  This final
+    compiler step caps each visual family and reduces only time above the
+    readability floor, avoiding another LLM call for a mechanical schedule
+    error.
+    """
+    if not brief.evidence_shots:
+        maximum = 30.0 if radar_has_source_video(brief) else STATIC_RADAR_MAX_DURATION
+        brief.duration_target = min(maximum, brief.duration_target)
+        return
+    durations = [
+        min(_shot_duration_limit(shot), max(1.3, float(shot.duration)))
+        for shot in brief.evidence_shots
+    ]
+    maximum_total = 30.0 if radar_has_source_video(brief) else STATIC_RADAR_MAX_DURATION
+    total = sum(durations)
+    if total > maximum_total:
+        floor = min(3.5, maximum_total / len(durations))
+        reducible = sum(max(0.0, value - floor) for value in durations)
+        excess = total - maximum_total
+        if reducible:
+            durations = [
+                value - min(excess, reducible) * max(0.0, value - floor) / reducible
+                for value in durations
+            ]
+    for shot, duration in zip(brief.evidence_shots, durations, strict=True):
+        shot.duration = round(duration, 3)
+    scheduled = round(sum(shot.duration for shot in brief.evidence_shots), 3)
+    if scheduled > maximum_total:
+        longest = max(brief.evidence_shots, key=lambda item: item.duration)
+        longest.duration = round(longest.duration - (scheduled - maximum_total), 3)
+        scheduled = round(sum(shot.duration for shot in brief.evidence_shots), 3)
+    brief.duration_target = min(
+        maximum_total, max(min(brief.duration_target, maximum_total), scheduled),
+    )
 
 
 def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
@@ -168,16 +443,12 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
     if brief.category_label not in RADAR_CATEGORY_LABELS:
         brief.category_label = ""
 
-    subject_names = [item.name.strip() for item in brief.subjects if item.name.strip()]
-
     def headline_copy(value: str) -> str:
-        has_subject = any(name.casefold() in value.casefold() for name in subject_names)
-        clipped = _clip_radar_copy(value, 28 if has_subject else 20)
-        if copy_width(clipped) > 20 and not any(
-            name.casefold() in clipped.casefold() for name in subject_names
-        ):
-            clipped = _clip_radar_copy(clipped, 20)
-        return clipped
+        # The upper rail is dynamic and may add a line or height. Never turn a
+        # complete, high-retention headline into a neutral or dangling setup
+        # merely to satisfy a fixed-width compiler budget. Semantic shortening
+        # belongs in the writer/critic loop; presentation owns fitting.
+        return re.sub(r"\s+", " ", value).strip().rstrip("。！!；;")
 
     original_candidates = list(strategy.hook_candidates)
     original_headline = brief.headline
@@ -203,52 +474,25 @@ def _canonicalize_radar_contract(brief: EditorialBrief) -> None:
 
     brief.headline = headline_copy(brief.headline)
     brief.fixed_conclusion = _complete_radar_conclusion(brief, 40)
+    apply_readable_radar_timing(brief)
     for index, shot in enumerate(brief.evidence_shots):
         shot.narrative_beat = (
             "opening" if index == 0 else
             "takeaway" if index == len(brief.evidence_shots) - 1 else
             "proof"
         )
-        raw_gloss = (shot.full_translation or shot.translation).strip()
-        raw_visible_width = max(
-            copy_width(shot.fact + shot.audience_copy),
-            copy_width(raw_gloss) if not (index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD) else 0,
-        )
-        desired_budget = min(64.0, max(40.0, raw_visible_width))
-        if desired_budget > 40:
-            shot.duration = max(shot.duration, (desired_budget - 24.0) / 10.0)
-        if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD and raw_gloss:
-            shot.duration = max(shot.duration, min(5.0, 2.4 + copy_width(raw_gloss) / 40.0))
-        screen_budget = _radar_shot_copy_budget(shot.duration)
-        audience_is_glossary = is_audience_glossary_definition(shot.audience_copy)
-        if audience_is_glossary and copy_width(shot.audience_copy) <= 32:
-            # The one plain-language definition is more valuable than a
-            # repeated long fact line. Reserve its full wording, then compact
-            # the evidence headline into the remaining screen budget.
-            audience_width = copy_width(shot.audience_copy)
-            shot.fact = _clip_radar_copy(shot.fact, max(8.0, screen_budget - audience_width))
-            shot.audience_copy = re.sub(r"\s+", " ", shot.audience_copy).strip()
-        else:
-            shot.fact = _clip_radar_copy(shot.fact, screen_budget)
-            remaining = max(0.0, screen_budget - copy_width(shot.fact))
-            audience = re.sub(r"\s+", " ", shot.audience_copy).strip()
-            shot.audience_copy = (
-                audience
-                if remaining >= 4 and copy_width(audience) <= remaining
-                and not _looks_like_radar_fragment(audience)
-                else ""
-            )
+        shot.fact = re.sub(r"\s+", " ", shot.fact).strip()
+        shot.audience_copy = re.sub(r"\s+", " ", shot.audience_copy).strip()
+        if _looks_like_radar_fragment(shot.audience_copy):
+            shot.audience_copy = ""
         if shot.full_translation:
-            shot.full_translation = _clip_radar_copy(
-                shot.full_translation,
-                120 if index == 0 and shot.kind == EvidenceShotKind.TWEET_CARD else screen_budget,
-            )
+            shot.full_translation = re.sub(r"\s+", " ", shot.full_translation).strip()
         if shot.translation:
-            shot.translation = _clip_radar_copy(shot.translation, screen_budget)
+            shot.translation = re.sub(r"\s+", " ", shot.translation).strip()
+        _fit_rendered_shot_copy(shot)
 
     scheduled_duration = sum(shot.duration for shot in brief.evidence_shots)
-    if scheduled_duration <= 15:
-        brief.duration_target = max(brief.duration_target, scheduled_duration)
+    brief.duration_target = max(brief.duration_target, scheduled_duration)
 
     if brief.director_brief and brief.context_graph:
         required = set(brief.context_graph.required_context_ids)
@@ -482,6 +726,51 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
         strongest = max(strategy.hook_candidates, key=candidate_score)
         if candidate_score(strongest) >= selected_score + 2.0:
             strategy.selected_hook = strongest
+        audience_role = _funding_story_audience_label(brief)
+        if (
+            audience_role is not None
+            and _hook_is_led_by_financing(strategy.selected_hook)
+            and not _hook_names_audience_role(strategy.selected_hook, audience_role)
+        ):
+            role_first = [
+                hook for hook in strategy.hook_candidates
+                if _hook_names_audience_role(hook, audience_role)
+                and not _looks_like_radar_fragment(hook)
+            ]
+            if role_first:
+                strategy.selected_hook = max(role_first, key=candidate_score)
+    # A brand-only hook is not self-explanatory in a fast feed. Prefer an
+    # already-written category-explicit headline for embodied/transport news
+    # instead of asking viewers to know every company name in advance.
+    evidence_text = "\n".join(item.quote for item in evidence).casefold()
+    category_groups = (
+        (
+            (
+                "autonomous driving", "autonomous ride", "fully autonomous",
+                "self-driving", "robotaxi", "无人驾驶", "自动驾驶",
+            ),
+            ("自动驾驶", "无人驾驶", "robotaxi", "机器人出租车"),
+        ),
+        (
+            ("robotics", "robot", "humanoid", "biped", "机器人", "人形", "双足"),
+            ("机器人", "人形", "双足"),
+        ),
+    )
+    for source_markers, visible_markers in category_groups:
+        if not any(marker in evidence_text for marker in source_markers):
+            continue
+        if any(marker.casefold() in strategy.selected_hook.casefold() for marker in visible_markers):
+            break
+        alternatives = [
+            item for item in [brief.headline, *strategy.hook_candidates]
+            if any(marker.casefold() in item.casefold() for marker in visible_markers)
+            and not _looks_like_radar_fragment(item)
+        ]
+        if alternatives:
+            strategy.selected_hook = max(alternatives, key=candidate_score)
+            if strategy.selected_hook not in strategy.hook_candidates:
+                strategy.hook_candidates[0] = strategy.selected_hook
+        break
     _inject_audience_glossary(brief)
     if brief.opening_mode:
         # Glossary injection and hook ranking can change visible copy after the
@@ -671,7 +960,7 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
         return
     evidence_by_id = {item.id: item for item in evidence}
     supported = {
-        "tweet", "quoted_post", "official_page", "source_image", "product_ui", "chart", "timeline",
+        "tweet", "quoted_post", "official_page", "source_image", "source_video", "product_ui", "chart", "timeline",
         "code", "paper", "quote_card", "impact_card", "stat_card",
     }
     derived_cycle = ("quote_card", "timeline", "impact_card", "stat_card")
@@ -698,6 +987,27 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
         }.get(shot.retention_job, "quote_card")
         choices = (preferred, *derived_cycle)
         return next((item for item in choices if item != previous and item not in used), next(item for item in choices if item != previous))
+
+    # A model may request source_image based on page prose even when image
+    # acquisition found no renderable asset. Reconcile the material choice
+    # before semantic validation: keep the grounded claim and compile it to a
+    # derived evidence card instead of spending multiple LLM repairs on an
+    # impossible visual family.
+    for shot in brief.evidence_shots:
+        cited_image = any(
+            item in evidence_by_id
+            and evidence_by_id[item].source_kind in {"web:source_image", "x:media_photo"}
+            and evidence_by_id[item].captured_asset
+            for item in shot.evidence_ids
+        )
+        if (shot.kind == EvidenceShotKind.IMAGE or shot.visual_family == "source_image") and not cited_image:
+            shot.kind = EvidenceShotKind.BROWSER_SECTION
+            shot.visual_family = (
+                "stat_card" if re.search(r"\d", shot.fact)
+                else "impact_card" if shot.retention_job in {"impact", "payoff"}
+                else "quote_card"
+            )
+            shot.source_url = ""
 
     # One strong source image is a reveal, not wallpaper. Cheap models may
     # cite it again on the payoff simply because it is available. Keep the
@@ -747,6 +1057,19 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
                 shot.visual_family = "official_page"
         if index == 0 and any(kind.startswith("x:") for kind in kinds):
             shot.visual_family = "tweet"
+        elif (
+            index > 0
+            and shot.kind == EvidenceShotKind.TWEET_CARD
+            and kinds
+            and kinds <= {"x:thread_post", "x:visual_analysis"}
+            and shot.visual_family not in derived_cycle
+        ):
+            # The complete root post is shown once. Later explanations that
+            # cite the same long post become focused evidence cards rather
+            # than replaying the entire tweet three more times.
+            shot.visual_family = derived_for(
+                shot, set(), brief.evidence_shots[index - 1].visual_family,
+            )
 
     used: set[str] = set()
     for index, shot in enumerate(brief.evidence_shots):
@@ -762,12 +1085,47 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
             shot.visual_family = derived_for(shot, used, previous)
         used.add(shot.visual_family)
 
+    if len(brief.evidence_shots) >= 3 and len({shot.visual_family for shot in brief.evidence_shots}) < 3:
+        # Material variety is presentation policy. When a valid multi-beat
+        # story alternates only two treatments, convert one middle proof into
+        # a derived evidence card instead of asking the prose model to rewrite
+        # the whole story or invent another source.
+        for index in range(1, len(brief.evidence_shots) - 1):
+            shot = brief.evidence_shots[index]
+            if shot.visual_family in {"source_video", "source_image", "tweet", "quoted_post"}:
+                continue
+            previous = brief.evidence_shots[index - 1].visual_family
+            next_family = brief.evidence_shots[index + 1].visual_family
+            replacement = next((
+                family for family in derived_cycle
+                if family not in {previous, next_family}
+                and family not in {item.visual_family for item in brief.evidence_shots}
+            ), None)
+            if replacement:
+                shot.visual_family = replacement
+                break
+
+    # Material de-duplication above may turn a browser page into a derived
+    # card. Refit after that decision because cards render fact, implication,
+    # and translation together while browser holds do not.
+    for shot in brief.evidence_shots:
+        _fit_rendered_shot_copy(shot)
+
     if brief.duration_target > 15:
         # A long source post needs a longer first hold, but still remains one
         # complete card. Later beats must earn their own visual treatment.
         root_length = max((len(item.quote) for item in evidence if item.id in brief.evidence_shots[0].evidence_ids), default=0)
-        if root_length > 1200:
-            brief.evidence_shots[0].duration = 5.0
+        if root_length > 1200 and brief.evidence_shots[0].kind == EvidenceShotKind.TWEET_CARD:
+            other_duration = sum(shot.duration for shot in brief.evidence_shots[1:])
+            available = max(brief.evidence_shots[0].duration, 30.0 - other_duration)
+            brief.evidence_shots[0].duration = max(
+                brief.evidence_shots[0].duration,
+                min(_shot_duration_limit(brief.evidence_shots[0]), 8.0, available),
+            )
+        brief.duration_target = max(
+            brief.duration_target,
+            round(sum(shot.duration for shot in brief.evidence_shots), 3),
+        )
         return
 
     # Timing is an execution parameter, but a dense readable screen has
@@ -775,7 +1133,7 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
     # those per-shot durations instead of flattening every flash back to an
     # even 2.8-second cadence. If a weak model overschedules the target, shrink
     # only the room above the 1.3-second readability floor proportionally.
-    desired = [min(5.0, max(1.3, shot.duration)) for shot in brief.evidence_shots]
+    desired = [min(_shot_duration_limit(shot), max(1.3, shot.duration)) for shot in brief.evidence_shots]
     desired_total = sum(desired)
     if desired_total > brief.duration_target:
         floor = 1.3
@@ -922,14 +1280,21 @@ def _validate_radar_contract(brief: EditorialBrief, evidence: list[Evidence]) ->
     strategy = brief.attention_strategy
     headline = (strategy.selected_hook or brief.headline).strip()
     width = copy_width(headline)
-    exact_subject = any(
-        subject.name.strip() and subject.name.casefold() in headline.casefold()
-        for subject in brief.subjects
-    )
-    if width > 28 or (width > 20 and not exact_subject):
-        errors.append("Radar headline must fit 20 equivalents, or 28 only to preserve an exact subject name")
+    if width > 64:
+        errors.append("Radar headline must fit 64 equivalents; rewrite it as a complete stronger angle, never clip it")
     if _looks_like_radar_fragment(headline):
         errors.append("Radar selected hook must be a complete phrase, not a mechanically clipped fragment")
+    if re.search(r"(?:无需|没有|没|未).{0,16}(?:通信|沟通|指令|代码|协议)$", headline):
+        errors.append("Radar hook states only an absent condition; it must also say what the subject did or what changed")
+    relational = re.search(r"(?:结合|搭配|采用|基于|携手).{0,24}$", headline)
+    concrete_outcome = re.search(
+        r"完成|实现|做到|发布|推出|获得|开售|进入|进军|落地|"
+        r"抓取|抓药|称重|研磨|包装|配药|搬运|行驶|泊车|"
+        r"降低|提升|翻倍|维持|抬高|抬价|迁到|离开",
+        headline,
+    )
+    if relational and not concrete_outcome:
+        errors.append("Radar capability hook names components but omits the concrete task or outcome")
     visible_fields = [
         brief.headline, brief.subheadline, brief.fixed_conclusion,
         strategy.selected_hook, *strategy.hook_candidates,
@@ -1108,6 +1473,16 @@ def validate_editorial_brief(
         errors.append("hook uses empty hype without a concrete subject or number")
     if strategy.payoff.strip() == visible_hook:
         errors.append("hook and payoff must not repeat the same sentence")
+    if topic == TopicType.COMPANY_OR_TEAM:
+        audience_role = _funding_story_audience_label(brief)
+        if (
+            audience_role is not None
+            and _hook_is_led_by_financing(visible_hook)
+            and not _hook_names_audience_role(visible_hook, audience_role)
+        ):
+            errors.append(
+                f"funding-led company hook must name its explicit engineering audience: {audience_role[0]}"
+            )
     if not brief.headline.strip() or not brief.subheadline.strip() or not brief.fixed_conclusion.strip():
         errors.append("headline, subheadline, and fixed_conclusion are required")
     if content_type == ContentType.FLASH and copy_width(brief.fixed_conclusion) > 64:
@@ -1236,8 +1611,18 @@ def validate_editorial_brief(
             errors.append(
                 "causal-safety note replaced the story payoff; keep the event meaning first and qualify only the disputed link"
             )
-    if content_type == ContentType.FLASH and brief.duration_target > 15:
-        errors.append("flash duration must not exceed 15 seconds")
+    if content_type == ContentType.FLASH and brief.duration_target > 30:
+        errors.append("flash duration must not exceed 30 seconds")
+    static_ceiling = (
+        STATIC_RADAR_RESEARCH_MAX_DURATION
+        if content_type == ContentType.DEEP_DIVE else STATIC_RADAR_MAX_DURATION
+    )
+    if brief.opening_mode and not radar_has_source_video(brief) and brief.duration_target > static_ceiling:
+        errors.append(
+            "static Radar duration must remain below 15 seconds"
+            if static_ceiling == STATIC_RADAR_MAX_DURATION else
+            "static research Radar duration must not exceed 20 seconds"
+        )
     if not brief.evidence_shots:
         errors.append("at least one evidence shot is required")
     if candidate.source_type == SourceType.TWEET and brief.evidence_shots and brief.evidence_shots[0].kind != EvidenceShotKind.TWEET_CARD:
@@ -1248,8 +1633,35 @@ def validate_editorial_brief(
             errors.append(f"evidence_shots[{index}] needs question, fact, and interpretation")
         if not shot.evidence_ids or not set(shot.evidence_ids) <= evidence_ids:
             errors.append(f"evidence_shots[{index}] must cite valid evidence")
-        if shot.duration <= 0 or shot.duration > 5:
-            errors.append(f"evidence_shots[{index}].duration must be >0 and <=5")
+        cited_items = [
+            evidence_items_by_id[item]
+            for item in shot.evidence_ids if item in evidence_items_by_id
+        ]
+        cited_scope = any(item.source_kind == "discovery:selection_scope" for item in cited_items)
+        cited_factual = any(item.source_kind != "discovery:selection_scope" for item in cited_items)
+        if cited_scope and not cited_factual:
+            errors.append(
+                f"evidence_shots[{index}] cites discovery selection scope as factual proof; "
+                "cite the source video, roundup excerpt, or archived page instead"
+            )
+        if (
+            shot.kind == EvidenceShotKind.BROWSER_SECTION
+            and shot.visual_family not in {"quote_card", "timeline", "impact_card", "stat_card"}
+            and any(item.source_kind in {"discovery:selection_scope", "web:reported_context"} for item in cited_items)
+        ):
+            errors.append(
+                f"evidence_shots[{index}] cannot render internal/roundup context as a browser section"
+            )
+        duration_limit = _shot_duration_limit(shot)
+        if shot.duration <= 0 or shot.duration > duration_limit:
+            errors.append(
+                f"evidence_shots[{index}].duration must be >0 and <={duration_limit:g}"
+            )
+        reading_rate = visible_reading_rate(shot)
+        if reading_rate > 12.0:
+            errors.append(
+                f"evidence_shots[{index}] visible reading rate {reading_rate:.1f} exceeds 12 CJK-width units/second; delete or merge copy, or extend this shot"
+            )
         normalized = re.sub(r"\s+", "", shot.fact).casefold()
         if normalized in seen_facts:
             errors.append(f"evidence_shots[{index}] repeats a previous fact")
@@ -1283,6 +1695,29 @@ def validate_editorial_brief(
             errors.append(
                 f"evidence_shots[{index}].audience_copy duplicates internal interpretation; "
                 "write audience information separately or leave it empty"
+            )
+        cited_image = any(
+            item in evidence_items_by_id
+            and evidence_items_by_id[item].source_kind in {"web:source_image", "x:media_photo"}
+            for item in shot.evidence_ids
+        )
+        if shot.visual_family == "source_image" and (
+            shot.kind != EvidenceShotKind.IMAGE or not cited_image
+        ):
+            errors.append(
+                f"evidence_shots[{index}] source_image must cite verified image evidence"
+            )
+        cited_video = any(
+            item in evidence_items_by_id
+            and evidence_items_by_id[item].source_kind == "web:source_video"
+            and evidence_items_by_id[item].captured_asset
+            for item in shot.evidence_ids
+        )
+        if shot.visual_family == "source_video" and (
+            shot.kind != EvidenceShotKind.VIDEO or not cited_video
+        ):
+            errors.append(
+                f"evidence_shots[{index}] source_video must cite archived official video evidence"
             )
         if shot.visual_family in {"quote_card", "timeline", "impact_card", "stat_card"}:
             cited_text_sources = [
@@ -1412,7 +1847,7 @@ def validate_editorial_brief(
             if len(families) < 3:
                 errors.append("high-retention flash needs at least three visual families")
             supported_families = {
-                "tweet", "quoted_post", "official_page", "source_image", "product_ui", "chart", "timeline",
+                "tweet", "quoted_post", "official_page", "source_image", "source_video", "product_ui", "chart", "timeline",
                 "code", "paper", "quote_card", "impact_card", "stat_card",
             }
             unknown_families = families - supported_families
@@ -1427,13 +1862,35 @@ def validate_editorial_brief(
                     "tweet", "quoted_post", "quote_card", "timeline", "impact_card", "stat_card",
                 }:
                     errors.append(f"evidence_shots[{index}] assigns a browser family to tweet evidence")
-                if shot.visual_family == "source_image" and shot.kind != EvidenceShotKind.IMAGE:
+                cited_image = any(
+                    item in evidence_items_by_id
+                    and evidence_items_by_id[item].source_kind in {"web:source_image", "x:media_photo"}
+                    for item in shot.evidence_ids
+                )
+                if shot.visual_family == "source_image" and (
+                    shot.kind != EvidenceShotKind.IMAGE or not cited_image
+                ):
                     errors.append(f"evidence_shots[{index}] uses source_image without image evidence")
+                cited_video = any(
+                    item in evidence_items_by_id
+                    and evidence_items_by_id[item].source_kind == "web:source_video"
+                    and evidence_items_by_id[item].captured_asset
+                    for item in shot.evidence_ids
+                )
+                if shot.visual_family == "source_video" and (
+                    shot.kind != EvidenceShotKind.VIDEO or not cited_video
+                ):
+                    errors.append(f"evidence_shots[{index}] uses source_video without video evidence")
             for previous, current in zip(brief.evidence_shots, brief.evidence_shots[1:]):
                 if previous.visual_family == current.visual_family and set(previous.evidence_ids) == set(current.evidence_ids):
                     errors.append("consecutive flash shots cannot repeat the same evidence treatment")
-            if any(shot.duration > (3.2 if shot.kind == EvidenceShotKind.TWEET_CARD else 2.8) for shot in brief.evidence_shots):
-                errors.append("flash shots must change every 1.3–2.8 seconds; a complete tweet may use at most 3.2 seconds")
+            if any(
+                shot.duration > _shot_duration_limit(shot)
+                for shot in brief.evidence_shots
+            ):
+                errors.append(
+                    "flash evidence cards may hold for at most 8 seconds, tweet cards for 10, and source video for 12"
+                )
             if any(shot.duration < 1.3 for shot in brief.evidence_shots):
                 errors.append("flash shots shorter than 1.3 seconds are unreadable without narration")
             first = brief.evidence_shots[0]
@@ -1516,11 +1973,49 @@ def validate_editorial_brief(
     return errors
 
 
-def _validate_story_axis_structure(brief: EditorialBrief, candidate: Candidate) -> list[str]:
+def _validate_story_axis_structure(
+    brief: EditorialBrief, candidate: Candidate, evidence: list[Evidence],
+) -> list[str]:
     """Keep retention optimization inside the selected story promise."""
     errors: list[str] = []
     strategy = brief.attention_strategy
     visible_hook = strategy.selected_hook.strip()
+    quantified_research_values = re.findall(
+        r"\d+(?:\.\d+)?\s*%",
+        " ".join((strategy.conflict, strategy.surprise)),
+    )
+    hook_percent_values = {
+        float(value) for value in re.findall(r"(\d+(?:\.\d+)?)\s*%", visible_hook)
+    }
+    expected_percent_values = {
+        float(re.search(r"\d+(?:\.\d+)?", value).group())
+        for value in quantified_research_values
+    }
+    if (
+        brief.opportunity
+        and brief.opportunity.story_archetype == "research_disclosure"
+        and quantified_research_values
+        and not (hook_percent_values & expected_percent_values)
+    ):
+        errors.append(
+            "quantified research hook must lead with an exact result instead of a neutral framework announcement"
+        )
+    if brief.opportunity and brief.opportunity.story_archetype == "research_disclosure":
+        subject_anchors: list[str] = []
+        for subject in brief.subjects:
+            subject_anchors.extend(
+                token for token in re.findall(r"[A-Za-z][A-Za-z0-9._-]+", subject.name)
+                if len(token) >= 2
+            )
+            chinese_name = re.sub(r"(?:研究)?团队$", "", subject.name.strip())
+            if len(chinese_name) >= 3:
+                subject_anchors.append(chinese_name)
+        if subject_anchors and not any(
+            anchor.casefold() in visible_hook.casefold() for anchor in subject_anchors
+        ):
+            errors.append(
+                "research-disclosure hook must name its institution, system, or studied actor before the result"
+            )
     if (
         brief.opportunity
         and brief.opportunity.story_archetype == "people_change"
@@ -1577,6 +2072,49 @@ def _validate_story_axis_structure(brief: EditorialBrief, candidate: Candidate) 
             errors.append(
                 "people-change story must establish the main person's role and recognizable work in an early identity-anchor beat"
             )
+
+    if brief.opportunity and brief.opportunity.selection_reasons:
+        primary_reason = brief.opportunity.selection_reasons[0]
+        if primary_reason.dimension == "competition":
+            # Capitalized Latin tokens inside a Chinese competition rationale
+            # are normally the exact brand anchors selected before writing.
+            # Keep their spelling/casing: Smart is the car brand, not the
+            # adjective "smart", and generic category copy cannot replace it.
+            non_brand_tokens = {
+                "AI", "API", "EV", "GPU", "CPU", "LMP", "MARL", "Agent",
+                "China", "Chinese", "Europe", "European", "Big",
+            }
+            brand_anchors = list(dict.fromkeys(
+                token for token in re.findall(r"\b[A-Z][A-Za-z.+-]{2,}\b", primary_reason.rationale)
+                if token not in non_brand_tokens and not any(character.isdigit() for character in token)
+            ))
+            reason_evidence = "\n".join(
+                item.quote for item in evidence if item.id in primary_reason.evidence_ids
+            )
+            familiar_companies = (
+                "Smart", "Liux", "OpenAI", "Anthropic", "Google", "DeepMind",
+                "Waymo", "Tesla", "Apple", "Microsoft", "Meta", "Amazon",
+                "NVIDIA", "BYD", "Xiaomi", "Huawei",
+            )
+            brand_anchors = list(dict.fromkeys([
+                *brand_anchors,
+                *(
+                    name for name in familiar_companies if re.search(
+                        rf"(?:\b{re.escape(name)}\b.{{0,180}}(?:mov(?:e|ed|ing).{{0,30}}(?:production|manufactur)|"
+                        rf"(?:production|manufactur).{{0,30}}(?:China|中国)|迁往中国|转向中国)|"
+                        rf"(?:mov(?:e|ed|ing).{{0,30}}(?:production|manufactur)|"
+                        rf"(?:production|manufactur).{{0,30}}(?:China|中国)|迁往中国|转向中国).{{0,180}}"
+                        rf"\b{re.escape(name)}\b)",
+                        reason_evidence, re.IGNORECASE | re.DOTALL,
+                    )
+                ),
+            ]))
+            missing_anchors = [token for token in brand_anchors if token not in visible_hook]
+            if len(brand_anchors) >= 2 and missing_anchors:
+                errors.append(
+                    "competition hook must preserve exact named brands from the locked selection reason: "
+                    + ", ".join(missing_anchors)
+                )
 
     parsed = urlparse(candidate.source_url)
     is_openrouter_discount = (
@@ -1700,8 +2238,9 @@ def validate_editorial_structure(
     """
     errors: list[str] = []
     errors.extend(_validate_radar_contract(brief, evidence))
-    errors.extend(_validate_story_axis_structure(brief, candidate))
+    errors.extend(_validate_story_axis_structure(brief, candidate, evidence))
     evidence_ids = {item.id for item in evidence}
+    evidence_items_by_id = {item.id: item for item in evidence}
     strategy = brief.attention_strategy
     for name, value in {
         "hook_fact": strategy.hook_fact,
@@ -1740,8 +2279,18 @@ def validate_editorial_structure(
             errors.append("every subject needs name, action, and consequence")
         if not set(subject.evidence_ids) <= evidence_ids:
             errors.append(f"subject {subject.name or '<missing>'} references unknown evidence")
-    if content_type == ContentType.FLASH and brief.duration_target > 15:
-        errors.append("flash duration must not exceed 15 seconds")
+    if content_type == ContentType.FLASH and brief.duration_target > 30:
+        errors.append("flash duration must not exceed 30 seconds")
+    static_ceiling = (
+        STATIC_RADAR_RESEARCH_MAX_DURATION
+        if content_type == ContentType.DEEP_DIVE else STATIC_RADAR_MAX_DURATION
+    )
+    if brief.opening_mode and not radar_has_source_video(brief) and brief.duration_target > static_ceiling:
+        errors.append(
+            "static Radar duration must remain below 15 seconds"
+            if static_ceiling == STATIC_RADAR_MAX_DURATION else
+            "static research Radar duration must not exceed 20 seconds"
+        )
     if not brief.evidence_shots:
         return [*errors, "at least one evidence shot is required"]
     if candidate.source_type == SourceType.TWEET and brief.evidence_shots[0].kind != EvidenceShotKind.TWEET_CARD:
@@ -1759,8 +2308,16 @@ def validate_editorial_structure(
             errors.append(f"evidence_shots[{index}] needs question, fact, and interpretation")
         if not shot.evidence_ids or not set(shot.evidence_ids) <= evidence_ids:
             errors.append(f"evidence_shots[{index}] must cite valid evidence")
-        if shot.duration <= 0 or shot.duration > 5:
-            errors.append(f"evidence_shots[{index}].duration must be >0 and <=5")
+        duration_limit = _shot_duration_limit(shot)
+        if shot.duration <= 0 or shot.duration > duration_limit:
+            errors.append(
+                f"evidence_shots[{index}].duration must be >0 and <={duration_limit:g}"
+            )
+        reading_rate = visible_reading_rate(shot)
+        if reading_rate > 12.0:
+            errors.append(
+                f"evidence_shots[{index}] visible reading rate {reading_rate:.1f} exceeds 12 CJK-width units/second; delete or merge copy, or extend this shot"
+            )
         normalized = re.sub(r"\s+", "", shot.fact).casefold()
         if normalized in seen_facts:
             errors.append(f"evidence_shots[{index}] repeats a previous fact")
@@ -1769,8 +2326,25 @@ def validate_editorial_structure(
             errors.append(f"evidence_shots[{index}] exposes an internal production label")
         if shot.visual_family in {"tweet", "quoted_post"} and shot.kind != EvidenceShotKind.TWEET_CARD:
             errors.append(f"evidence_shots[{index}] uses an X-card family without tweet_card evidence")
-        if shot.visual_family == "source_image" and shot.kind != EvidenceShotKind.IMAGE:
+        cited_image = any(
+            item in evidence_items_by_id
+            and evidence_items_by_id[item].source_kind in {"web:source_image", "x:media_photo"}
+            for item in shot.evidence_ids
+        )
+        if shot.visual_family == "source_image" and (
+            shot.kind != EvidenceShotKind.IMAGE or not cited_image
+        ):
             errors.append(f"evidence_shots[{index}] source_image must compile to image material")
+        cited_video = any(
+            item in evidence_items_by_id
+            and evidence_items_by_id[item].source_kind == "web:source_video"
+            and evidence_items_by_id[item].captured_asset
+            for item in shot.evidence_ids
+        )
+        if shot.visual_family == "source_video" and (
+            shot.kind != EvidenceShotKind.VIDEO or not cited_video
+        ):
+            errors.append(f"evidence_shots[{index}] source_video must compile to video material")
     if sum(shot.duration for shot in brief.evidence_shots) > brief.duration_target + 0.01:
         errors.append("evidence shot durations exceed duration_target")
     if len(brief.evidence_shots) > 1 and not any(
@@ -1956,7 +2530,10 @@ def compile_evidence_shots(brief: EditorialBrief, candidate: Candidate) -> list[
 
 
 def _material_role(kind: EvidenceShotKind) -> MaterialRole:
-    if kind in {EvidenceShotKind.TWEET_CARD, EvidenceShotKind.BROWSER_SECTION, EvidenceShotKind.PDF_PAGE, EvidenceShotKind.CODE_EXAMPLE, EvidenceShotKind.TERMINAL_DEMO}:
+    if kind in {
+        EvidenceShotKind.TWEET_CARD, EvidenceShotKind.BROWSER_SECTION, EvidenceShotKind.VIDEO,
+        EvidenceShotKind.PDF_PAGE, EvidenceShotKind.CODE_EXAMPLE, EvidenceShotKind.TERMINAL_DEMO,
+    }:
         return MaterialRole.PROOF
     if kind == EvidenceShotKind.IMAGE:
         return MaterialRole.ILLUSTRATION
@@ -1968,6 +2545,7 @@ def _visual_action(shot: EvidenceShot) -> str:
         EvidenceShotKind.TWEET_CARD: "show the complete original post without splitting it",
         EvidenceShotKind.BROWSER_SECTION: "navigate a real browser to one exact page section",
         EvidenceShotKind.IMAGE: "show a source image without slow zoom",
+        EvidenceShotKind.VIDEO: "show one uninterrupted best-action clip from the official source video",
         EvidenceShotKind.PDF_PAGE: "show the real PDF page and its page number",
         EvidenceShotKind.FIGURE: "focus the cited figure and caption",
         EvidenceShotKind.BENCHMARK_CHART: "focus the cited benchmark row, column, and conditions",

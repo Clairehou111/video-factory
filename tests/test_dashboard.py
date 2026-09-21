@@ -1,7 +1,9 @@
 import hashlib
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from video_factory.collection_publish import (
     CollectionPublishBatch, CollectionPublishItem, CollectionPublishItemState,
@@ -19,12 +21,26 @@ class FakeDashboardBackend:
 
     def __init__(self) -> None:
         self.uploaded = []
+        self.schedules = []
+        self.auth_valid = True
+        self.login_calls = 0
 
     def check_account(self, target):
+        if not self.auth_valid:
+            return BackendResult(
+                ["check"], 1, "cookie 已失效（页面跳转到登录页）",
+                started=True,
+            )
         return BackendResult(["check"], 0, "valid", started=True)
+
+    def login_account(self, platform, account_name, headless=False):
+        self.login_calls += 1
+        self.auth_valid = True
+        return BackendResult(["login"], 0, "login completed", started=True)
 
     def submit_collection_video(self, target, video_path):
         self.uploaded.append((target.platform, video_path.name))
+        self.schedules.append(target.schedule_at)
         return BackendResult(["upload"], 0, '{"video_id":"wechat-1"}', started=True)
 
     def ensure_bilibili_collection(self, account_name, title):
@@ -74,6 +90,26 @@ class DashboardTest(unittest.TestCase):
             self.assertTrue(rows[0]["can_publish"])
             self.assertEqual(list(media.values())[0].name, "wechat.mp4")
 
+    def test_queue_shows_only_latest_rerender_for_same_youtube_source(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            batch.id = "dashboard-batch-new"
+            batch.manifest_id = "rerendered-manifest"
+            batch.created_at = "9999-01-01T00:00:00Z"
+            workspace.save_publish_batch(batch)
+
+            with patch.object(
+                workspace, "load_collection_manifest",
+                return_value=SimpleNamespace(
+                    source_video_id="same-video", source_url="https://youtube.test/watch",
+                    source_title="Interview", editorial_mode="known_tech_interview_clip",
+                ),
+            ):
+                rows, _ = PublishDashboard(workspace).queue()
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["batch_id"], "dashboard-batch-new")
+
     def test_publish_button_approves_and_submits_only_selected_wechat_item(self) -> None:
         with TemporaryDirectory() as temp:
             workspace, batch = self.make_batch(Path(temp))
@@ -87,6 +123,60 @@ class DashboardTest(unittest.TestCase):
             restored = workspace.load_publish_batch(batch.id)
             self.assertEqual(restored.items[0].state, CollectionPublishItemState.SUBMITTED)
             self.assertEqual(restored.items[1].state, CollectionPublishItemState.PENDING)
+
+    def test_publish_can_set_audited_beijing_schedule_before_approval(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            backend = FakeDashboardBackend()
+            dashboard = PublishDashboard(workspace, actor="claire", backend_factory=lambda: backend)
+
+            result = dashboard.publish(
+                batch.id, "wechat-item", "2099-09-16 20:30", update_schedule=True,
+            )
+
+            self.assertTrue(result["published"])
+            self.assertEqual(backend.schedules, ["2099-09-16 20:30"])
+            restored = workspace.load_publish_batch(batch.id)
+            self.assertEqual(restored.items[0].schedule_at, "2099-09-16 20:30")
+            self.assertEqual(
+                restored.approval_payload()["items"][0]["schedule_at"],
+                "2099-09-16 20:30",
+            )
+
+    def test_publish_rejects_schedule_without_two_hour_lead_time(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            dashboard = PublishDashboard(workspace)
+
+            with self.assertRaisesRegex(ValueError, "至少需要提前 2 小时"):
+                dashboard.publish(
+                    batch.id, "wechat-item", "2020-01-01 20:30",
+                    update_schedule=True,
+                )
+
+    def test_withdrawn_batch_is_kept_for_audit_but_hidden_from_queue(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Workspace(root / "workspace")
+            workspace.initialize()
+            video = root / "withdrawn.mp4"
+            video.write_bytes(b"withdrawn-video")
+            batch = PublishBatch(
+                id="withdrawn-batch", manifest_id="missing-withdrawn-manifest",
+                video_path=str(video),
+                video_sha256=hashlib.sha256(video.read_bytes()).hexdigest(),
+                targets=[PublishTarget(PublishPlatform.TENCENT, "main", "广告感太强")],
+                state=PublishBatchState.READY_FOR_REVIEW,
+            )
+            batch.withdraw_from_queue("editorial review: feels like an advertisement")
+            workspace.save_publish_batch(batch)
+
+            rows, _ = PublishDashboard(workspace).queue()
+
+            self.assertEqual(rows, [])
+            restored = workspace.load_publish_batch(batch.id)
+            self.assertTrue(restored.queue_hidden)
+            self.assertIn("advertisement", restored.queue_hidden_reason)
 
     def test_sensitive_video_requires_separate_review_before_publish(self) -> None:
         with TemporaryDirectory() as temp:
@@ -125,6 +215,55 @@ class DashboardTest(unittest.TestCase):
             rows, _ = dashboard.queue()
             self.assertFalse(rows[0]["can_review"])
             self.assertTrue(rows[0]["can_publish"])
+
+    def test_collection_rights_review_is_explicit_and_bound_into_approval(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            batch.state = PublishBatchState.BLOCKED
+            batch.checks = [{
+                "name": "rights_review", "passed": False,
+                "detail": "human reuse-basis review required before publication",
+            }]
+            workspace.save_publish_batch(batch)
+            dashboard = PublishDashboard(workspace, actor="claire")
+
+            rows, _ = dashboard.queue()
+            self.assertTrue(rows[0]["can_review"])
+            self.assertEqual(rows[0]["review_check"], "rights_review")
+            self.assertEqual(rows[0]["action_label"], "确认复用依据已审核")
+
+            result = dashboard.review(batch.id, "wechat-item")
+
+            self.assertTrue(result["reviewed"])
+            restored = workspace.load_publish_batch(batch.id)
+            self.assertEqual(restored.state, PublishBatchState.READY_FOR_REVIEW)
+            self.assertIn("rights_review", restored.review_overrides)
+            self.assertIn("review_overrides", restored.approval_payload())
+
+    def test_expired_login_becomes_bounded_login_and_publish_recovery(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            backend = FakeDashboardBackend()
+            backend.auth_valid = False
+            dashboard = PublishDashboard(
+                workspace, actor="claire", backend_factory=lambda: backend,
+            )
+
+            first = dashboard.publish(batch.id, "wechat-item")
+            self.assertFalse(first["published"])
+            self.assertTrue(first["requires_login"])
+            rows, _ = dashboard.queue()
+            self.assertTrue(rows[0]["requires_login"])
+            self.assertEqual(rows[0]["action_label"], "登录视频号并继续发布")
+
+            recovered = dashboard.login_and_publish(batch.id, "wechat-item")
+
+            self.assertTrue(recovered["published"])
+            self.assertTrue(recovered["login_recovered"])
+            self.assertEqual(backend.login_calls, 1)
+            self.assertEqual(backend.uploaded, [(PublishPlatform.TENCENT, "wechat.mp4")])
+            attempts = list((workspace.publish_dir / batch.id / "attempts").glob("*.json"))
+            self.assertTrue(any("login_recovery" in path.name for path in attempts))
 
 
 if __name__ == "__main__":

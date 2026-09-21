@@ -17,9 +17,11 @@ from video_factory.publish import (
     SocialAutoUploadBackend,
     SocialAutoUploadSettings,
     _apply_upstream_compatibility_patches,
+    account_auth_required,
+    publisher_error_text,
     _is_definitive_pre_submit_failure,
     _redact_output,
-    create_publish_batch,
+    create_publish_batch, wechat_feed_title, wechat_short_title,
     targets_from_spec,
 )
 from video_factory.storage import Workspace
@@ -162,12 +164,27 @@ class PublishBatchTest(unittest.TestCase):
             self.assertEqual(corrupt.state, PublishBatchState.BLOCKED)
             self.assertFalse(next(check for check in corrupt.checks if check["name"] == "video_probe")["passed"])
 
-            wrong = VideoProbe(video, 16.0, 1920, 1080, "hevc", "yuv444p", None)
+            wrong = VideoProbe(video, 31.0, 1920, 1080, "hevc", "yuv444p", None)
             with patch("video_factory.publish.probe_video", return_value=wrong):
                 noncompliant = create_publish_batch(valid_manifest(video), [target], root)
             self.assertEqual(noncompliant.state, PublishBatchState.BLOCKED)
             failed = {check["name"] for check in noncompliant.checks if not check["passed"]}
             self.assertTrue({"resolution", "h264", "yuv420p", "aac", "duration"} <= failed)
+
+    def test_flash_publish_gate_accepts_readable_cut_up_to_30_seconds(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            target = PublishTarget(PublishPlatform.TENCENT, "main", "测试标题")
+            probe = VideoProbe(video, 20.0, 1080, 1920, "h264", "yuv420p", "aac")
+
+            with patch("video_factory.publish.probe_video", return_value=probe):
+                batch = create_publish_batch(valid_manifest(video), [target], root / "workspace")
+
+            duration = next(check for check in batch.checks if check["name"] == "duration")
+            self.assertTrue(duration["passed"])
+            self.assertIn("max 30.00s", duration["detail"])
 
     def test_batch_approval_is_bound_to_exact_video_and_metadata(self) -> None:
         with TemporaryDirectory() as temp:
@@ -290,6 +307,14 @@ class PublishBatchTest(unittest.TestCase):
         self.assertFalse(_is_definitive_pre_submit_failure(
             ["tencent", "upload-video"], "", "browser closed after final publish click",
         ))
+
+    def test_auth_recovery_detects_current_chinese_cookie_message_and_ansi(self) -> None:
+        self.assertTrue(account_auth_required(
+            "\x1b[97m🥹 cookie 已失效（页面跳转到登录页），得重新登录一下\x1b[0m",
+        ))
+        self.assertFalse(account_auth_required("browser closed after final publish click"))
+        self.assertNotIn("\x1b", publisher_error_text("\x1b[97mcookie=<secret> expired\x1b[0m"))
+        self.assertIn("cookie=<redacted>", publisher_error_text("cookie=secret expired"))
 
     def test_wechat_upload_uses_headed_browser(self) -> None:
         with TemporaryDirectory() as temp:
@@ -439,12 +464,42 @@ class PublishBatchTest(unittest.TestCase):
             self.assertIn('get_by_role("checkbox", name="声明原创")', patched)
             self.assertIn("无法确认视频号原创声明已勾选，停止发表", patched)
             self.assertIn("debug_tencent_original_statement.html", patched)
-            self.assertNotIn("Video Factory republishes edited source material", patched)
+            self.assertIn("if not self.category", patched)
+            self.assertIn("包含第三方源视频，未勾选原创声明", patched)
+            self.assertIn("source-aware WeChat originality policy", patched)
             patched_cli = cli.read_text(encoding="utf-8")
             self.assertIn('"list", "--max-pages", "1"', patched_cli)
             self.assertIn("Batch preflight already checked credentials", patched_cli)
             self.assertNotIn("is_ready = await tencent_setup", patched_cli)
             self.assertEqual(_apply_upstream_compatibility_patches(source), [])
+
+    def test_wechat_short_title_uses_complete_clause_instead_of_raw_truncation(self) -> None:
+        value = wechat_short_title("AI不是零和游戏：开源、推理云、应用都能赢")
+
+        self.assertEqual(value, "AI不是零和游戏")
+        self.assertGreaterEqual(len(value), 7)
+        self.assertLessEqual(len(value), 15)
+
+    def test_wechat_feed_title_selects_a_complete_claim_instead_of_slicing(self) -> None:
+        value = wechat_feed_title(
+            "全球换电普遍遇冷，汽车巨头麦格纳为何追加3500万美元重注印度两轮换电？",
+        )
+
+        self.assertEqual(value, "汽车巨头麦格纳为何追加3500万美元重注印度两轮换电？")
+        self.assertLessEqual(len(value), 30)
+
+    def test_direct_youtube_source_does_not_receive_original_category(self) -> None:
+        with TemporaryDirectory() as temp:
+            video = Path(temp) / "clip.mp4"
+            video.write_bytes(b"clip")
+            manifest = valid_manifest(video)
+            manifest.source_urls = ["https://www.youtube.com/watch?v=source123"]
+            target = PublishTarget(PublishPlatform.TENCENT, "main", "完整技术访谈片段")
+            with patch("video_factory.publish.probe_video", side_effect=self.valid_probe):
+                create_publish_batch(manifest, [target], Path(temp))
+
+        self.assertNotIn("category", target.options)
+        self.assertEqual(target.options["short_title"], "完整技术访谈片段")
 
     def test_setup_installs_managed_chromium_when_local_chrome_is_unavailable(self) -> None:
         with TemporaryDirectory() as temp:

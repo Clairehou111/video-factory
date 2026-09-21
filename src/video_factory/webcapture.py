@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from .github_editor import select_github_focuses
+from .media import probe_video
 from .models import CaptureCue, CueAction, GitHubProjectBrief, GitHubWalkthrough, RenderManifest
 
 
@@ -28,10 +30,18 @@ class WebScrollVideoSettings:
     root: Path
     node: str = "node"
     highlight_gap: int = 8
+    capture_timeout_seconds: int = 180
 
     @classmethod
     def from_environment(cls) -> "WebScrollVideoSettings":
-        return cls(Path(os.environ.get("WEB_SCROLL_VIDEO_ROOT", "../web-scroll-video")).resolve())
+        try:
+            timeout = int(os.environ.get("VIDEO_FACTORY_WEB_CAPTURE_TIMEOUT_SECONDS", "180"))
+        except ValueError:
+            timeout = 180
+        return cls(
+            Path(os.environ.get("WEB_SCROLL_VIDEO_ROOT", "../web-scroll-video")).resolve(),
+            capture_timeout_seconds=max(30, min(timeout, 600)),
+        )
 
 
 class WebScrollVideoAdapter:
@@ -128,6 +138,36 @@ class WebScrollVideoAdapter:
         )
         return runner
 
+    def _run_capture_command(self, command: list[str]) -> None:
+        """Run the recorder in its own process group and reap every child on timeout."""
+        process = subprocess.Popen(command, start_new_session=True)
+        try:
+            returncode = process.wait(timeout=self.settings.capture_timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait()
+            raise RuntimeError(
+                f"web-scroll-video exceeded the {self.settings.capture_timeout_seconds}s capture timeout"
+            ) from error
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, command)
+
     def capture(self, request: WebCaptureRequest) -> Path:
         working = request
         repairs: list[dict[str, str]] = []
@@ -152,9 +192,19 @@ class WebScrollVideoAdapter:
                         "repair": "run the pinned upstream capture runner without optional visual patches",
                     })
             try:
-                subprocess.run(
-                    self.build_command(cue_path, working.storyboard_dir, runner_path), check=True,
+                self._run_capture_command(
+                    self.build_command(cue_path, working.storyboard_dir, runner_path),
                 )
+            except RuntimeError as error:
+                if not self._usable_completed_output(working):
+                    raise
+                runner_strategy = "valid_output_after_recorder_timeout"
+                fallback_reason = str(error)
+                repairs.append({
+                    "kind": "recorder_timeout_after_valid_output",
+                    "error": fallback_reason,
+                    "repair": "verify and reuse the complete recorded MP4",
+                })
             except subprocess.CalledProcessError as error:
                 missing = self._missing_text_from_error(cue_path)
                 if not missing and not prefer_upstream_runner:
@@ -167,18 +217,27 @@ class WebScrollVideoAdapter:
                         "repair": "retry once with the pinned upstream capture runner",
                     })
                     continue
-                if attempt >= 3 or not missing:
+                if not missing and self._usable_completed_output(working):
+                    runner_strategy = "valid_output_after_recorder_exit"
+                    fallback_reason = f"recorder exited {error.returncode} after writing a complete MP4"
+                    repairs.append({
+                        "kind": "recorder_exit_after_valid_output",
+                        "error": fallback_reason,
+                        "repair": "verify and reuse the complete recorded MP4",
+                    })
+                elif attempt >= 3 or not missing:
                     raise
-                repaired = self._repair_missing_text_request(working, missing)
-                if repaired.cues == working.cues:
-                    raise
-                repairs.append({
-                    "kind": "missing_visible_text",
-                    "missing_target": missing,
-                    "repair": "scroll to source-page bottom and hold without a false highlight",
-                })
-                working = repaired
-                continue
+                else:
+                    repaired = self._repair_missing_text_request(working, missing)
+                    if repaired.cues == working.cues:
+                        raise
+                    repairs.append({
+                        "kind": "missing_visible_text",
+                        "missing_target": missing,
+                        "repair": "scroll to source-page bottom and hold without a false highlight",
+                    })
+                    working = repaired
+                    continue
             if not working.output.is_file():
                 raise RuntimeError(f"web-scroll-video did not create {working.output}")
             try:
@@ -208,6 +267,21 @@ class WebScrollVideoAdapter:
                 json.dumps(repairs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
             )
         return working.output
+
+    @classmethod
+    def _usable_completed_output(cls, request: WebCaptureRequest) -> bool:
+        """Accept a recorder's complete MP4 when only its cleanup exits nonzero."""
+        if not request.output.is_file():
+            return False
+        try:
+            probe = probe_video(request.output)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return False
+        expected = float(cls.capture_metadata(request)["duration"])
+        return (
+            probe.width == request.width and probe.height == request.height
+            and probe.duration >= max(0.1, expected - 0.25)
+        )
 
     @staticmethod
     def _missing_text_from_error(cue_path: Path) -> str:

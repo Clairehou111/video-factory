@@ -120,8 +120,16 @@ class StoryboardDirector:
             if not set(proposal.evidence_ids) <= evidence_ids:
                 raise ValueError(f"scene {index} references unknown evidence")
             duration = proposal.duration_hint or max(2.0, len(proposal.narration) / self.words_per_second)
-            if duration > 5.0:
-                raise ValueError(f"scene {index} is {duration:.1f}s; split it so visual change occurs within 5 seconds")
+            cadence_limit = (
+                12.0 if proposal.visual_family == "source_video" else
+                10.0 if proposal.visual_family in {"tweet", "quoted_post"} else
+                10.0
+            )
+            if duration > cadence_limit:
+                raise ValueError(
+                    f"scene {index} is {duration:.1f}s; split it so visual change occurs "
+                    f"within {cadence_limit:g} seconds"
+                )
             scenes.append(Scene(
                 id=f"scene-{index}", start=round(cursor, 3), end=round(cursor + duration, 3),
                 narration=proposal.narration, caption=proposal.caption, evidence_ids=proposal.evidence_ids,
@@ -139,7 +147,7 @@ class StoryboardDirector:
         # 12.000000000000002. Treat that as the requested 12.0 seconds rather
         # than sending a valid story back through another expensive LLM loop.
         if cursor > request.target_duration + 0.001:
-            if request.content_type == ContentType.FLASH and cursor <= 15.0:
+            if request.content_type == ContentType.FLASH and cursor <= 30.0:
                 # A ten-second Radar target is a pacing goal, not permission to
                 # crush readable evidence. Keep the Flash format and extend
                 # only as far as the already-selected shots require.

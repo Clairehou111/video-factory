@@ -44,6 +44,7 @@ class CollectionPublishItem:
     description: str
     tags: list[str]
     options: dict[str, Any]
+    schedule_at: str | None = None
     state: CollectionPublishItemState = CollectionPublishItemState.PENDING
     attempts: int = 0
     remote_id: str = ""
@@ -55,7 +56,9 @@ class CollectionPublishItem:
             self.platform = PublishPlatform(self.platform)
         if not isinstance(self.state, CollectionPublishItemState):
             self.state = CollectionPublishItemState(self.state)
-        self.as_publish_target().validate()
+        target = self.as_publish_target()
+        target.validate()
+        self.options = target.options
 
     def as_publish_target(self) -> PublishTarget:
         options = dict(self.options)
@@ -63,7 +66,7 @@ class CollectionPublishItem:
             options.setdefault("collection", self.collection_title)
         return PublishTarget(
             self.platform, self.account_name, self.title, self.description,
-            list(self.tags), options=options,
+            list(self.tags), schedule_at=self.schedule_at, options=options,
         )
 
     def approval_payload(self) -> dict[str, Any]:
@@ -78,7 +81,7 @@ class CollectionPublishItem:
             "collection_title": self.collection_title, "order": self.order,
             "video_path": str(Path(self.video_path).resolve()), "video_sha256": self.video_sha256,
             "title": self.title, "description": self.description,
-            "tags": self.tags, "options": self.options,
+            "tags": self.tags, "schedule_at": self.schedule_at, "options": self.options,
             "option_file_sha256": option_file_sha256,
         }
 
@@ -94,9 +97,13 @@ class CollectionPublishBatch:
     backend_commit: str = SOCIAL_AUTO_UPLOAD_COMMIT
     batch_type: str = "collection"
     remote_collection_id: str = ""
+    review_overrides: dict[str, dict[str, str]] = field(default_factory=dict)
     approval_digest: str | None = None
     approved_by: str | None = None
     approved_at: str | None = None
+    queue_hidden: bool = False
+    queue_hidden_reason: str = ""
+    queue_hidden_at: str = ""
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
 
@@ -117,7 +124,16 @@ class CollectionPublishBatch:
             "manifest_id": self.manifest_id, "collection_title": self.collection_title,
             "backend_commit": self.backend_commit,
             "items": [item.approval_payload() for item in self.items],
+            "review_overrides": self.review_overrides,
         }
+
+    def withdraw_from_queue(self, reason: str) -> None:
+        if not reason.strip():
+            raise ValueError("queue withdrawal requires a reason")
+        self.queue_hidden = True
+        self.queue_hidden_reason = reason.strip()
+        self.queue_hidden_at = now_iso()
+        self.updated_at = now_iso()
 
     def compute_approval_digest(self) -> str:
         encoded = json.dumps(self.approval_payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -132,6 +148,31 @@ class CollectionPublishBatch:
         self.approved_by = actor.strip()
         self.approved_at = now_iso()
         self.state = PublishBatchState.APPROVED
+        self.updated_at = now_iso()
+
+    def record_review_override(self, check_name: str, actor: str, reason: str) -> None:
+        """Record the mandatory human reuse-basis review for interview media."""
+        if check_name != "rights_review":
+            raise ValueError(f"collection quality check cannot be overridden: {check_name}")
+        if self.state != PublishBatchState.BLOCKED:
+            raise ValueError(f"review override requires a blocked batch; current state is {self.state}")
+        if not actor.strip() or not reason.strip():
+            raise ValueError("review override requires an actor and reason")
+        check = next((row for row in self.checks if row.get("name") == check_name), None)
+        if check is None or check.get("passed", False):
+            raise ValueError(f"batch has no failed {check_name} check")
+        original_detail = str(check.get("detail") or "")
+        self.review_overrides[check_name] = {
+            "actor": actor.strip(), "reason": reason.strip(),
+            "reviewed_at": now_iso(), "original_detail": original_detail,
+        }
+        check["passed"] = True
+        check["detail"] = f"人工审核通过：{reason.strip()}（原门禁：{original_detail}）"
+        if all(bool(row.get("passed", False)) for row in self.checks):
+            self.state = PublishBatchState.READY_FOR_REVIEW
+        self.approval_digest = None
+        self.approved_by = None
+        self.approved_at = None
         self.updated_at = now_iso()
 
     def verify_approval(self) -> None:
@@ -219,7 +260,7 @@ def create_collection_publish_batch(
             raise ValueError(f"collection publishing does not support platform: {platform_name}")
         if not isinstance(raw, dict):
             raise ValueError(f"collection target {platform_name} must be an object")
-        allowed_target = {"account", "tid", "tags", "description", "collection"}
+        allowed_target = {"account", "tid", "tags", "description", "collection", "schedule_at"}
         unknown_target = set(raw) - allowed_target
         if unknown_target:
             raise ValueError(f"unsupported {platform_name} collection fields: {', '.join(sorted(unknown_target))}")
@@ -246,6 +287,7 @@ def create_collection_publish_batch(
                 title=render.title or collection_item.title,
                 description=str(raw.get("description") or render.description),
                 tags=[str(tag) for tag in raw.get("tags", render.tags)], options=options,
+                schedule_at=str(raw.get("schedule_at") or "").strip() or None,
             ))
     checks = validate_collection(manifest, workspace)
     all_files = all(Path(item.video_path).is_file() and item.video_sha256 for item in items)

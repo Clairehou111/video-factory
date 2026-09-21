@@ -7,19 +7,21 @@ from unittest.mock import patch
 
 from video_factory.director import NarrativeAnswer, StoryboardDirector
 from video_factory.editorial import (
-    canonicalize_editorial_brief, compile_evidence_shots, route_content,
+    apply_readable_radar_timing, canonicalize_editorial_brief, compile_evidence_shots, route_content,
     validate_editorial_brief, validate_editorial_structure,
 )
 from video_factory.compositor import (
     GITHUB_COLD_OPEN_LAYOUTS, WECHAT_BOTTOM_UI_SAFE, WECHAT_TOP_UI_SAFE,
-    _centered_lines, _footer_layout, _information_layout, _wrapped_lines, render_github_cold_open_frames,
-    render_information_frame,
+    _centered_lines, _expanded_evidence_layout, _footer_layout, _information_layout,
+    _fit_complete_gloss_lines, _radar_metadata, _single_header_layout, _wrapped_lines,
+    mobile_safe_text, render_github_cold_open_frames,
+    render_adjacent_gloss, render_information_frame,
 )
 from video_factory.llm import OpenAICompatibleStoryWriter, _compile_evidence_shot_kind
 from video_factory.models import (
     AttentionStrategy, Candidate, ContentType, EditorialBrief, Evidence, EvidenceShot,
     ContextEvent, ContextGraph, DirectorBrief, EditorialOpportunity, EvidenceShotKind, MaterialRole, Scene,
-    SelectionReason, SourceType, StoryArcBeat, StorySubject, TopicType,
+    InformationRenderProfile, RenderManifest, SelectionReason, SourceType, StoryArcBeat, StorySubject, TopicType,
 )
 from video_factory.quality import _quantity_supported, validate_manifest
 from video_factory.storage import Workspace
@@ -30,6 +32,7 @@ from video_factory.tweetcard import (
 from video_factory.webcapture import WebScrollVideoAdapter
 from video_factory.writer import StoryWriterPacket
 from video_factory.acquisition import URLAcquirer
+from video_factory.ingest import IngestResult
 
 
 def evidence(candidate, text="A concrete verified capability"):
@@ -67,6 +70,191 @@ def brief_for(candidate, topic=TopicType.COMPANY_OR_TEAM, content_type=ContentTy
 
 
 class EditorialContractTests(unittest.TestCase):
+    def test_mobile_math_indexes_use_supported_ascii_glyphs(self):
+        self.assertEqual(
+            mobile_safe_text("Q₁₀·K₁ 到 Q₁₀·K₁₀，QKᵀ"),
+            "Q_10·K_1 到 Q_10·K_10，QK^T",
+        )
+
+    def test_x_attached_gif_is_archived_as_source_video(self):
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp) / "workspace")
+            workspace.initialize()
+            candidate = Candidate(
+                "tweet-1", SourceType.TWEET, "https://x.com/dev/status/1", "KV cache",
+            )
+            ingest = IngestResult(candidate, [], [])
+            payload = {"data": [{
+                "id": "1", "text": "The visual below explains the process.",
+                "media": [{
+                    "type": "video",
+                    "url": "https://video.twimg.com/tweet_video/example.mp4",
+                }],
+            }]}
+            acquirer = URLAcquirer(workspace)
+            with patch.object(acquirer, "_fetch", return_value=(b"fake-mp4", "video/mp4")):
+                acquirer._archive_x_media(ingest, payload, Path(temp))
+
+            self.assertEqual(len(ingest.evidence), 1)
+            video = ingest.evidence[0]
+            self.assertEqual(video.source_kind, "web:source_video")
+            self.assertEqual(video.metadata["source_platform"], "x")
+            self.assertEqual(video.metadata["original_media_type"], "video")
+            self.assertTrue((workspace.root / video.captured_asset).is_file())
+
+    def test_flash_with_one_code_proof_keeps_large_pinned_news_header(self):
+        page = Evidence("page", "candidate", "https://vendor.example/robot", "proof", "web:primary_page")
+        scene = Scene(
+            "scene", 0, 5, "", "机器人发布", [page.id], MaterialRole.PROOF,
+            "show source", visual_family="code",
+        )
+        manifest = RenderManifest(
+            "render", "candidate", ContentType.FLASH, [scene], [page], [page.url],
+            topic_type=TopicType.COMPANY_OR_TEAM, fixed_title="机器人发布开源训练栈",
+            fixed_footer="先看真实动作，再看是否适合开发",
+            render_profile=InformationRenderProfile.RADAR_V2.value,
+        )
+
+        self.assertFalse(_expanded_evidence_layout(manifest))
+
+    def test_expanded_header_uses_multiple_readable_lines_instead_of_tiny_single_line(self):
+        height, size, lines = _single_header_layout(
+            "这个开源机器人项目把仿真训练、真机部署与完整开发工具放进同一套工作流",
+        )
+
+        self.assertGreaterEqual(height, 190)
+        self.assertGreaterEqual(size, 40)
+        self.assertGreaterEqual(lines, 2)
+
+    def test_short_information_title_is_left_aligned_in_a_compact_rail(self):
+        from PIL import Image, ImageChops
+
+        title = "Waymo进军德国"
+        height, _, _ = _information_layout(title)
+        with TemporaryDirectory() as directory:
+            output = render_information_frame(
+                title, "目标是在完成验证后开放商业无人驾驶服务。",
+                Path(directory) / "frame.png",
+            )
+            with Image.open(output).convert("RGB") as image:
+                title_band = image.crop((0, WECHAT_TOP_UI_SAFE, 1080, WECHAT_TOP_UI_SAFE + height))
+                background = Image.new("RGB", title_band.size, "#031126")
+                difference = ImageChops.difference(title_band, background).getbbox()
+
+        self.assertLessEqual(height, 190)
+        self.assertIsNotNone(difference)
+        self.assertLess(difference[0], 100)
+
+    def test_long_information_title_expands_without_ellipsis(self):
+        title = (
+            "一家成立十八个月的机器人公司把首批通用机器人交付给财富全球五百强工业客户，"
+            "并首次公开全身控制与端到端自主系统进入真实工厂的完整过程"
+        )
+
+        height, size, lines = _information_layout(title)
+
+        self.assertGreater(height, 190)
+        self.assertGreaterEqual(size, 36)
+        self.assertGreaterEqual(lines, 3)
+
+    def test_long_highlight_translation_fits_without_ellipsis(self):
+        from PIL import Image, ImageDraw
+
+        translation = (
+            "今天我们兴奋地宣布：Waymo正在为德国慕尼黑的全自动驾驶打车服务打基础。"
+            "我们已完成超过2000万次行程，每周提供数十万次商业载客服务。"
+        )
+        draw = ImageDraw.Draw(Image.new("RGB", (1080, 1920)))
+
+        _, lines = _fit_complete_gloss_lines(draw, translation, None, 820, max_lines=5)
+
+        self.assertEqual("".join(lines), translation)
+        self.assertNotIn("…", "".join(lines))
+        self.assertLessEqual(len(lines), 5)
+
+    def test_translation_card_lines_share_one_left_edge(self):
+        from PIL import Image
+
+        translation = (
+            "第一行较短\n"
+            "第二行包含更多信息用于验证统一左边界\n"
+            "第三行长度也不同"
+        )
+        with TemporaryDirectory() as directory:
+            output = render_adjacent_gloss(
+                translation, Path(directory) / "gloss.png",
+                profile=InformationRenderProfile.RADAR_V2.value,
+            )
+            with Image.open(output).convert("RGBA") as image:
+                rows: list[tuple[int, int]] = []
+                active = False
+                start = 0
+                for y in range(image.height):
+                    has_text = any(
+                        pixel[3] > 0 and pixel[0] > 190 and pixel[1] > 170
+                        for pixel in (image.getpixel((x, y)) for x in range(image.width))
+                    )
+                    if has_text and not active:
+                        start, active = y, True
+                    elif active and not has_text:
+                        rows.append((start, y))
+                        active = False
+                if active:
+                    rows.append((start, image.height))
+                left_edges = []
+                for top, bottom in rows:
+                    xs = [
+                        x for y in range(top, bottom) for x in range(image.width)
+                        if (
+                            (pixel := image.getpixel((x, y)))[3] > 0
+                            and pixel[0] > 190 and pixel[1] > 170
+                        )
+                    ]
+                    if xs:
+                        left_edges.append(min(xs))
+
+        self.assertEqual(len(left_edges), 3)
+        self.assertLessEqual(max(left_edges) - min(left_edges), 3)
+
+    def test_dense_radar_screens_extend_without_shortening_existing_holds(self):
+        candidate = Candidate("web", SourceType.WEB, "https://example.com/story", "Story")
+        brief, _ = brief_for(candidate)
+        brief.opening_mode = "direct_fact"
+        brief.duration_target = 8.0
+        brief.evidence_shots.append(EvidenceShot(
+            "third", EvidenceShotKind.BROWSER_SECTION, "有什么用？",
+            "机器人在实体环境连续完成抓取、搬运和自主恢复动作",
+            "这段信息需要更长阅读时间", ["e-1"], ["impact"],
+            candidate.source_url, "A concrete verified capability", "具体动作证据",
+            2.0, "", audience_copy="它面向真实工作任务而不是玩具演示",
+        ))
+        brief.evidence_shots[0].duration = 5.0
+
+        apply_readable_radar_timing(brief)
+
+        self.assertEqual(brief.evidence_shots[0].duration, 5.0)
+        self.assertTrue(all(3.5 <= shot.duration <= 5.0 for shot in brief.evidence_shots))
+        self.assertLessEqual(sum(shot.duration for shot in brief.evidence_shots), 15.0)
+
+    def test_radar_date_prefers_publication_time_over_later_capture_time(self):
+        primary = Evidence(
+            "page", "candidate", "https://vendor.example/news", "proof", "web:primary_page",
+            captured_at="2026-08-31T08:00:00Z",
+        )
+        scope = Evidence(
+            "scope", "candidate", primary.url, "scope", "discovery:selection_scope",
+            captured_at="2026-08-31T08:00:00Z",
+            metadata={"published_at": "Fri, 28 Aug 2026 16:00:03 +0000"},
+        )
+        manifest = RenderManifest(
+            "render", "candidate", ContentType.FLASH, [], [primary, scope], [primary.url],
+            render_profile=InformationRenderProfile.RADAR_V2.value,
+        )
+
+        _, date = _radar_metadata(manifest)
+
+        self.assertEqual(date, "08-28 快报")
+
     def test_internal_interpretation_is_not_compiled_into_visible_scene_copy(self):
         candidate = Candidate("tweet", SourceType.TWEET, "https://x.com/dev/status/1", "Post", author="dev")
         brief, item = brief_for(candidate)
@@ -169,6 +357,21 @@ class EditorialContractTests(unittest.TestCase):
         # token after the greedy wrapper had kept it intact.
         balanced = _centered_lines(draw, text, font, 924, 2)
         self.assertNotIn("Ag\nent", "\n".join(balanced))
+
+    def test_two_line_sre_hook_breaks_at_question_not_inside_a_chinese_word(self):
+        from PIL import Image, ImageDraw, ImageFont
+
+        text = "SRE 还在宕机后救火？Empirik 用 AI 提前拦截高危变更"
+        draw = ImageDraw.Draw(Image.new("RGB", (1080, 300)))
+        font = ImageFont.truetype(
+            str(Path("/Users/clairehou/pyProjects/MoneyPrinterTurbo/resource/fonts/STHeitiMedium.ttc")),
+            54,
+        )
+
+        self.assertEqual(
+            _centered_lines(draw, text, font, 944, 2),
+            ["SRE 还在宕机后救火？", "Empirik 用 AI 提前拦截高危变更"],
+        )
 
     def test_github_cold_open_contains_no_old_ornamental_lines_or_frames(self):
         with TemporaryDirectory() as directory:
@@ -530,6 +733,12 @@ Markdown Content:
         self.assertIn("Optimize the selected hook aggressively for first-1.5-second retention", prompt)
         self.assertIn("locked primary story promise", prompt)
         self.assertIn("never fabricate shock", prompt)
+        self.assertIn("Every video must nevertheless add one small piece of editorial value", prompt)
+        self.assertIn("Every unfamiliar abbreviation or specialist term", prompt)
+        self.assertIn("animated GIF or video attached to an X post", prompt)
+        self.assertIn("do not make 合谋/串通/商量 carry", prompt)
+        self.assertIn("what the researchers made the agents do", prompt)
+        self.assertIn("as its grammatical actor", prompt)
 
     def test_model_prompt_requires_exact_name_and_plain_metric_explanation(self):
         candidate = Candidate("model", SourceType.WEB, "https://example.com/model", "GLM-5.3-Flash")
@@ -672,8 +881,47 @@ Markdown Content:
         ).prompt()
 
         self.assertIn("funding is evidence of a bet, not the whole story", company_prompt)
+        self.assertIn("make the selected hook name that role and pain directly", company_prompt)
+        self.assertIn("brand whose name is also an ordinary word", company_prompt)
         self.assertIn("Distinguish a protocol, pilot, or proposed method", research_prompt)
         self.assertIn("name who left which organization and where they went", company_prompt)
+        self.assertIn("Spoken-Chinese contract", research_prompt)
+        self.assertIn("did not discuss or message each other", research_prompt)
+
+    def test_funding_led_sre_story_must_name_sre_and_its_pain_in_the_hook(self):
+        candidate = Candidate(
+            "empirik", SourceType.WEB, "https://example.com/empirik", "Empirik",
+        )
+        brief, item = brief_for(candidate, TopicType.COMPANY_OR_TEAM, ContentType.FLASH)
+        item.quote = (
+            "Empirik raised $21 million after spinning out of Sequoia. It predicts outages "
+            "before they happen and lets DevOps and site reliability engineering teams "
+            "offload routine troubleshooting."
+        )
+        brief.opportunity = EditorialOpportunity(
+            "Empirik 独立并融资", "刚刚宣布",
+            "DevOps/SRE 团队面对高频变更与宕机排障压力",
+            "SRE 不想再事后救火", [SelectionReason(
+                "sre-workflow", "workflow", "将 SRE 从事后排障推向事前预测", [item.id],
+            )], story_archetype="capability_shift",
+        )
+        brief.attention_strategy.hook_candidates = [
+            "红杉孵化 Empirik 获 2100 万美元独立",
+            "SRE 还在宕机后救火？Empirik 用 AI 提前拦截高危变更",
+            "Empirik 把可观测性推向事前预测",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        errors = validate_editorial_brief(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertIn("funding-led company hook must name its explicit engineering audience: SRE", errors)
+
+        canonicalize_editorial_brief(brief, [item])
+        self.assertEqual(
+            brief.attention_strategy.selected_hook,
+            "SRE 还在宕机后救火？Empirik 用 AI 提前拦截高危变更",
+        )
 
     def test_people_change_pattern_context_requires_a_concrete_move(self):
         candidate = Candidate(
@@ -796,6 +1044,33 @@ Markdown Content:
         self.assertGreaterEqual(TWEET_TRANSLATION_FONT_MIN, 46)
         self.assertGreaterEqual(EDITORIAL_TRANSLATION_FONT_SIZE, 46)
 
+    def test_motion_story_tweet_card_keeps_translation_inside_short_viewport(self):
+        candidate = Candidate(
+            "tweet", SourceType.TWEET, "https://x.com/dev/status/1", "Post", author="dev",
+            metadata={"author_name": "Developer"},
+        )
+        root = Evidence(
+            "tweet-root", candidate.id, candidate.source_url,
+            "A long technical source post explains the mechanism in detail. " * 45,
+            "x:thread_post",
+        )
+        scene = Scene(
+            "scene-1", 0, 5, "", "原帖", [root.id], MaterialRole.PROOF,
+            "show source excerpt with translation",
+            highlight_translation="这段原帖解释了为什么历史数据会被缓存，而当前查询只使用一次。",
+        )
+        with TemporaryDirectory() as directory:
+            output = render_tweet_card(
+                candidate, root, scene, Path(directory) / "tweet.png", size=(1384, 1092),
+            )
+            from PIL import Image
+            with Image.open(output) as image:
+                self.assertEqual(image.size, (1384, 1092))
+                # The lower viewport contains the blue translation chip,
+                # rather than an all-white crop of the English body.
+                lower = image.crop((90, 400, 1294, 1040))
+                self.assertIn((234, 242, 255), set(lower.get_flattened_data()))
+
     def test_program_compiles_semantic_card_family_into_material_kind(self):
         candidate = Candidate("tweet", SourceType.TWEET, "https://x.com/dev/status/1", "Post", author="dev")
         root = Evidence("root", candidate.id, candidate.source_url, "Feature landed", "x:thread_post")
@@ -811,6 +1086,32 @@ Markdown Content:
             _compile_evidence_shot_kind(raw, {root.id: root, image.id: image}),
             EvidenceShotKind.TWEET_CARD,
         )
+
+    def test_source_image_family_requires_cited_verified_image_bytes(self):
+        candidate = Candidate("web", SourceType.WEB, "https://example.com/story", "Story")
+        page = Evidence(
+            "page", candidate.id, candidate.source_url, "HTML primary source", "web:agent_primary_source",
+            captured_asset="assets/agent-web-sources/page.source",
+        )
+        raw = {"visual_family": "source_image", "evidence_ids": [page.id]}
+
+        self.assertEqual(
+            _compile_evidence_shot_kind(raw, {page.id: page}),
+            EvidenceShotKind.BROWSER_SECTION,
+        )
+
+        brief, _ = brief_for(candidate)
+        brief.evidence_shots[0].visual_family = "source_image"
+        brief.evidence_shots[0].kind = EvidenceShotKind.IMAGE
+        brief.evidence_shots[0].evidence_ids = [page.id]
+        errors = validate_editorial_brief(
+            brief, candidate, [page], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertTrue(any("source_image" in error for error in errors))
+        structural_errors = validate_editorial_structure(
+            brief, candidate, [page], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertTrue(any("source_image" in error for error in structural_errors))
 
     def test_flash_presentation_compiler_preserves_real_source_then_adds_payoff_card(self):
         candidate = Candidate("tweet", SourceType.TWEET, "https://x.com/dev/status/1", "Post", author="dev")
@@ -877,6 +1178,24 @@ Markdown Content:
         brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
         canonicalize_editorial_brief(brief, [item])
         self.assertEqual(brief.attention_strategy.selected_hook, "OpenAI兑现承诺：banked reset准时落地")
+
+    def test_radar_hook_does_not_keep_a_severed_named_entity(self):
+        candidate = Candidate("robot", SourceType.WEB, "https://example.com/noble", "Noble")
+        brief, item = brief_for(candidate)
+        brief.opening_mode = "direct_fact"
+        brief.subjects[0].name = "Noble Machines"
+        brief.headline = "Noble Machines 成立18个月即完成首批工业交付"
+        brief.attention_strategy.hook_candidates = [
+            "成立18个月，Noble Machines 把首批通用机器人交付给财富全",
+            "Noble Machines 成立18个月即达成首个交付里程碑",
+            "Noble Machines 18个月完成首批交付",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [item])
+
+        self.assertNotIn("财富全", brief.attention_strategy.selected_hook)
+        self.assertFalse(brief.attention_strategy.selected_hook.endswith("给"))
 
     def test_x_root_actor_hook_beats_a_detached_background_hook(self):
         candidate = Candidate("tweet", SourceType.TWEET, "https://x.com/sama/status/1", "Sam reply", author="sama")
@@ -1080,6 +1399,112 @@ Markdown Content:
         )
         self.assertNotIn("company-competition reply-chain hook must name both evidenced companies", repaired)
 
+    def test_company_competition_hook_preserves_exact_smart_brand_axis(self):
+        candidate = Candidate(
+            "liux", SourceType.WEB, "https://example.com/liux", "Liux Big",
+        )
+        brief, item = brief_for(candidate)
+        reason = SelectionReason(
+            "europe-vs-china", "competition",
+            "Smart 已把生产迁到中国，Liux 却坚持在西班牙造微型车", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "Smart 迁往中国生产后，Liux 反向押注欧洲制造", "current",
+            "hardware builders", "competition", [reason], story_archetype="price_competition",
+        )
+        brief.attention_strategy.selected_hook = "西班牙 Liux 获全欧认证正面迎战"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+
+        self.assertIn(
+            "competition hook must preserve exact named brands from the locked selection reason: Smart",
+            errors,
+        )
+
+        brief.attention_strategy.selected_hook = "Smart 把生产迁到中国，Liux 偏要在欧洲造微型车"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        repaired = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+        self.assertFalse(any("competition hook must preserve exact named brands" in error for error in repaired))
+
+    def test_company_competition_hook_keeps_familiar_incumbent_named_in_source(self):
+        candidate = Candidate("liux", SourceType.WEB, "https://example.com/liux", "Liux Big")
+        brief, item = brief_for(candidate, TopicType.COMPANY_OR_TEAM, ContentType.FLASH)
+        item.quote = (
+            "Even Smart moved production to China. Spanish startup Liux is betting on "
+            "European production for its Big microcar."
+        )
+        reason = SelectionReason(
+            "competition", "competition",
+            "欧洲微型车转向中国制造，西班牙公司反向押注本地生产", [item.id],
+        )
+        brief.opportunity = EditorialOpportunity(
+            "Liux在中国制造主导的微型车市场押注欧洲生产", "current",
+            "hardware builders", "competition", [reason], story_archetype="official_update",
+        )
+        brief.attention_strategy.selected_hook = "西班牙 Liux 推出微型车 Big 迎战中国供应链"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+        )
+
+        self.assertIn(
+            "competition hook must preserve exact named brands from the locked selection reason: Smart",
+            errors,
+        )
+
+    def test_research_hook_prefers_exact_result_over_neutral_framework_launch(self):
+        candidate = Candidate("mayo", SourceType.PAPER, "https://example.com/paper.pdf", "AGENT-O")
+        brief, item = brief_for(candidate, TopicType.RESEARCH_OR_BENCHMARK, ContentType.FLASH)
+        brief.opportunity = EditorialOpportunity(
+            "Mayo Clinic团队提出AGENT-O并评估279篇论文", "current", "medical AI builders",
+            "reporting gap", [SelectionReason(
+                "reporting-gap", "capability_shift", "AGENT-O量化医疗Agent报告缺口", [item.id],
+            )], story_archetype="research_disclosure",
+        )
+        brief.attention_strategy.conflict = "84.6%缺少运行时架构"
+        brief.attention_strategy.surprise = "82.8%缺少治理与安全信息"
+        brief.attention_strategy.selected_hook = "Mayo Clinic提出医疗AI Agent语义框架"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+
+        errors = validate_editorial_structure(
+            brief, candidate, [item], TopicType.RESEARCH_OR_BENCHMARK, ContentType.FLASH,
+        )
+        self.assertIn(
+            "quantified research hook must lead with an exact result instead of a neutral framework announcement",
+            errors,
+        )
+
+        brief.attention_strategy.selected_hook = "评估279篇医疗AI论文：84.6%没写清运行架构"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        missing_actor = validate_editorial_structure(
+            brief, candidate, [item], TopicType.RESEARCH_OR_BENCHMARK, ContentType.FLASH,
+        )
+        self.assertIn(
+            "research-disclosure hook must name its institution, system, or studied actor before the result",
+            missing_actor,
+        )
+
+        brief.attention_strategy.selected_hook = "Mayo Clinic评估279篇论文：84.6%没写清运行架构"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        repaired = validate_editorial_structure(
+            brief, candidate, [item], TopicType.RESEARCH_OR_BENCHMARK, ContentType.FLASH,
+        )
+        self.assertFalse(any("quantified research hook" in error for error in repaired))
+
+        brief.attention_strategy.conflict = "61.0%准确率"
+        brief.attention_strategy.selected_hook = "Mayo Clinic实测十款模型：最高准确率只有61%"
+        brief.attention_strategy.hook_candidates[0] = brief.attention_strategy.selected_hook
+        equivalent_format = validate_editorial_structure(
+            brief, candidate, [item], TopicType.RESEARCH_OR_BENCHMARK, ContentType.FLASH,
+        )
+        self.assertFalse(any("quantified research hook" in error for error in equivalent_format))
+
     def test_multi_party_reply_chain_rejects_missing_intervening_response(self):
         candidate = Candidate(
             "x-sam", SourceType.TWEET, "https://x.com/sama/status/1",
@@ -1217,6 +1642,31 @@ Markdown Content:
         failed = {check.name for check in validate_manifest(manifest) if not check.passed}
         self.assertNotIn("attention_strategy", failed)
         self.assertNotIn("duration_band", failed)
+
+    def test_director_accepts_readable_six_second_evidence_card(self):
+        candidate = Candidate(
+            "web-company", SourceType.WEB, "https://example.com/news", "Autonomous driving",
+        )
+        brief, item = brief_for(candidate)
+        brief.evidence_shots[0].duration = 6.0
+        brief.evidence_shots[1].duration = 6.0
+        brief.duration_target = 12.0
+        scenes = compile_evidence_shots(brief, candidate)
+        answers = [
+            NarrativeAnswer("identity", "Jeff Dean成立Discovery Loop", [item.id]),
+            NarrativeAnswer("product_direction", "自动化机器学习实验", [item.id]),
+            NarrativeAnswer("impact", "自动化科研竞争转向系统能力", [item.id]),
+        ]
+        from video_factory.director import StoryboardRequest
+        request = StoryboardRequest(
+            "story-readable", candidate, TopicType.COMPANY_OR_TEAM, ContentType.FLASH,
+            [item], brief.fixed_conclusion, answers, scenes, 12,
+            editorial_brief=brief, fixed_hook=brief.attention_strategy.selected_hook,
+        )
+
+        manifest = StoryboardDirector().direct(request)
+
+        self.assertEqual([scene.duration for scene in manifest.scenes], [6.0, 6.0])
 
 
 if __name__ == "__main__":

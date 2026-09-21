@@ -6,7 +6,7 @@ import os
 import re
 import time
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -21,7 +21,9 @@ from .models import (
 )
 from .writer import StoryWriterPacket
 from .github_editor import canonicalize_github_brief, compose_github_hook, copy_width, select_github_focuses
-from .editorial import canonicalize_editorial_brief, compile_evidence_shots
+from .editorial import (
+    canonicalize_editorial_brief, compile_evidence_shots, enforce_flash_time_budget,
+)
 from .translation import IT_TRANSLATION_CONTRACT, PLAIN_CHINESE_CONTRACT
 
 
@@ -59,8 +61,12 @@ def _compile_evidence_shot_kind(raw: dict[str, object], evidence_by_id: dict[str
     # not silently turn the mandatory root-post shot into a standalone image.
     if family in {"tweet", "quoted_post"}:
         return EvidenceShotKind.TWEET_CARD
-    if family == "source_image" or any(kind in {"web:source_image", "x:media_photo"} for kind in kinds):
+    # A model's presentation label cannot turn an HTML/page asset into image
+    # bytes. Only a cited, acquisition-verified image may compile to IMAGE.
+    if any(kind in {"web:source_image", "x:media_photo"} for kind in kinds):
         return EvidenceShotKind.IMAGE
+    if any(kind == "web:source_video" for kind in kinds):
+        return EvidenceShotKind.VIDEO
     if family == "paper":
         return EvidenceShotKind.PDF_PAGE
     if family == "chart":
@@ -157,6 +163,7 @@ class LLMSettings:
     model: str
     timeout_seconds: int = 45
     provider_preferences: dict[str, object] | None = None
+    reasoning_effort: str | None = None
 
     @classmethod
     def from_environment(cls, provider: str, model: str | None = None) -> "LLMSettings":
@@ -176,13 +183,30 @@ class LLMSettings:
                 key or "", selected_model, timeout_seconds=timeout_seconds,
             )
         if provider == "kimi":
-            key = os.environ.get("KIMI_API_KEY") or os.environ.get("MOONSHOT_API_KEY")
-            selected_model = model or os.environ.get("KIMI_MODEL")
+            coding_key = os.environ.get("KIMI_CODE_API")
+            key = coding_key or os.environ.get("KIMI_API_KEY") or os.environ.get("MOONSHOT_API_KEY")
+            requested_model = model or os.environ.get("KIMI_MODEL") or (
+                "kimi/kimi3" if coding_key else ""
+            )
+            aliases = {
+                "kimi/kimi3": "k3",
+                "kimi3": "k3",
+                "kimi/k3": "k3",
+            }
+            selected_model = aliases.get(requested_model.casefold(), requested_model)
             if not selected_model:
-                raise ValueError("Kimi requires --model or KIMI_MODEL; model availability is account-specific")
+                raise ValueError(
+                    "Kimi requires --model or KIMI_MODEL; use kimi/kimi3 for the coding plan"
+                )
+            base_url = (
+                os.environ.get("KIMI_CODING_BASE_URL", "https://api.kimi.com/coding/v1")
+                if coding_key else
+                os.environ.get("KIMI_BASE_URL", "https://api.moonshot.cn/v1")
+            )
             return cls(
-                provider, os.environ.get("KIMI_BASE_URL", "https://api.moonshot.cn/v1"),
+                provider, base_url,
                 key or "", selected_model, timeout_seconds=timeout_seconds,
+                reasoning_effort=os.environ.get("KIMI_REASONING_EFFORT", "high"),
             )
         if provider == "openrouter":
             key = os.environ.get("OPENROUTER_API_KEY")
@@ -285,12 +309,55 @@ class OpenAICompatibleStoryWriter:
             for focus in github.get("focus_candidates") or []:
                 if isinstance(focus, dict) and str(focus.get("id") or "") in selected_focus_ids:
                     referenced.update(str(value) for value in (focus.get("evidence_ids") or []))
+        targets_by_evidence: dict[str, list[str]] = {}
+        for shot in visible["evidence_shots"]:
+            target = str(shot.get("target") or "").strip()
+            if not target:
+                continue
+            for evidence_id in shot.get("evidence_ids") or []:
+                targets_by_evidence.setdefault(str(evidence_id), []).append(target)
+
+        def critic_excerpt(item: Evidence) -> str:
+            # Long pages often place the decisive proof well after the first
+            # 2K characters. Give the critic the beginning plus exact target
+            # neighborhoods, otherwise it falsely calls valid later quotes
+            # “missing” and damages an otherwise grounded story during repair.
+            pieces = [item.quote[:1800]]
+            for target in targets_by_evidence.get(item.id, []):
+                start = item.quote.find(target)
+                if start < 0:
+                    continue
+                left = max(0, start - 350)
+                right = min(len(item.quote), start + len(target) + 350)
+                context = item.quote[left:right]
+                if context not in pieces:
+                    pieces.append("\n--- cited target context ---\n" + context)
+            return "".join(pieces)[:12000]
+
         evidence = [{
             "id": item.id, "kind": item.source_kind, "url": item.url,
-            "quote": item.quote[:2200],
+            "quote": critic_excerpt(item),
         } for item in packet.evidence if item.id in referenced or len(referenced) == 0]
+        selection_promise = asdict(packet.opportunity) if packet.opportunity else {}
         schema = {
             "approved": True,
+            "story_review": {
+                "verdict": "pass|fail",
+                "primary_promise": "what the selected story promises the viewer",
+                "draft_axis": "what the current cut actually spends most of its time explaining",
+                "narrative_tension_score": "1|2|3|4|5",
+                "audience_relevance_score": "1|2|3|4|5",
+                "chronology_score": "1|2|3|4|5",
+                "evidence_hierarchy_score": "1|2|3|4|5",
+                "decision_value_score": "1|2|3|4|5",
+                "pacing_score": "1|2|3|4|5",
+                "failure_modes": [{
+                    "category": "story_axis|audience_context|chronology|evidence_hierarchy|decision_context|editorial_value|conflict_visibility|payoff|pacing",
+                    "problem": "specific whole-cut failure",
+                    "repair_instruction": "evidence-bound instruction for the complete arc",
+                    "evidence_ids": ["existing evidence id"],
+                }],
+            },
             "field_reviews": [{
                 "field_path": "one exact key from fields",
                 "verdict": "pass|fail",
@@ -305,15 +372,24 @@ class OpenAICompatibleStoryWriter:
             }],
         }
         review_messages = [
-            {"role": "system", "content": "Return one strict JSON review only. You are a skeptical Chinese technical-video copy editor, not the original writer."},
+            {"role": "system", "content": "Return one strict JSON review only. You are the story editor and grounding editor for a Chinese technical short video, not the original writer."},
             {"role": "user", "content": "\n".join([
+                "First review the draft as one silent 10–20 second film before reviewing individual lines. A grounded and grammatical cut still fails when it tells the wrong story, promotes a secondary technical detail over the selected event, hides the recognizable company stake behind an unfamiliar person, flattens a real company conflict into friendly personal replies, reports a discount without helping viewers decide when to use it, or makes the payoff unreadable by crowding too much copy into too little time.",
+                "Compare story_review.primary_promise with the supplied Editorial opportunity and story_review.draft_axis with the actual headline, selected hook, shot sequence, and conclusion. The first selection reason is the locked story promise. Before passing, enumerate each independent fact, contrast, mechanism, or result explicitly promised by that reason and the event_claim, then verify that every indispensable one appears in visible copy. Fail evidence_hierarchy when a multi-part source is compressed to three shots by dropping a promised black-box finding, safety result, action step, market proof, or payoff. Three clear beats are stronger than five dense cards only when the selected promise is still complete; shot count is not a quality goal. Score narrative tension as concrete stakes/capability shift rather than mandatory shock. Score evidence hierarchy by whether identity/stakes and decisive proof appear before secondary implementation detail. Score pacing by whether each screen can be read with sound off and every sentence remains complete. Any holistic score below 4 is a story_review failure.",
+                "For people moves, the company loss/current event remains the axis and the person's recognizable work is a short identity anchor. For a locked competition reason, preserve every specifically named brand and the opposed actions in the hook; a certification, price, feature, funding round, or waitlist is supporting proof and cannot replace a more recognizable incumbent-versus-challenger reversal. Preserve official brand spelling and capitalization exactly, including brands whose names are also ordinary words such as Smart. For price competition, the discount is incomplete without a supported use case and delivery-quality evidence or an explicit stability/TTFT/latency/throughput question. For a company reply chain, name both companies and preserve the initiating claim → challenge → response order. Do not invent conflict to increase a score; every heightened stake must cite supplied evidence and will be checked again by the field grounding review.",
+                "When the cited page itself gives a familiar incumbent's concrete action and a challenger making the opposite bet, fail retention_hook if the draft replaces that named reversal with generic market language. For quantified research, the strongest compact pattern is recognizable institution/system + sample + exact surprising result; a sample count followed by '发现' without the finding is incomplete. The result clause should say concretely what the papers, systems, or agents did or failed to report, rather than replacing that action with an abstract editorial diagnosis. When two parallel, familiar assumptions are explicitly rejected by the source, score a hook lower if it expands only one and silently drops the other.",
                 "Review every field listed in fields against its cited evidence and the story as a whole. Return exactly one field_reviews item for every field path; do not omit easy fields.",
                 "A field path ending in .target is the exact source-language proof the browser will highlight, not Chinese copy. Ignore Chinese naturalness for targets. Pass it only when it is an exact contiguous substring of its cited evidence and directly supports that same shot's fact; topical proximity elsewhere on the page is insufficient. If the page supports the fact but this target points at a different claim, fail source_support and instruct replacement with the smallest exact supporting excerpt from the same cited evidence.",
                 "Reject when an actor, action, object, recipient, chronology, causal strength, or certainty differs from the evidence; when a concrete technical name is replaced by a vague category that makes the event harder to understand; when Chinese reads like literal translation, a report, or abstract consultant language; or when a screen cannot explain itself without narration. For a model/product story, reject a selected hook that omits the exact model/product name and names only its vendor, publisher, host, or benchmark.",
                 "For each field, first extract actor-action-object-recipient and certainty, then compare them with evidence. A naturalness score below 4 is fail. Unexplained English technical nouns inside Chinese prose are fail when the evidence lets you explain the concrete action. Keeping an official English feature name does not exempt it: the first audience-facing occurrence must immediately explain what the feature concretely gives or does in natural Chinese. The same rule applies to specialist Chinese metrics: if a hook/fact says 拒绝率、幻觉率、激活参数、上下文窗口 or a similarly non-obvious metric, the first relevant evidence shot must say in plain Chinese what it measures or means in practice; numbers alone are not an explanation. Preserve quantity, duration, recurrence, permission, and guarantee strength exactly: a one-time credit, reset, trial, exception, or temporary rollout cannot become permanent freedom from recurring limits or costs; free availability or free use does not prove commercial-use permission; support does not prove a guarantee; and an open-source repository does not transfer third-party asset licenses. Unsupported mechanisms, policies, risks, permissions, or advice are fail.",
-                "A specialist term needs one adjacent explanation at its first relevant evidence shot, not repetition in every persistent rail and field. If that first shot explains it, do not fail the headline, hook, conclusion, or later shots merely for using the same term without repeating the definition.",
+                "Every decision-critical specialist term or unfamiliar abbreviation needs an adjacent plain-Chinese explanation at its first relevant evidence shot. Prefer replacing academic jargon with the concrete action it describes instead of stacking dictionary definitions. If the first shot explains a term, do not require repetition in every persistent rail and later field. Fail literal phrases such as 超竞争价格、默契合谋、Nash均衡 or LMP when a general technical viewer still cannot tell who did what or what the price means.",
+                "Apply a read-aloud speech test to every Chinese viewer-facing field. Imagine one developer explaining it once to a smart colleague who has not read the paper. Pass only when the listener can immediately identify the actor, concrete action, reaction/result, and why it matters. Fail prose that is grammatically correct but built mainly from abstract research nouns, institutional recommendations, or word-for-word source structure. For a research mechanism, require a small concrete scene before an optional formal term. For tacit collusion, preserve the no-communication distinction: natural Chinese should say that the agents did not discuss or message each other but still learned to keep prices high together; 串通 or 商量 alone falsely implies an explicit agreement. translation and full_translation must pass this same spoken-Chinese test, not merely preserve terminology.",
+                "Judge editorial value-add across the whole cut. Fail editorial_value when the visible story only translates or paraphrases the original source and never adds one evidence-backed use case, consequence, comparison, technical implication, relevant context event, or explicit unresolved decision question. The extension must be modest and grounded; do not demand speculation or a manufactured hot take.",
+                "Editorial value does not require a prediction, competitor claim, market verdict, global-leader label, or call to action. A concrete rollout sequence, real-world deployment implication, safety/regulatory test, audience use case, or honest source-bounded question is enough. Never fail a cut merely because fleet size, partner, benchmark, or market impact is absent from the evidence, and never ask the repair writer to claim that one event decides a company's success or an industry's competitive landscape.",
+                "When archived evidence includes a high-priority source video or X-attached animation, fail evidence_hierarchy if the cut replaces it with static paraphrase cards instead of using one uninterrupted best section as motion proof. The clip length may vary with the action; do not impose a fixed five-second hold.",
+                "For a named robotics or autonomous-driving company, fail audience_context when the headline assumes brand recognition and omits the plain category or object needed to understand the event, such as 自动驾驶、无人驾驶、机器人 or 机器人出租车. Also require one grounded deployment/use/safety/regulatory implication beyond the announcement itself.",
                 "For a people/team move, fail audience_context when the visible story assumes the audience already knows the main person and never gives an evidence-backed role plus recognizable work/project anchor. Also fail retention_hook when a lesser-known technical person is placed before a much more audience-recognizable evidenced incumbent/company and its concrete loss or stake; source authorship does not outrank audience recognition. When an earlier departure is used as pattern context, pass it only when the audience-facing copy gives the concrete dated move—who left which organization and where they went or what they founded—instead of substituting an outlet's abstract industry summary. For price competition, fail audience_context when the story reports only the discount without a supported workload/use case and without addressing route-specific uptime plus TTFT/latency/throughput; missing current metrics should be an explicit question and verification action. For an evidenced company-versus-company reply chain, fail retention_hook when the selected hook removes the company names and reduces the conflict to generic personal replies.",
-                "For headline, selected_hook, fixed_conclusion, GitHub hook_opening, and GitHub footer, also judge short-video attention. A score below 4 is fail. Judge selected_hook as the first 1.5 seconds: when the cited evidence contains an exact number/contrast, a named consequential actor, concrete developer pain/ROI, or an honest open question inside the selected story, a neutral announcement label scores only 3. Do not require shock: when opening_mode is direct_fact, a crisp named actor + important concrete change can score 4 without conflict or an information gap. conflict, counter_intuitive, and developer_roi must be earned by evidence. GitHub hook_reveal and hook_verdict must add a clear new capability and payoff, but they do not each need another standalone conflict. Calibrate naturalness as spoken peer-to-peer technical Chinese: explicit actor, direct action, short clauses, and one concrete audience consequence. Calibrate attention strictly: 1 is vague filler; 2 is a generic topic; 3 is accurate but low-stakes; 4 is immediately clear and gives the intended audience a concrete reason to keep watching; 5 is unusually memorable without enlarging the claim. The fixed conclusion or GitHub footer must deliver a clear evidence-backed view or memorable consequence, not merely repeat the event or give ritual caution.",
+                "For headline, selected_hook, fixed_conclusion, GitHub hook_opening, and GitHub footer, also judge short-video attention. A score below 4 is fail. Judge selected_hook as the first 1.5 seconds: when the cited evidence contains an exact number/contrast, a named consequential actor, concrete developer pain/ROI, or an honest open question inside the selected story, a neutral announcement label scores only 3. A hook that merely says a company announced, summarized, evaluated, proposed, or found something also scores at most 3 when the same evidence supports the actual surprising result, reversal, conflict, consequence, or question. Prefer the phrasing a technically informed friend would post to make peers pause and reply ‘really?’, while keeping every claim sourced. Do not require shock: when opening_mode is direct_fact, a crisp named actor + important concrete change can score 4 without conflict or an information gap. conflict, counter_intuitive, and developer_roi must be earned by evidence. GitHub hook_reveal and hook_verdict must add a clear new capability and payoff, but they do not each need another standalone conflict. Calibrate naturalness as spoken peer-to-peer technical Chinese: explicit actor, direct action, short clauses, and one concrete audience consequence. Calibrate attention strictly: 1 is vague filler; 2 is a generic topic; 3 is accurate but low-stakes; 4 is immediately clear and gives the intended audience a concrete reason to keep watching; 5 is unusually memorable without enlarging the claim. The fixed conclusion or GitHub footer must deliver a clear evidence-backed view or memorable consequence, not merely repeat the event or give ritual caution.",
                 "If editorial_inference is non-empty, it must be the selected question-form hook. Judge the proof and takeaway as false if they silently promote that question into a fact. category_label is optional factual navigation only; never demand one and reject evaluative labels that are not source facts.",
                 "Every repair_instruction is evidence-bound too. Never propose an example sentence containing a date, quantity, rollout scope, default behavior, first/only/all/complete superlative, licensing permission, official policy, mechanism, or capability absent from the supplied evidence. If stronger attention cannot be earned by another verified fact, improve the stance and concrete wording around the existing fact instead of inventing one.",
                 "For a fixed_conclusion repair, end on the strongest verified impact, payoff, or concrete action. Never instruct the writer to append 未知、有待观察、有待验证、进一步研究、需关注后续 or an equivalent ritual caveat; move a decision-critical scope limit to its own evidence field instead.",
@@ -323,6 +399,7 @@ class OpenAICompatibleStoryWriter:
                 "Energy must come from the event's actual stakes and the editor's evidence-backed stance. Do not manufacture outrage, certainty, scale, or conflict. When the facts are genuinely dramatic, allow direct emotional Chinese instead of flattening them into report language.",
                 "Do not enforce a preferred opinion or wording. Do not invent facts. Judge whether a Chinese technical viewer can understand who did what and what happened next on the first read. If any field fails, approved must be false.",
                 "Audience: Chinese developers and technically curious vibe coders watching a BGM-only WeChat Channels video.",
+                "Editorial opportunity: " + json.dumps(selection_promise, ensure_ascii=False),
                 "Fields: " + json.dumps(fields, ensure_ascii=False),
                 "Visible copy: " + json.dumps(visible, ensure_ascii=False),
                 "Evidence: " + json.dumps(evidence, ensure_ascii=False),
@@ -375,6 +452,7 @@ class OpenAICompatibleStoryWriter:
         # reasoning against max_tokens even when it is excluded from the
         # response, so 3.6K can end with finish_reason=length and no JSON.
         review, provenance = self._request_json(review_messages, max_tokens=7200)
+        story_review = review.get("story_review") if isinstance(review.get("story_review"), dict) else {}
         field_reviews = normalized_field_reviews(review)
         reviews_by_path = {
             str(item.get("field_path") or ""): item for item in field_reviews
@@ -389,6 +467,12 @@ class OpenAICompatibleStoryWriter:
             retry_fields = "Fields: " + json.dumps(missing_fields, ensure_ascii=False)
             retry_messages[-1]["content"] = retry_messages[-1]["content"].replace(
                 original_fields, retry_fields,
+            )
+            retry_messages[-1]["content"] += (
+                "\nCoverage retry: the previous audit omitted these exact viewer-facing fields. "
+                "Return exactly one field_reviews row for every key in Fields, using the key "
+                "verbatim as field_path. Review translations even when they repeat nearby copy; "
+                "do not substitute fact, target, or full_translation for translation."
             )
             review, provenance = self._request_json(retry_messages, max_tokens=3600)
             provenance = {
@@ -416,7 +500,50 @@ class OpenAICompatibleStoryWriter:
             "problem": item.get("problem"), "evidence_ids": item.get("evidence_ids") or [],
             "repair_instruction": item.get("repair_instruction"),
         } for item in field_reviews if str(item.get("verdict") or "").casefold() == "fail"]
+        story_failures = [
+            item for item in (story_review.get("failure_modes") or [])
+            if isinstance(item, dict)
+        ]
+        score_names = (
+            "narrative_tension_score", "audience_relevance_score", "chronology_score",
+            "evidence_hierarchy_score", "decision_value_score", "pacing_score",
+        )
+        low_story_scores: list[str] = []
+        for name in score_names:
+            try:
+                value = int(story_review.get(name) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if story_review and value < 4:
+                low_story_scores.append(f"{name}={value}")
         model_reported_failure = bool(issues)
+        if story_review and (
+            str(story_review.get("verdict") or "").casefold() == "fail"
+            or story_failures or low_story_scores
+        ):
+            if not story_failures:
+                story_failures = [{
+                    "category": "story_axis",
+                    "problem": "holistic story scores below 4: " + ", ".join(low_story_scores),
+                    "repair_instruction": "rebuild the complete arc around the locked selection promise using only cited evidence",
+                    "evidence_ids": [],
+                }]
+            issues.extend({
+                "field_path": "editorial_brief.director_brief",
+                "category": str(item.get("category") or "story_axis"),
+                "problem": str(item.get("problem") or "holistic story review failed"),
+                "evidence_ids": list(item.get("evidence_ids") or []),
+                "repair_instruction": str(item.get("repair_instruction") or "rebuild the complete evidence hierarchy"),
+            } for item in story_failures)
+            model_reported_failure = True
+        elif packet.opportunity and not story_review:
+            issues.append({
+                "field_path": "editorial_brief.director_brief",
+                "category": "story_axis",
+                "problem": "holistic story review was omitted for a draft with a locked editorial opportunity",
+                "evidence_ids": [],
+                "repair_instruction": "rebuild the complete arc around the first selection reason and require holistic verification before field approval",
+            })
         attention_paths = {
             "editorial_brief.headline", "editorial_brief.fixed_conclusion",
             "editorial_brief.attention_strategy.selected_hook",
@@ -465,6 +592,123 @@ class OpenAICompatibleStoryWriter:
         # target, so treating it as a fatal rejection makes a valid generation
         # nondeterministically fail.  We still fail closed on any explicit field
         # failure or low attention score above.
+        return issues, {
+            **provenance,
+            "story_review": story_review,
+            "narrative_score": story_review.get("narrative_tension_score") if story_review else None,
+            "pacing_score": story_review.get("pacing_score") if story_review else None,
+        }
+
+    def review_spoken_chinese(
+        self, packet: StoryWriterPacket, draft: dict[str, object],
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Audit read-aloud Chinese only; never re-direct or expand the cut."""
+        editorial = dict(draft.get("editorial_brief") or {})
+        attention = editorial.get("attention_strategy") or {}
+        fields: dict[str, object] = {
+            "editorial_brief.headline": editorial.get("headline"),
+            "editorial_brief.subheadline": editorial.get("subheadline"),
+            "editorial_brief.fixed_conclusion": editorial.get("fixed_conclusion") or draft.get("footer"),
+            "editorial_brief.attention_strategy.selected_hook": (
+                attention.get("selected_hook") if isinstance(attention, dict) else None
+            ),
+        }
+        for index, shot in enumerate(editorial.get("evidence_shots") or []):
+            if not isinstance(shot, dict):
+                continue
+            for name in ("fact", "audience_copy", "translation", "full_translation"):
+                if shot.get(name):
+                    fields[f"editorial_brief.evidence_shots[{index}].{name}"] = shot[name]
+        fields = {path: value for path, value in fields.items() if value}
+        evidence = [{"id": item.id, "quote": item.quote[:2200]} for item in packet.evidence]
+        schema = {
+            "field_reviews": [{
+                "field_path": "one exact key from Fields", "verdict": "pass|fail",
+                "naturalness_score": "1|2|3|4|5",
+                "problem": "specific spoken-Chinese problem, empty for pass",
+                "repair_instruction": "spoken rewrite instruction preserving the supplied meaning",
+                "evidence_ids": ["existing evidence id"],
+            }],
+        }
+        messages = [
+            {"role": "system", "content": (
+                "Return one strict JSON object. You are a native-Chinese dialogue editor. "
+                "Your authority is limited to how existing viewer-facing Chinese sounds when read aloud."
+            )},
+            {"role": "user", "content": "\n".join([
+                "Review exactly every field in Fields once. Do not review story choice, directing, evidence hierarchy, pacing, visuals, missing facts, technical completeness, or what the video should add.",
+                "Do not request a chart, another shot, another metric, an implementation method, a stronger claim, or additional context. Do not change factual certainty. Only decide whether the existing meaning is expressed as natural spoken Mandarin for a technically curious colleague who has not read the source.",
+                "Use the read-aloud test: the listener should understand the actor, action, reaction/result, and meaning after hearing the sentence once. Prefer short subject-verb clauses and concrete actions. Every sentence needs a human, company, system, model, or agent as its grammatical actor. Fail a translation that makes an abstract phase, deviation, mechanism, framework, finding, or risk perform the action; restore the concrete actor when the source uses passive academic syntax. Fail academic nominalization, report language, consultant language, word-for-word syntax, and conclusions that sound like an institutional memo. A paper-method sentence also fails when it merely names a model, framework, or type of game; it should say what the researchers made the agents do and what the agents could observe.",
+                "For research terms, the concrete scene comes first and the formal name is optional. For tacit collusion, preserve the key distinction: the agents did not discuss or message each other, yet learned to keep prices high together. A field containing 合谋, 串通, or 商量 passes only when that same field first makes both parts understandable: no discussion/messages/instruction, and the agents keeping or pushing prices high together. The formal label may follow the mechanism; it cannot replace it.",
+                "A naturalness score below 4 is fail. For each failure, instruct a spoken rewrite using only the current field meaning and supplied evidence. Never invent a number, date, scope, mechanism, policy, or recommendation.",
+                "Fields: " + json.dumps(fields, ensure_ascii=False),
+                "Evidence: " + json.dumps(evidence, ensure_ascii=False),
+                "Return JSON matching: " + json.dumps(schema, ensure_ascii=False),
+            ])},
+        ]
+        review, provenance = self._request_json(messages, max_tokens=4800)
+        rows = [item for item in (review.get("field_reviews") or []) if isinstance(item, dict)]
+        by_path = {
+            str(item.get("field_path") or ""): item for item in rows
+            if str(item.get("field_path") or "") in fields
+        }
+        missing = [path for path in fields if path not in by_path]
+        if missing:
+            raise StoryDraftError(
+                review, ValueError("spoken-Chinese critic omitted fields: " + json.dumps(missing)),
+            )
+        issues = [{
+            "field_path": path, "category": "natural_chinese",
+            "problem": item.get("problem") or "does not pass the spoken-Chinese read-aloud test",
+            "evidence_ids": item.get("evidence_ids") or [],
+            "repair_instruction": item.get("repair_instruction") or "rewrite as natural spoken Chinese without changing meaning",
+        } for path, item in by_path.items() if str(item.get("verdict") or "").casefold() == "fail"]
+
+        # A model may regard a familiar academic label as fluent Chinese even
+        # when a general technical viewer still cannot picture the mechanism.
+        # Keep this distinction auditable: tacit collusion is specifically the
+        # absence of an explicit agreement, not a synonym for 串通 or 商量.
+        source_describes_tacit_collusion = any(
+            "tacit collusion" in item.quote.casefold() for item in packet.evidence
+        )
+        if source_describes_tacit_collusion:
+            no_explicit_agreement = re.compile(
+                r"(?:没|没有|不|无需|从未).{0,12}"
+                r"(?:商量|讨论|沟通|通信|聊天|互发|协议|指令|(?:让|教).{0,4}联手)"
+            )
+            shared_high_price = re.compile(
+                r"(?:一起|共同|同时|都).{0,14}(?:维持|抬高|抬价|拉高|保持).{0,8}(?:高价|价格|电价)|"
+                r"(?:维持|抬高|抬价|拉高).{0,8}(?:高价|价格|电价)"
+            )
+            formal_label = re.compile(r"合谋|串通|商量")
+            evidence_ids = [item.id for item in packet.evidence]
+            rail_paths = [path for path in fields if not re.search(r"evidence_shots\[\d+\]", path)]
+            shot_groups: dict[str, list[str]] = {}
+            for path in fields:
+                match = re.search(r"evidence_shots\[(\d+)\]", path)
+                if match:
+                    shot_groups.setdefault(match.group(1), []).append(path)
+            # Judge what the viewer sees together. Requiring every adjacent
+            # field to repeat both halves would create robotic redundancy.
+            for group_paths in [rail_paths, *shot_groups.values()]:
+                group_text = " ".join(str(fields[path]) for path in group_paths)
+                formal_paths = [path for path in group_paths if formal_label.search(str(fields[path]))]
+                if not formal_paths:
+                    continue
+                if no_explicit_agreement.search(group_text) and shared_high_price.search(group_text):
+                    continue
+                for path in formal_paths:
+                    issues = [item for item in issues if item.get("field_path") != path]
+                    issues.append({
+                        "field_path": path,
+                        "category": "natural_chinese",
+                        "problem": "这一屏用合谋/串通/商量代替了机制，没说清 tacit collusion 的反常之处。",
+                        "evidence_ids": evidence_ids,
+                        "repair_instruction": (
+                            "让这一屏先用口语说清：它们没商量、也没互发消息（或没收到联手指令），"
+                            "却慢慢学会一起维持高价。可直接去掉术语；如果仍需专业名称，只在机制之后补充。"
+                        ),
+                    })
         return issues, provenance
 
     def plan(self, packet: StoryWriterPacket) -> tuple[EditorialPlan, dict[str, object]]:
@@ -535,7 +779,11 @@ class OpenAICompatibleStoryWriter:
             "required setup/context event" in validation_error
             or "incumbent-history pattern context" in validation_error
         )
-        if packet.topic_type != TopicType.GITHUB_PROJECT and not context_structure_error and (
+        holistic_story_error = bool(re.search(
+            r'"category"\s*:\s*"(?:story_axis|audience_context|chronology|evidence_hierarchy|decision_context|editorial_value|conflict_visibility|payoff|pacing)"',
+            validation_error,
+        ))
+        if packet.topic_type != TopicType.GITHUB_PROJECT and not context_structure_error and not holistic_story_error and (
             "missing mechanism/details" in validation_error or "unsupported concepts" in validation_error
             or "quoted earlier post" in validation_error or "branded feature name" in validation_error
             or "near-duplicates" in validation_error or "absence-of-limit" in validation_error
@@ -579,6 +827,14 @@ class OpenAICompatibleStoryWriter:
                 " Rebuild the complete editorial brief so director_brief.selected_context_ids includes every required_context_id. "
                 "For a people_change story with pattern_context_ids, select and visibly use at least one verified earlier incumbent-history event. "
                 "Add its evidence id and context event id to a distinct background/turn shot; state chronology explicitly and do not merge it with the root event."
+            )
+        if packet.topic_type != TopicType.GITHUB_PROJECT and holistic_story_error:
+            repair_contract += (
+                " This is a holistic story/directing failure, not a line-edit request. Rebuild the complete editorial_brief around the first EditorialOpportunity selection reason. "
+                "You may delete, merge, or reorder evidence_shots, but every retained claim must cite supplied evidence and an X-root story must still show the complete root post first. "
+                "Restore the intended actor, stakes, chronology, evidence hierarchy, audience decision context, and payoff before polishing wording. "
+                "Prefer three readable beats; keep a fourth only when it adds indispensable context. Preserve a lesser-known person's evidence-backed identity anchor, but never let their background replace the current event. "
+                "After increasing tension, re-check every claim for grounding: do not invent opposition, causality, scale, or certainty."
             )
         if packet.topic_type != TopicType.GITHUB_PROJECT and "root-post Chinese translation" in validation_error:
             repair_contract += (
@@ -667,6 +923,7 @@ class OpenAICompatibleStoryWriter:
         self, packet: StoryWriterPacket, invalid_draft: dict[str, object], validation_error: str,
     ) -> tuple[StoryboardRequest, dict[str, object], dict[str, object]]:
         """Patch only semantic copy that failed grounding, preserving scene evidence mechanics."""
+        issue_paths = set(re.findall(r'"field_path"\s*:\s*"([^"]+)"', validation_error))
         editorial = dict(invalid_draft.get("editorial_brief") or {})
         shot_source = editorial.get("evidence_shots") or invalid_draft.get("evidence_shots") or []
         director_source = editorial.get("director_brief") or invalid_draft.get("director_brief") or {}
@@ -712,6 +969,7 @@ class OpenAICompatibleStoryWriter:
             {"role": "system", "content": "Return one strict JSON patch only."},
             {"role": "user", "content": "\n".join([
                 "Repair only the failing Chinese editorial copy for a BGM-only WeChat short video.",
+                "Change only the exact field paths named in Validation errors. Copy every other current viewer-facing field byte-for-byte; do not rewrite clean fields or move a rejected term into another field.",
                 "Keep every shot id, evidence id, URL, visual_family, and ordering unchanged. "
                 "For every shot, return the smallest exact contiguous target from its same cited evidence that directly proves the repaired fact; never point the highlight at a merely adjacent or topically related claim. "
                 "translation and full_translation are viewer-facing Chinese copy: repair them when validation identifies literal, vague, or unnatural language.",
@@ -735,7 +993,8 @@ class OpenAICompatibleStoryWriter:
                 IT_TRANSLATION_CONTRACT,
                 PLAIN_CHINESE_CONTRACT,
                 "Validation errors: " + validation_error,
-                "Required existing structure (write fresh copy; the invalid old wording is intentionally omitted): " + json.dumps(current, ensure_ascii=False),
+                "Required existing structure: " + json.dumps(current, ensure_ascii=False),
+                "Current editorial copy (preserve all non-failing fields exactly): " + json.dumps(editorial, ensure_ascii=False),
                 "Evidence: " + json.dumps(evidence_excerpt, ensure_ascii=False),
                 "Return JSON matching: " + json.dumps(patch_schema, ensure_ascii=False),
             ])},
@@ -743,11 +1002,29 @@ class OpenAICompatibleStoryWriter:
         # browser targets are included, reasoning-capable providers can spend
         # more than 2.4K tokens before emitting the strict JSON payload.
         ], max_tokens=4800)
-        required_patch_fields = {
-            "headline", "subheadline", "fixed_conclusion", "hook_fact", "conflict", "surprise",
-            "stakes", "stance", "payoff", "hook_candidates", "hook_evidence_ids", "selected_hook",
-            "shot_updates", "director_copy", "story_arc_updates",
-        }
+        if issue_paths:
+            required_patch_fields: set[str] = set()
+            for path in issue_paths:
+                top_match = re.fullmatch(
+                    r"editorial_brief\.(headline|subheadline|fixed_conclusion)", path,
+                )
+                attention_match = re.fullmatch(
+                    r"editorial_brief\.attention_strategy\.([a-z_]+)", path,
+                )
+                if top_match:
+                    required_patch_fields.add(top_match.group(1))
+                elif attention_match:
+                    required_patch_fields.add(attention_match.group(1))
+                elif re.search(r"editorial_brief\.evidence_shots\[\d+\]", path):
+                    required_patch_fields.add("shot_updates")
+                elif path == "editorial_brief.director_brief":
+                    required_patch_fields.add("director_copy")
+        else:
+            required_patch_fields = {
+                "headline", "subheadline", "fixed_conclusion", "hook_fact", "conflict", "surprise",
+                "stakes", "stance", "payoff", "hook_candidates", "hook_evidence_ids", "selected_hook",
+                "shot_updates", "director_copy", "story_arc_updates",
+            }
         missing_patch_fields = required_patch_fields - set(patch)
         expected_shot_ids = {str(item.get("id")) for item in shot_source if isinstance(item, dict) and item.get("id")}
         returned_shot_ids = {
@@ -756,27 +1033,53 @@ class OpenAICompatibleStoryWriter:
         }
         expected_arc = [item for item in director_source.get("story_arc", []) if isinstance(item, dict)]
         returned_arc = [item for item in patch.get("story_arc_updates", []) if isinstance(item, dict)]
-        if missing_patch_fields or returned_shot_ids != expected_shot_ids:
+        required_shot_ids = expected_shot_ids
+        if issue_paths:
+            required_shot_ids = {
+                str(shot_source[int(match.group(1))].get("id"))
+                for path in issue_paths
+                if (match := re.search(r"editorial_brief\.evidence_shots\[(\d+)\]", path))
+                and int(match.group(1)) < len(shot_source)
+                and isinstance(shot_source[int(match.group(1))], dict)
+                and shot_source[int(match.group(1))].get("id")
+            }
+        if missing_patch_fields or not required_shot_ids <= returned_shot_ids:
             problem = "semantic repair patch is incomplete"
             if missing_patch_fields:
                 problem += ": missing " + ", ".join(sorted(missing_patch_fields))
-            if returned_shot_ids != expected_shot_ids:
-                problem += "; shot ids must be " + ", ".join(sorted(expected_shot_ids))
+            if not required_shot_ids <= returned_shot_ids:
+                problem += "; missing shot ids " + ", ".join(sorted(required_shot_ids - returned_shot_ids))
             raise StoryDraftError(patch, ValueError(problem))
         repaired = deepcopy(invalid_draft)
         repaired_editorial = dict(repaired.get("editorial_brief") or {})
         for name in ("headline", "subheadline", "fixed_conclusion"):
-            if patch.get(name):
+            path = f"editorial_brief.{name}"
+            if patch.get(name) and (not issue_paths or path in issue_paths):
                 repaired_editorial[name] = patch[name]
         for name in ("opening_mode", "category_label", "direct_identifier", "editorial_inference"):
-            if name in patch:
+            path = f"editorial_brief.{name}"
+            if name in patch and (not issue_paths or path in issue_paths):
                 repaired_editorial[name] = str(patch.get(name) or "")
-        repaired_editorial["attention_strategy"] = {
-            name: patch[name] for name in (
-                "hook_fact", "conflict", "surprise", "stakes", "stance", "payoff",
-                "hook_candidates", "hook_evidence_ids", "selected_hook",
+        repaired_attention = dict(repaired_editorial.get("attention_strategy") or {})
+        for name in (
+            "hook_fact", "conflict", "surprise", "stakes", "stance", "payoff",
+            "hook_candidates", "hook_evidence_ids", "selected_hook",
+        ):
+            path = f"editorial_brief.attention_strategy.{name}"
+            selected_hook_repair = (
+                name == "hook_candidates"
+                and "editorial_brief.attention_strategy.selected_hook" in issue_paths
             )
-        }
+            if name in patch and (not issue_paths or path in issue_paths or selected_hook_repair):
+                repaired_attention[name] = patch[name]
+        if "editorial_brief.attention_strategy.selected_hook" in issue_paths:
+            selected = str(repaired_attention.get("selected_hook") or "")
+            candidates = [str(item) for item in repaired_attention.get("hook_candidates") or []]
+            if selected and selected not in candidates:
+                repaired_attention["hook_candidates"] = [
+                    selected, *[item for item in candidates if item != selected],
+                ][:3]
+        repaired_editorial["attention_strategy"] = repaired_attention
         repaired["editorial_brief"] = repaired_editorial
         repaired["footer"] = repaired_editorial.get("fixed_conclusion", repaired.get("footer", ""))
         updates = {
@@ -787,22 +1090,21 @@ class OpenAICompatibleStoryWriter:
         if not isinstance(shot_container, list):
             shot_container = repaired.get("evidence_shots")
         if isinstance(shot_container, list):
-            for shot in shot_container:
+            for index, shot in enumerate(shot_container):
                 update = updates.get(str(shot.get("id"))) if isinstance(shot, dict) else None
                 if update:
-                    shot["fact"] = str(update.get("fact") or shot.get("fact") or "")
-                    shot["interpretation"] = str(update.get("interpretation") or shot.get("interpretation") or "")
-                    shot["audience_copy"] = str(update.get("audience_copy") or "")
-                    if "target" in update:
-                        shot["target"] = str(update.get("target") or "")
-                    if "translation" in update:
-                        shot["translation"] = str(update.get("translation") or "")
-                    if "full_translation" in update:
-                        shot["full_translation"] = str(update.get("full_translation") or "")
-                    shot["relation_to_previous"] = str(update.get("relation_to_previous") or shot.get("relation_to_previous") or "")
+                    prefix = f"editorial_brief.evidence_shots[{index}]"
+                    for name in (
+                        "fact", "interpretation", "audience_copy", "target", "translation",
+                        "full_translation", "relation_to_previous",
+                    ):
+                        path = f"{prefix}.{name}"
+                        if name in update and (not issue_paths or path in issue_paths):
+                            shot[name] = str(update.get(name) or "")
         director_copy = patch.get("director_copy")
         director_container = repaired_editorial.get("director_brief") or repaired.get("director_brief")
-        if isinstance(director_copy, dict) and isinstance(director_container, dict):
+        repair_director = not issue_paths or "editorial_brief.director_brief" in issue_paths
+        if repair_director and isinstance(director_copy, dict) and isinstance(director_container, dict):
             for name in ("editorial_thesis", "viewer_tension", "attention_trigger", "emotion", "emotion_intensity"):
                 if director_copy.get(name):
                     director_container[name] = director_copy[name]
@@ -906,7 +1208,11 @@ class OpenAICompatibleStoryWriter:
             "model": self.settings.model,
             "messages": messages,
             "response_format": {"type": "json_object"},
-            "temperature": 0.2,
+            "temperature": (
+                1 if self.settings.provider == "kimi"
+                and self.settings.model in {"k3", "k3-256k"}
+                else 0.2
+            ),
             "max_tokens": max_tokens,
         }
         if self.settings.provider_preferences:
@@ -916,6 +1222,8 @@ class OpenAICompatibleStoryWriter:
                 "effort": os.environ.get("OPENROUTER_REASONING_EFFORT", "low"),
                 "exclude": True,
             }
+        elif self.settings.provider == "kimi" and self.settings.model in {"k3", "k3-256k"}:
+            payload["reasoning_effort"] = self.settings.reasoning_effort or "high"
         endpoint = self.settings.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.settings.api_key}", "Content-Type": "application/json"}
         if self.settings.provider == "openrouter":
@@ -931,7 +1239,11 @@ class OpenAICompatibleStoryWriter:
         # finish_reason=error, empty content, or a prose error instead of the
         # requested JSON object. Treat those as bounded transient failures in
         # the same way as 429/5xx responses.
-        max_attempts = 2
+        # Keep malformed/empty responses bounded, but give explicit rate limits
+        # enough time to clear. OpenRouter already has provider/model fallbacks
+        # enabled in the request; a gateway-level 429 requires client backoff.
+        max_attempts = 4
+        retry_events: list[dict[str, object]] = []
         for attempt in range(max_attempts):
             try:
                 with urlopen(request, timeout=self.settings.timeout_seconds) as response:
@@ -951,20 +1263,41 @@ class OpenAICompatibleStoryWriter:
                 last_error = error
             except (URLError, OSError, http.client.HTTPException, json.JSONDecodeError, ValueError) as error:
                 last_error = error
-            if attempt < max_attempts - 1:
-                time.sleep(0.6 * (attempt + 1))
+            rate_limited = isinstance(last_error, HTTPError) and last_error.code == 429
+            attempt_limit = max_attempts if rate_limited else 2
+            if attempt + 1 >= attempt_limit:
+                break
+            retry_after = ""
+            if isinstance(last_error, HTTPError) and last_error.headers:
+                retry_after = str(last_error.headers.get("Retry-After") or "").strip()
+            try:
+                requested_delay = float(retry_after)
+            except ValueError:
+                requested_delay = 0.0
+            if rate_limited:
+                base_delay = max(0.1, float(os.environ.get("VIDEO_FACTORY_LLM_429_BACKOFF_SECONDS", "2")))
+                delay = min(30.0, requested_delay or base_delay * (2 ** attempt))
+            else:
+                delay = 0.6 * (attempt + 1)
+            retry_events.append({
+                "attempt": attempt + 1,
+                "reason": f"HTTP {last_error.code}" if isinstance(last_error, HTTPError) else type(last_error).__name__,
+                "backoff_seconds": delay,
+            })
+            time.sleep(delay)
         if result is None or draft is None:
             if isinstance(last_error, HTTPError):
                 detail = f"HTTP {last_error.code}"
             else:
                 detail = str(getattr(last_error, "reason", last_error))
             raise RuntimeError(
-                f"{self.settings.provider} story request failed after {max_attempts} attempts: {detail}"
+                f"{self.settings.provider} story request failed after {len(retry_events) + 1} attempts: {detail}"
             ) from last_error
         provenance = {
             "provider": self.settings.provider, "model": result.get("model", self.settings.model),
             "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "usage": result.get("usage"),
+            "usage": result.get("usage"), "request_attempts": len(retry_events) + 1,
+            "retry_events": retry_events,
         }
         return draft, provenance
 
@@ -1167,6 +1500,11 @@ class OpenAICompatibleStoryWriter:
             graph.discarded_context_ids = list(dict.fromkeys([
                 *graph.discarded_context_ids, *(item.id for item in new_context if item.id),
             ]))
+            parsed_duration_target = _coerce_model_float(
+                editorial_data.get("duration_target", packet.target_duration), packet.target_duration,
+            )
+            if packet.content_type == ContentType.FLASH:
+                parsed_duration_target = min(30.0, parsed_duration_target)
             editorial_brief = EditorialBrief(
                 headline=str(editorial_data.get("headline", "")),
                 subheadline=str(editorial_data.get("subheadline", "")),
@@ -1175,9 +1513,7 @@ class OpenAICompatibleStoryWriter:
                 subjects=[StorySubject(**item) for item in editorial_data.get("subjects", draft.get("subjects", []))],
                 context_events=context_events,
                 evidence_shots=shots,
-                duration_target=_coerce_model_float(
-                    editorial_data.get("duration_target", packet.target_duration), packet.target_duration,
-                ),
+                duration_target=parsed_duration_target,
                 opportunity=packet.opportunity,
                 context_graph=graph,
                 director_brief=director_brief,
@@ -1187,6 +1523,8 @@ class OpenAICompatibleStoryWriter:
                 editorial_inference=str(editorial_data.get("editorial_inference", "")),
             )
             canonicalize_editorial_brief(editorial_brief, packet.evidence)
+            if packet.content_type == ContentType.FLASH:
+                enforce_flash_time_budget(editorial_brief)
         if packet.topic_type == TopicType.GITHUB_PROJECT and brief:
             scenes = OpenAICompatibleStoryWriter._github_scenes_from_draft(
                 packet, brief, draft.get("github_scenes", []),
@@ -1279,6 +1617,54 @@ class OpenAICompatibleStoryWriter:
         if errors:
             raise ValueError("; ".join(errors))
         return scenes
+
+
+class TransportFallbackStoryWriter:
+    """Retry the same request through a secondary provider after transport exhaustion."""
+
+    def __init__(
+        self, primary: OpenAICompatibleStoryWriter, fallback: OpenAICompatibleStoryWriter,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.settings = primary.settings
+        self.fallback_active = False
+        self.fallback_reason = ""
+
+    def _request_json(
+        self, messages: list[dict[str, str]], max_tokens: int,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if self.fallback_active:
+            draft, provenance = self.fallback._request_json(messages, max_tokens)
+            return draft, {
+                **provenance,
+                "transport_fallback": {
+                    "from_provider": self.primary.settings.provider,
+                    "from_model": self.primary.settings.model,
+                    "to_provider": self.fallback.settings.provider,
+                    "to_model": self.fallback.settings.model,
+                    "reason": self.fallback_reason,
+                    "circuit_open": True,
+                },
+            }
+        try:
+            return self.primary._request_json(messages, max_tokens)
+        except RuntimeError as error:
+            if "story request failed after" not in str(error):
+                raise
+            self.fallback_active = True
+            self.fallback_reason = str(error)
+            draft, provenance = self.fallback._request_json(messages, max_tokens)
+            return draft, {
+                **provenance,
+                "transport_fallback": {
+                    "from_provider": self.primary.settings.provider,
+                    "from_model": self.primary.settings.model,
+                    "to_provider": self.fallback.settings.provider,
+                    "to_model": self.fallback.settings.model,
+                    "reason": str(error),
+                },
+            }
 
 
 def packet_from_json(path: Path) -> StoryWriterPacket:

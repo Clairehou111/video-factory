@@ -34,6 +34,26 @@ DEFAULT_FONT = str(FONT_CANDIDATES[0])
 WECHAT_TOP_UI_SAFE = 120
 WECHAT_BOTTOM_UI_SAFE = 400
 RADAR_META_RAIL = 58
+
+
+_SUBSCRIPT_DIGITS = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+
+
+def mobile_safe_text(value: str) -> str:
+    """Replace math glyphs missing from the bundled CJK font.
+
+    Noto Sans CJK renders Unicode subscript digits as tofu boxes on the final
+    phone frame. ASCII index notation is slightly less typographic but fully
+    legible and semantically explicit on every supported render host.
+    """
+    text = re.sub(
+        r"[₀₁₂₃₄₅₆₇₈₉]+",
+        lambda match: "_" + match.group(0).translate(_SUBSCRIPT_DIGITS),
+        value,
+    )
+    return text.replace("ᵀ", "^T")
+
+
 def _is_radar_v2(manifest: RenderManifest) -> bool:
     return str(manifest.render_profile or "classic") == InformationRenderProfile.RADAR_V2.value
 
@@ -49,8 +69,17 @@ def _radar_metadata(manifest: RenderManifest) -> tuple[str, str]:
         key=lambda item: 0 if root_url and item.url.rstrip("/") == root_url else 1,
     )
     date_label = ""
-    for item in ordered:
-        raw = str(item.metadata.get("published_at") or item.captured_at or "").strip()
+    # Prefer an actual publication timestamp anywhere in the selected evidence
+    # before falling back to acquisition time.  The primary page and discovery
+    # scope can share a URL, and the page record is commonly captured days
+    # after the dated discovery item.
+    dated = [
+        str(item.metadata.get("published_at") or "").strip()
+        for item in ordered
+        if str(item.metadata.get("published_at") or "").strip()
+    ]
+    fallback = [str(item.captured_at or "").strip() for item in ordered if item.captured_at]
+    for raw in [*dated, *fallback]:
         if not raw:
             continue
         try:
@@ -192,6 +221,42 @@ def _draw_centered(draw: object, text: str, *, box: tuple[int, int, int, int], f
         draw.text(((left + right) // 2, start_y + index * line_height), line, font=font, fill=fill, anchor="ma")
 
 
+def _draw_left_aligned(
+    draw: object, text: str, *, box: tuple[int, int, int, int], font: object,
+    fill: str, max_lines: int, line_gap: int = 10,
+) -> None:
+    """Draw a vertically centered title on one stable left grid."""
+    left, top, right, bottom = box
+    # Alignment and line-breaking are independent. Reuse the natural-boundary
+    # balancer so a left-aligned question hook breaks after “？” instead of
+    # splitting a phrase such as “提前” across two lines.
+    lines = _centered_lines(draw, text, font, right - left, max_lines)
+    line_height = draw.textbbox((0, 0), "中", font=font)[3] + line_gap
+    start_y = top + max(0, ((bottom - top) - len(lines) * line_height) // 2)
+    for index, line in enumerate(lines):
+        draw.text(
+            (left, start_y + index * line_height), line,
+            font=font, fill=fill, anchor="la",
+        )
+
+
+def _fit_complete_gloss_lines(
+    draw: object, text: str, font_path: Path | None, width: int,
+    *, max_lines: int = 5, maximum_size: int = 40, minimum_size: int = 32,
+) -> tuple[object, list[str]]:
+    """Fit a complete translation card without ellipsis."""
+    from PIL import ImageFont
+
+    compact = re.sub(r"\s+", "", text)
+    font_file = str(_font_path(font_path))
+    for size in range(maximum_size, minimum_size - 1, -2):
+        font = ImageFont.truetype(font_file, size)
+        lines = _wrapped_lines(draw, text, font, width, max_lines)
+        if re.sub(r"\s+", "", "".join(lines)) == compact:
+            return font, lines
+    raise ValueError("highlight translation cannot fit without truncation")
+
+
 def _information_layout(hook: str, font_path: Path | None = None) -> tuple[int, int, int]:
     """Return top-rail height, title size, and lines without truncation.
 
@@ -202,9 +267,14 @@ def _information_layout(hook: str, font_path: Path | None = None) -> tuple[int, 
     draw = ImageDraw.Draw(Image.new("RGB", (8, 8)))
     compact = hook.strip().replace("\n", "")
     font_file = str(_font_path(font_path))
-    for top_height, max_lines, maximum_size in ((260, 2, 54), (300, 3, 50), (340, 3, 46), (380, 4, 42)):
-        available_height = top_height - 72
-        for size in range(maximum_size, 33, -2):
+    # Choose the smallest rail that fits the complete title. Short titles no
+    # longer inherit the old 260px minimum, while long titles may still expand
+    # to four lines rather than being clipped or shrunk into a breadcrumb.
+    for top_height, max_lines, maximum_size in (
+        (190, 2, 54), (230, 3, 50), (280, 3, 46), (330, 4, 42), (380, 4, 38),
+    ):
+        available_height = top_height - 40
+        for size in range(maximum_size, 35, -2):
             font = ImageFont.truetype(font_file, size)
             lines = _wrapped_lines(draw, hook, font, 944, max_lines)
             line_height = draw.textbbox((0, 0), "中", font=font)[3] + 12
@@ -235,6 +305,7 @@ def render_fixed_footer(text: str, output: Path, font_path: Path | None = None) 
     """Compatibility helper for the former footer-only renderer."""
     from PIL import Image, ImageDraw, ImageFont
 
+    text = mobile_safe_text(text)
     if not text.strip():
         raise ValueError("fixed footer text is required")
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
@@ -256,6 +327,8 @@ def render_information_frame(hook: str, footer: str, output: Path, font_path: Pa
     """Opaque fixed top/bottom rails; the middle remains transparent for evidence video."""
     from PIL import Image, ImageDraw, ImageFont
 
+    hook = mobile_safe_text(hook)
+    footer = mobile_safe_text(footer)
     if not hook.strip() or not footer.strip():
         raise ValueError("both fixed hook and fixed footer are required")
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
@@ -268,9 +341,9 @@ def render_information_frame(hook: str, footer: str, output: Path, font_path: Pa
     draw.rectangle((0, bottom_top, 1080, 1920), fill="#031126ff")
     title = ImageFont.truetype(str(_font_path(font_path)), title_size)
     conclusion = ImageFont.truetype(str(_font_path(font_path)), conclusion_size)
-    _draw_centered(
+    _draw_left_aligned(
         draw, hook,
-        box=(68, WECHAT_TOP_UI_SAFE + 28, 1012, top_bottom - 24), font=title,
+        box=(68, WECHAT_TOP_UI_SAFE + 16, 1012, top_bottom - 14), font=title,
         fill="#f4f8ff", max_lines=title_lines, line_gap=12,
     )
     _draw_centered(
@@ -297,24 +370,40 @@ def _expanded_evidence_layout(manifest: RenderManifest) -> bool:
         for item in manifest.evidence
     ):
         return True
+    # A single code proof inside an ordinary flash does not turn the whole
+    # story into a repository/architecture walkthrough.  That old shortcut
+    # incorrectly removed the footer and squeezed long news hooks into a tiny
+    # one-line header (for example, a product launch whose final proof links to
+    # its SDK).  Only genuinely deep paper/architecture visuals opt in here.
     return any(
-        scene.visual_family.casefold() in {"paper", "architecture", "code"}
+        scene.visual_family.casefold() in {"paper", "architecture"}
         for scene in manifest.scenes
     )
 
 
-def _single_header_layout(title: str, font_path: Path | None = None) -> tuple[int, int]:
-    """Fit one stable project/action line above an expanded evidence viewport."""
+def _single_header_layout(title: str, font_path: Path | None = None) -> tuple[int, int, int]:
+    """Fit a large stable project/action header above expanded evidence.
+
+    Deep evidence still gets at least 1400px of vertical viewport, but the
+    headline no longer shrinks into a tiny one-line breadcrumb.  A second or
+    third line is cheaper than making the first thing viewers read illegible.
+    """
     from PIL import Image, ImageDraw, ImageFont
 
     draw = ImageDraw.Draw(Image.new("RGB", (8, 8)))
     compact = re.sub(r"\s+", " ", title.strip())
     font_file = str(_font_path(font_path))
-    for size in range(46, 21, -2):
-        font = ImageFont.truetype(font_file, size)
-        if draw.textbbox((0, 0), compact, font=font)[2] <= 944:
-            return 130, size
-    raise ValueError("expanded-layout title must fit one line; keep the repo/paper name and one action")
+    for height, max_lines, maximum_size in (
+        (190, 2, 54), (230, 3, 50), (280, 3, 46), (330, 4, 42),
+    ):
+        available_height = height - 40
+        for size in range(maximum_size, 39, -2):
+            font = ImageFont.truetype(font_file, size)
+            lines = _wrapped_lines(draw, compact, font, 944, max_lines)
+            line_height = draw.textbbox((0, 0), "中", font=font)[3] + 12
+            if "".join(lines) == compact and len(lines) * line_height <= available_height:
+                return height, size, max_lines
+    raise ValueError("expanded-layout title cannot fit three readable lines")
 
 
 def render_single_header_frame(
@@ -322,14 +411,17 @@ def render_single_header_frame(
 ) -> Path:
     from PIL import Image, ImageDraw, ImageFont
 
-    height, size = _single_header_layout(title, font_path)
+    title = mobile_safe_text(title)
+    height, size, lines = _single_header_layout(title, font_path)
     rail_bottom = WECHAT_TOP_UI_SAFE + height
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     draw.rectangle((0, 0, 1080, rail_bottom), fill="#031126ff")
-    draw.text(
-        (540, WECHAT_TOP_UI_SAFE + height // 2), re.sub(r"\s+", " ", title.strip()),
-        font=ImageFont.truetype(str(_font_path(font_path)), size), fill="#f4f8ff", anchor="mm",
+    _draw_left_aligned(
+        draw, re.sub(r"\s+", " ", title.strip()),
+        box=(68, WECHAT_TOP_UI_SAFE + 16, 1012, rail_bottom - 14),
+        font=ImageFont.truetype(str(_font_path(font_path)), size), fill="#f4f8ff",
+        max_lines=lines, line_gap=12,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output)
@@ -624,7 +716,9 @@ def render_scene_copy(scene: Scene, output: Path, font_path: Path | None = None)
     """A small nearby Chinese gloss; never a full-screen editorial card."""
     from PIL import Image, ImageDraw, ImageFont
 
-    translation = _translation_only((scene.highlight_translation or "").strip())
+    translation = mobile_safe_text(
+        _translation_only((scene.highlight_translation or "").strip())
+    )
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
     if not translation:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -659,10 +753,9 @@ def render_adjacent_gloss(
     from PIL import Image, ImageDraw, ImageFont
 
     canvas = Image.new("RGBA", CANVAS, (0, 0, 0, 0))
-    translation = _translation_only(text)
+    translation = mobile_safe_text(_translation_only(text))
     if translation and profile != InformationRenderProfile.RADAR_V2.value:
         draw = ImageDraw.Draw(canvas)
-        font = ImageFont.truetype(str(_font_path(font_path)), 40)
         text_width = 820
         center_x = 540
         top = 1030
@@ -678,24 +771,26 @@ def render_adjacent_gloss(
             center_x = int(target_left + target_width / 2)
             center_x = max(40 + text_width // 2, min(1040 - text_width // 2, center_x))
             top = int(target_top + target_height + 24)
-        lines = _wrapped_lines(draw, translation, font, text_width, 3)
+        font, lines = _fit_complete_gloss_lines(
+            draw, translation, font_path, text_width, max_lines=5,
+        )
         line_height = draw.textbbox((0, 0), "中", font=font)[3] + 8
         height = len(lines) * line_height
         if highlight_box and source_size and top + height > 1540:
             scale = min(1080 / source_size[0], pane_height / source_size[1])
             target_top = pane_top + float(highlight_box["top"]) * scale
             top = max(pane_top + 20, int(target_top - height - 24))
+        text_left = center_x - text_width / 2
         for index, line in enumerate(lines):
             draw.text(
-                (center_x, top + index * line_height), line, font=font, fill="#ffe35b",
-                stroke_width=5, stroke_fill="#020815", anchor="ma",
+                (text_left, top + index * line_height), line, font=font, fill="#ffe35b",
+                stroke_width=5, stroke_fill="#020815", anchor="la",
             )
         output.parent.mkdir(parents=True, exist_ok=True)
         canvas.save(output)
         return output
     if translation:
         draw = ImageDraw.Draw(canvas)
-        font = ImageFont.truetype(str(_font_path(font_path)), 40)
         text_width = 820
         center_x = 540
         top = 1030
@@ -716,7 +811,9 @@ def render_adjacent_gloss(
             center_x = int(target_left + target_width / 2)
             center_x = max(40 + text_width // 2, min(1040 - text_width // 2, center_x))
             top = int(target_top + target_height + 24)
-        lines = _wrapped_lines(draw, translation, font, text_width, 3)
+        font, lines = _fit_complete_gloss_lines(
+            draw, translation, font_path, text_width, max_lines=5,
+        )
         line_height = draw.textbbox((0, 0), "中", font=font)[3] + 8
         height = len(lines) * line_height
         if highlight_box and source_size and top + height + 28 > pane_top + pane_height:
@@ -738,7 +835,7 @@ def render_adjacent_gloss(
         for index, line in enumerate(lines):
             parts = [part for part in emphasis.split(line) if part]
             widths = [draw.textbbox((0, 0), part, font=font)[2] for part in parts]
-            cursor_x = center_x - sum(widths) / 2
+            cursor_x = chip_left + 24
             for part, width in zip(parts, widths):
                 fill = "#fbbf24" if emphasis.fullmatch(part) else "#f8fafc"
                 draw.text((cursor_x, top + index * line_height), part, font=font, fill=fill, anchor="la")
@@ -769,7 +866,7 @@ def compose_information_frame(
     metadata_rail = RADAR_META_RAIL if identifier or date_label else 0
     expanded = _expanded_evidence_layout(manifest)
     if expanded:
-        header_height, _ = _single_header_layout(title, font_path)
+        header_height, _, _ = _single_header_layout(title, font_path)
         pane_top = WECHAT_TOP_UI_SAFE + header_height + metadata_rail
         bottom_top = 1920
         layout_profile = "expanded_single_header"

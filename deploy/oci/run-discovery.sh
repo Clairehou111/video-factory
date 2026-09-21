@@ -13,7 +13,7 @@ CLI="${VIDEO_FACTORY_CLI:-/opt/video-factory/venv/bin/video-factory}"
 WORKSPACE="${VIDEO_FACTORY_WORKSPACE:-/srv/video-factory/workspace}"
 CONFIG="${VIDEO_FACTORY_DISCOVERY_CONFIG:-/opt/video-factory/app/examples/resource_discovery.json}"
 PROVIDER="${VIDEO_FACTORY_DISCOVERY_PROVIDER:-auto}"
-CHANNEL_LIST="${VIDEO_FACTORY_DISCOVERY_CHANNELS:-github,official,paper,news,openrouter}"
+CHANNEL_LIST="${VIDEO_FACTORY_DISCOVERY_CHANNELS:-github,projects,robotics,autonomous_driving,official,paper,news,openrouter}"
 LOCK_DIR="${VIDEO_FACTORY_RUNTIME:-/srv/video-factory/runtime}"
 
 if ! command -v flock >/dev/null 2>&1; then

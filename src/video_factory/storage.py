@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
@@ -33,7 +35,12 @@ class Workspace:
             self.renders_dir, self.publish_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.db_path)) as db:
+        with closing(self._connect()) as db:
+            # Dashboard/search readers must not block discovery or generation
+            # writers.  WAL is persistent for the database and remains safe to
+            # request on later initializations.
+            db.execute("PRAGMA journal_mode = WAL")
+            db.execute("PRAGMA synchronous = NORMAL")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS records (
                     kind TEXT NOT NULL,
@@ -155,7 +162,18 @@ class Workspace:
         target_dir = self.assets_dir / category / digest[:12]
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / (name or source.name)
-        shutil.copy2(source, target)
+        # Local reruns often feed an asset path returned by a previous archive
+        # operation. Reusing that immutable content-addressed file is already
+        # success; copying it onto itself raises SameFileError and needlessly
+        # turns a recoverable rerun into a manual intervention.
+        same_file = source.resolve() == target.resolve()
+        if not same_file and target.exists():
+            try:
+                same_file = source.samefile(target)
+            except OSError:
+                same_file = False
+        if not same_file:
+            shutil.copy2(source, target)
         return str(target.relative_to(self.root)), digest
 
     def load_candidate(self, identifier: str) -> Candidate:
@@ -166,7 +184,7 @@ class Workspace:
     def candidate_for_source_url(self, source_url: str) -> Candidate | None:
         """Return an already archived root candidate without touching the network."""
         target = source_url.rstrip("/")
-        with closing(sqlite3.connect(self.db_path)) as db:
+        with closing(self._connect()) as db:
             rows = db.execute("SELECT payload FROM records WHERE kind = 'candidate'").fetchall()
         for (raw,) in rows:
             payload = json.loads(raw)
@@ -180,23 +198,48 @@ class Workspace:
 
     def evidence_for_candidates(self, candidate_ids: list[str]) -> list[Evidence]:
         identifiers = set(candidate_ids)
-        with closing(sqlite3.connect(self.db_path)) as db:
+        with closing(self._connect()) as db:
             rows = db.execute("SELECT payload FROM records WHERE kind = 'evidence'").fetchall()
         return [Evidence(**payload) for (raw,) in rows if (payload := json.loads(raw)).get("candidate_id") in identifiers]
 
     def _save(self, kind: str, identifier: str, payload: dict) -> None:
-        self.initialize()
-        with closing(sqlite3.connect(self.db_path)) as db:
-            db.execute(
-                "INSERT OR REPLACE INTO records(kind, id, payload, created_at) VALUES (?, ?, ?, datetime('now'))",
-                (kind, identifier, json.dumps(payload, ensure_ascii=False)),
-            )
-            db.commit()
+        attempts = max(1, int(os.environ.get("VIDEO_FACTORY_SQLITE_WRITE_ATTEMPTS", "6")))
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(attempts):
+            try:
+                self.initialize()
+                with closing(self._connect()) as db:
+                    db.execute(
+                        "INSERT OR REPLACE INTO records(kind, id, payload, created_at) VALUES (?, ?, ?, datetime('now'))",
+                        (kind, identifier, json.dumps(payload, ensure_ascii=False)),
+                    )
+                    db.commit()
+                return
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).casefold():
+                    raise
+                last_error = error
+                if attempt + 1 >= attempts:
+                    break
+                time.sleep(min(2.0, 0.1 * (2 ** attempt)))
+        assert last_error is not None
+        raise sqlite3.OperationalError(
+            f"workspace database remained locked after {attempts} write attempts"
+        ) from last_error
 
     def _load(self, kind: str, identifier: str) -> dict:
         self.initialize()
-        with closing(sqlite3.connect(self.db_path)) as db:
+        with closing(self._connect()) as db:
             row = db.execute("SELECT payload FROM records WHERE kind = ? AND id = ?", (kind, identifier)).fetchone()
         if not row:
             raise KeyError(f"no {kind} record: {identifier}")
         return json.loads(row[0])
+
+    def _connect(self) -> sqlite3.Connection:
+        timeout = max(
+            0.01,
+            float(os.environ.get("VIDEO_FACTORY_SQLITE_BUSY_TIMEOUT_SECONDS", "2")),
+        )
+        db = sqlite3.connect(self.db_path, timeout=timeout)
+        db.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+        return db

@@ -31,7 +31,10 @@ class OracleDeploymentTests(unittest.TestCase):
             self.assertIn(line, payload)
         self.assertNotIn("sk-", payload)
         self.assertNotIn("/Users/", payload)
-        self.assertIn("VIDEO_FACTORY_DISCOVERY_CHANNELS=github,official,paper,news,openrouter", payload)
+        self.assertIn(
+            "VIDEO_FACTORY_DISCOVERY_CHANNELS=github,projects,robotics,autonomous_driving,official,paper,news,openrouter",
+            payload,
+        )
 
     def test_systemd_units_do_not_publish(self) -> None:
         units = "\n".join(

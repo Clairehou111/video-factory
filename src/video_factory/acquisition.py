@@ -261,7 +261,13 @@ class URLAcquirer:
         return {"ok": True, "schema_version": "1", "data": [root]}
 
     def _archive_x_media(self, ingest: IngestResult, payload: dict, job: Path) -> None:
-        """Promote root and quoted-post photos to immutable visual evidence."""
+        """Promote attached X images and motion media to immutable evidence.
+
+        X exposes animated GIFs as short MP4 files. Treating only photos as
+        media silently removed the author's most explanatory visual from
+        technical posts, so both native video and GIF-backed MP4 now enter the
+        same source-video path used by official webpage footage.
+        """
         from PIL import Image
 
         root_id = ingest.candidate.id.removeprefix("tweet-")
@@ -286,13 +292,57 @@ class URLAcquirer:
             )
             for media in owner.get("media") or []:
                 media_index += 1
-                if not isinstance(media, dict) or str(media.get("type") or "").casefold() not in {"photo", "image"}:
+                if not isinstance(media, dict):
+                    continue
+                media_type = str(media.get("type") or "").casefold()
+                if media_type not in {
+                    "photo", "image", "video", "gif", "animated_gif", "animated_image",
+                }:
                     continue
                 media_url = str(media.get("url") or media.get("media_url_https") or "").strip()
                 if not media_url or media_url in seen_urls:
                     continue
                 seen_urls.add(media_url)
                 body, content_type = self._fetch(media_url)
+                if media_type in {"video", "gif", "animated_gif", "animated_image"}:
+                    if len(body) > 50_000_000:
+                        raise ValueError("attached X video exceeds 50 MB")
+                    digest = hashlib.sha256(body).hexdigest()
+                    suffix = Path(urlparse(media_url).path).suffix.casefold()
+                    extension = suffix if suffix in {".mp4", ".mov", ".webm"} else ".mp4"
+                    local = job / f"x-media-{media_index}-{digest[:10]}{extension}"
+                    local.write_bytes(body)
+                    archived_path, archived_hash = self.workspace.archive_asset(
+                        local, "twitter-media",
+                    )
+                    evidence = Evidence(
+                        id=f"{ingest.candidate.id}-media-{digest[:16]}",
+                        candidate_id=ingest.candidate.id,
+                        url=media_url,
+                        quote=(
+                            f"Motion media attached to the {relationship} X post. "
+                            + re.sub(r"\s+", " ", source_text).strip()[:500]
+                        ),
+                        source_kind="web:source_video",
+                        captured_asset=archived_path,
+                        sha256=archived_hash,
+                        notes=(
+                            "Video or animated GIF attached to the exact X post; "
+                            "archived as first-class motion evidence."
+                        ),
+                        metadata={
+                            "parent_source_url": parent_url,
+                            "post_relationship": relationship,
+                            "content_type": content_type,
+                            "original_media_type": media_type,
+                            "source_platform": "x",
+                            "visual_role": "source_video",
+                            "editorial_priority": "high",
+                        },
+                    )
+                    self.workspace.save_evidence(evidence)
+                    ingest.evidence.append(evidence)
+                    continue
                 if len(body) > 12_000_000:
                     raise ValueError("attached X image exceeds 12 MB")
                 with Image.open(io.BytesIO(body)) as image:

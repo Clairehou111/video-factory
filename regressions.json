@@ -451,7 +451,7 @@
     "impact": "Canonicalization kept the hook under the 28-equivalent exception while validation correctly allowed that exception only for an exact model, project, or actor name, triggering an unnecessary fallback model.",
     "status": "fixed",
     "tests": [
-      "tests/test_radar.py::RadarV2Test::test_radar_hook_only_gets_extended_budget_when_subject_survives_clipping"
+      "tests/test_radar.py::RadarV2Test::test_radar_hook_uses_dynamic_upper_rail_instead_of_semantic_clipping"
     ]
   },
   {
@@ -599,13 +599,13 @@
   },
   {
     "id": "VF-20260831-053",
-    "title": "Fallback writer and critic shared the same OpenRouter failure domain",
+    "title": "Writer and critic shared the same model-level editorial blind spot",
     "stage": "content_agent",
-    "reproduction": "Escalate from a DeepSeek writer to an OpenRouter Gemini writer while the reviewer selector also chooses another OpenRouter model.",
-    "impact": "An OpenRouter timeout or malformed review could take down both fallback generation and independent review, discarding an otherwise recoverable draft.",
+    "reproduction": "Use the same model configuration to generate a story and approve its story axis, wording, and visual hierarchy.",
+    "impact": "A fluent but weak directing choice could pass because the reviewer reproduced the writer's assumptions instead of challenging them.",
     "status": "fixed",
     "tests": [
-      "tests/test_factory.py::VideoFactoryTest::test_openrouter_writer_uses_cross_provider_deepseek_critic"
+      "tests/test_factory.py::VideoFactoryTest::test_openrouter_writer_uses_independent_gemini_critic"
     ]
   },
   {
@@ -812,6 +812,1608 @@
     "tests": [
       "tests/test_context_research.py::ContextResearchTests::test_people_move_adds_prior_incumbent_query_and_rejects_same_day_headlines",
       "tests/test_editorial.py::EditorialContractTests::test_people_change_pattern_context_requires_a_concrete_move"
+    ]
+  },
+  {
+    "id": "VF-20260831-072",
+    "title": "Web capture could hold the pipeline lock indefinitely",
+    "stage": "browser_capture",
+    "reproduction": "Let the Node recorder or one of its Chrome/FFmpeg children stop making progress during an evidence capture.",
+    "impact": "The pipeline remained running for hours, held the scheduler lock, and prevented later discovery cycles from completing.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_capture_timeout_terminates_the_entire_recorder_process_group"
+    ]
+  },
+  {
+    "id": "VF-20260831-073",
+    "title": "A source-image label caused HTML to be opened as image bytes",
+    "stage": "render",
+    "reproduction": "Return visual_family=source_image while citing only a web page and an agent primary-source HTML archive.",
+    "impact": "The material compiler trusted the label, Pillow opened a .source HTML document, and every deterministic rerender failed identically.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_source_image_family_requires_cited_verified_image_bytes",
+      "tests/test_discovery.py::DiscoveryTest::test_invalid_cached_image_manifest_falls_back_to_full_generation"
+    ]
+  },
+  {
+    "id": "VF-20260831-074",
+    "title": "Every robotics feed failing was reported as an empty news cycle",
+    "stage": "discovery",
+    "reproduction": "Run robotics discovery while DNS or network policy blocks every configured RSS and Google News endpoint.",
+    "impact": "The audit said no_selection with zero candidates instead of reporting a search failure, so the agent could not activate a network fallback.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_rss_search_reports_when_every_source_failed"
+    ]
+  },
+  {
+    "id": "VF-20260831-075",
+    "title": "One busy robotics publication consumed the cross-source probe budget",
+    "stage": "discovery",
+    "reproduction": "Pool hundreds of rows from several feeds, sort them only by timestamp, and probe the first ten globally.",
+    "impact": "Ordinary articles from a frequent publisher displaced surprising demos and autonomous-driving events from other sources.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_rss_search_round_robins_probe_budget_across_sources"
+    ]
+  },
+  {
+    "id": "VF-20260831-076",
+    "title": "A 24-hour robotics window discarded still-current visual breakthroughs",
+    "stage": "discovery",
+    "reproduction": "Restart after a weekend or blocked local run and discover a three-day-old first-ever robotics event with original video.",
+    "impact": "The first 11-vs-11 humanoid RoboCup match was found but rejected before generation even though it was timely, visual, and surprising.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_projects_and_robotics_sources_are_in_defaults"
+    ]
+  },
+  {
+    "id": "VF-20260831-077",
+    "title": "Simulation-only robotics claims scored like verified physical results",
+    "stage": "discovery",
+    "reproduction": "Publish a long article with numeric 2D simulation results and explicitly state that no physical robot has verified them.",
+    "impact": "An unverified theory received a top robotics score, blocked the channel, and displaced concrete demos and deployments.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_simulation_only_claim_cannot_pose_as_real_world_result"
+    ]
+  },
+  {
+    "id": "VF-20260831-078",
+    "title": "Robotics discovery waited for every network source serially",
+    "stage": "discovery_performance",
+    "reproduction": "Fetch ten feeds and then ten candidate pages one at a time with a 45-second timeout per request.",
+    "impact": "A healthy discovery-only pass could appear frozen for several minutes before generation even started.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_rss_search_probes_sources_concurrently"
+    ]
+  },
+  {
+    "id": "VF-20260831-079",
+    "title": "Structural validation referenced an undefined evidence map",
+    "stage": "editorial_validation",
+    "reproduction": "Validate a generated web story after adding verified source-image checks to validate_editorial_structure.",
+    "impact": "Every newly selected robotics story failed before a manifest could be saved with NameError: evidence_items_by_id is not defined.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_source_image_family_requires_cited_verified_image_bytes"
+    ]
+  },
+  {
+    "id": "VF-20260831-080",
+    "title": "The agent retried an identical internal programming error three times",
+    "stage": "generation_recovery",
+    "reproduction": "Raise NameError before a manifest exists during discovery adoption.",
+    "impact": "The fallback loop repeated the same impossible attempt instead of stopping immediately and preserving the candidate for a corrected runtime.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_internal_programming_error_is_not_retried_three_times"
+    ]
+  },
+  {
+    "id": "VF-20260831-081",
+    "title": "Generation changed the subject inside a multi-video robotics roundup",
+    "stage": "discovery_to_direction",
+    "reproduction": "Select IEEE Spectrum's Microduck item, then give the writer the complete Video Friday page containing many unrelated robot videos without the discovery scope.",
+    "impact": "The director replaced Microduck with a later pharmacy robot, so the generated story no longer matched the candidate that won discovery.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_new_channels_run_end_to_end_from_discovery_to_generation_audit"
+    ]
+  },
+  {
+    "id": "VF-20260831-082",
+    "title": "Roundup browser capture showed a different robot than the Chinese claim",
+    "stage": "visual_evidence",
+    "reproduction": "Scroll a long lazy-loaded IEEE Video Friday page to Microduck text after multiple embedded videos change page height.",
+    "impact": "The Chinese overlay described Microduck while the recorded page visibly showed EmoLo and other unrelated robots, despite automated checks passing.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_roundup_routes_generation_to_subject_primary_page"
+    ]
+  },
+  {
+    "id": "VF-20260831-083",
+    "title": "Routing a news event to its official page dropped the date-fast-news label",
+    "stage": "discovery_to_render",
+    "reproduction": "Discover a dated IEEE roundup item, then generate from the subject-specific official product page whose HTML has no machine-readable publication date.",
+    "impact": "The safer official visual lost the small date + 快报 context required for time-sensitive news.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_roundup_routes_generation_to_subject_primary_page"
+    ]
+  },
+  {
+    "id": "VF-20260831-084",
+    "title": "Automatic discovery silently rendered the legacy classic profile",
+    "stage": "discovery_to_render",
+    "reproduction": "Adopt a selected discovery candidate without explicitly setting GenerateOptions.render_profile.",
+    "impact": "New robotics and autonomous-driving videos bypassed the current Radar UI, including its small date + 快报 metadata rail.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_new_channels_run_end_to_end_from_discovery_to_generation_audit",
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_roundup_routes_generation_to_subject_primary_page"
+    ]
+  },
+  {
+    "id": "VF-20260831-085",
+    "title": "One code proof collapsed an ordinary Flash into a tiny deep-content header",
+    "stage": "information_layout",
+    "reproduction": "Generate a product/news Flash whose final evidence family is code while the overall topic is neither a repository, paper, nor architecture walkthrough.",
+    "impact": "The footer disappeared and a long news hook was forced into one very small line, even though the story needed the normal large pinned news header.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_flash_with_one_code_proof_keeps_large_pinned_news_header"
+    ]
+  },
+  {
+    "id": "VF-20260831-086",
+    "title": "The Flash contract forced BGM-only evidence screens to change after 2.8 seconds",
+    "stage": "editorial_timing",
+    "reproduction": "Render three dense source screens containing Chinese evidence copy under the former 1.3–2.8 second Flash cadence.",
+    "impact": "Viewers could neither watch the original motion nor finish reading the visible Chinese before the next cut.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_dense_radar_screens_extend_without_shortening_existing_holds"
+    ]
+  },
+  {
+    "id": "VF-20260831-087",
+    "title": "The date-fast-news rail preferred capture day over publication day",
+    "stage": "metadata_render",
+    "reproduction": "Route a dated discovery event to an official page captured several days later, with both evidence records sharing the same URL.",
+    "impact": "The video displayed 08-31 快报 for an item actually published on 08-28.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_radar_date_prefers_publication_time_over_later_capture_time"
+    ]
+  },
+  {
+    "id": "VF-20260831-088",
+    "title": "A robotics roundup entered discovery as one headline instead of independent events",
+    "stage": "discovery_atomization",
+    "reproduction": "Discover a Video Friday page containing separate household, toy, pharmacy, and industrial robot videos with their own primary links.",
+    "impact": "Only the robot named in the parent headline competed; useful household and worker robots inside the same source were invisible to ranking.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_roundup_is_atomized_with_each_video_paired_to_its_subject"
+    ]
+  },
+  {
+    "id": "VF-20260831-089",
+    "title": "A visually catchy toy robot outranked a useful worker robot",
+    "stage": "discovery_ranking",
+    "reproduction": "Compare an eligible desk-sized research toy with an eligible physical robot completing laundry or household work.",
+    "impact": "Cheap price and video keywords outweighed real-world labor value, producing a less consequential story for the target audience.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_useful_worker_robot_ranks_above_eligible_toy_demo"
+    ]
+  },
+  {
+    "id": "VF-20260831-090",
+    "title": "Robotics and autonomous-driving events competed for one generation slot",
+    "stage": "discovery_selection",
+    "reproduction": "Find one high-value household robot and one high-value public-road robotaxi event in the same discovery cycle.",
+    "impact": "One audience-relevant category displaced the other even though the product requires at most one result from each category.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_and_autonomous_driving_each_generate_in_one_service_run"
+    ]
+  },
+  {
+    "id": "VF-20260831-091",
+    "title": "An official product video was replaced by rapid jumps across its web page",
+    "stage": "source_video_direction",
+    "reproduction": "Generate a three-shot robotics Flash when the selected event supplies both an official source video and an official product page.",
+    "impact": "The edit switched between DOM regions too quickly instead of letting viewers watch one complete defining action.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_official_video_flash_becomes_one_clip_plus_two_readable_cards"
+    ]
+  },
+  {
+    "id": "VF-20260831-092",
+    "title": "A plain YouTube 403 stopped official-footage acquisition",
+    "stage": "source_video_acquisition",
+    "reproduction": "Download an official YouTube video when the system yt-dlp client receives HTTP 403 but the managed mweb PO-token runtime is healthy.",
+    "impact": "The agent lost the strongest source visual instead of switching to its already-installed acquisition fallback.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_source_video.py::SourceVideoTest::test_download_falls_back_to_managed_mweb_runtime_after_plain_yt_dlp_failure"
+    ]
+  },
+  {
+    "id": "VF-20260831-093",
+    "title": "The motion fallback selected foreground hand movement instead of robot action",
+    "stage": "source_video_clip_selection",
+    "reproduction": "Rank five-second windows in a robot demo where a large hand moves near the frame edge before the robot completes a useful action in the center.",
+    "impact": "When the vision selector was unavailable, the fallback chose the busiest pixels rather than the clearest subject action.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_source_video.py::SourceVideoTest::test_motion_fallback_prefers_sustained_action_over_static_intro"
+    ]
+  },
+  {
+    "id": "VF-20260831-094",
+    "title": "Official source footage was squeezed inside a portrait evidence track",
+    "stage": "source_video_composition",
+    "reproduction": "Render a landscape official robot clip inside the Flash middle pane after concatenating it with portrait information cards.",
+    "impact": "The footage was technically present but appeared as a small strip, making viewers think the middle section was not the original video.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_source_video.py::SourceVideoTest::test_default_source_video_clip_uses_wide_evidence_pane"
+    ]
+  },
+  {
+    "id": "VF-20260831-095",
+    "title": "Atomized roundup events with official videos failed the visual gate",
+    "stage": "discovery_quality_gate",
+    "reproduction": "Split a robotics weekly roundup into subject events whose local paragraphs are concise and whose metadata includes an official YouTube video.",
+    "impact": "Deployed industrial, laundry, and pharmacy robots were rejected as missing a visual path while a long text-only article won the generation slot.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robotics_roundup_is_atomized_with_each_video_paired_to_its_subject"
+    ]
+  },
+  {
+    "id": "VF-20260831-096",
+    "title": "Generic prose made a robot social study look like a useful physical task",
+    "stage": "discovery_ranking",
+    "reproduction": "Score a Pepper interaction study containing generic phrases such as 'people move' and 'more autonomous' plus references to homes and hospitals.",
+    "impact": "Substring matching promoted a social-science article to the same impact tier as robots that visibly perform daily work.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_robot_social_study_is_not_mistaken_for_a_useful_physical_task"
+    ]
+  },
+  {
+    "id": "VF-20260831-097",
+    "title": "Every official source clip was forced to exactly five seconds",
+    "stage": "source_video_direction",
+    "reproduction": "Compare an instant single jump with a multi-step industrial manipulation that needs setup, action, and payoff.",
+    "impact": "The fixed duration either rushed meaningful robot work or held trivial motion longer than necessary.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_source_video.py::SourceVideoTest::test_source_clip_duration_varies_with_action_scenario",
+      "tests/test_factory.py::VideoFactoryTest::test_multi_step_source_action_gets_more_time_than_cards"
+    ]
+  },
+  {
+    "id": "VF-20260831-098",
+    "title": "Source-video rerender redownloaded an asset already archived in the workspace",
+    "stage": "source_video_acquisition",
+    "reproduction": "Rerender a generated motion-first story with the same official YouTube URL and an existing captured_asset in its manifest.",
+    "impact": "A deterministic timing adjustment repeated the slow 403-to-managed-download path and wasted network work.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_rerender_reuses_archived_source_video_asset"
+    ]
+  },
+  {
+    "id": "VF-20260831-099",
+    "title": "Reselected source-video timestamps did not replace stale evidence metadata",
+    "stage": "source_video_rerender",
+    "reproduction": "Reselect a seven-second clip using the same stable source-video evidence ID as an older five-second selection.",
+    "impact": "The schedule could claim a longer action while the renderer still read and played the old five-second timestamps.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_multi_step_source_action_gets_more_time_than_cards"
+    ]
+  },
+  {
+    "id": "VF-20260831-100",
+    "title": "Reusing an archived source video attempted to archive-copy the file onto itself",
+    "stage": "source_video_rerender",
+    "reproduction": "Resolve a source-video URL to an existing workspace asset and pass that same absolute path back through archive_asset.",
+    "impact": "The optimized reuse path raised SameFileError and silently fell back to the older clip selection.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_rerender_reuses_archived_source_video_asset"
+    ]
+  },
+  {
+    "id": "VF-20260831-101",
+    "title": "Radar hook preserved a model-written named entity fragment",
+    "stage": "editorial_canonicalization",
+    "reproduction": "Supply a hook ending with the severed phrase '交付给财富全' alongside complete alternative hooks.",
+    "impact": "The pinned headline looked visibly broken even though the story and evidence were otherwise correct.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_radar_hook_does_not_keep_a_severed_named_entity",
+      "tests/test_factory.py::VideoFactoryTest::test_fragmented_hook_repair_selects_existing_complete_alternative"
+    ]
+  },
+  {
+    "id": "VF-20260831-102",
+    "title": "Pinned headlines were visually centered inside an oversized minimum rail",
+    "stage": "wechat_composition",
+    "reproduction": "Render both a short one-line Radar headline and a long multi-line headline in the shared upper rail.",
+    "impact": "Short titles floated in excess empty space and line starts moved horizontally; reducing the rail naively would have hidden long titles.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_short_information_title_is_left_aligned_in_a_compact_rail",
+      "tests/test_editorial.py::EditorialContractTests::test_long_information_title_expands_without_ellipsis"
+    ]
+  },
+  {
+    "id": "VF-20260831-103",
+    "title": "Long highlighted Chinese translation was truncated with an ellipsis",
+    "stage": "wechat_composition",
+    "reproduction": "Render the Waymo Munich source paragraph translation in the middle evidence chip at a fixed 40px font and three-line limit.",
+    "impact": "The card removed the end of the primary evidence claim, so viewers could not read the complete translated source.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_long_highlight_translation_fits_without_ellipsis"
+    ]
+  },
+  {
+    "id": "VF-20260831-104",
+    "title": "Translation-card lines were individually centered",
+    "stage": "wechat_composition",
+    "reproduction": "Render a three-line Chinese evidence translation whose lines have visibly different lengths.",
+    "impact": "Each line began at a different horizontal position, making a dense BGM-only translation slower to scan.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_translation_card_lines_share_one_left_edge"
+    ]
+  },
+  {
+    "id": "VF-20260831-105",
+    "title": "Runtime problems were logged repeatedly but never entered a bounded improvement loop",
+    "stage": "self_improvement",
+    "reproduction": "Let the ten-minute scheduler encounter the same authentication, generation, or rendering failure several times.",
+    "impact": "The audit log accumulated duplicate rows while no asynchronous agent clustered, reproduced, backed off, or prepared a verified fix.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_self_audit.py::ProblemLedgerTest::test_record_deduplicates_and_preserves_occurrence_count",
+      "tests/test_self_audit.py::ProblemLedgerTest::test_failed_attempts_back_off_one_three_seven_then_block",
+      "tests/test_automation.py::AutomationTest::test_run_audit_records_trial_repairs_cost_and_human_gate"
+    ]
+  },
+  {
+    "id": "VF-20260831-106",
+    "title": "A reviewed manifest and rendered video were not bound to immutable run hashes",
+    "stage": "artifact_audit",
+    "reproduction": "Change or replace a job manifest or final MP4 after result.json was written.",
+    "impact": "A later audit could inspect different content from what the viewer saw and attempt to fix the wrong generation behavior.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory_audit_identity.py::FactoryAuditIdentityTest::test_completed_artifacts_bind_hash_revision_and_active_policy",
+      "tests/test_self_audit.py::ProblemLedgerTest::test_artifact_hash_drift_becomes_a_deduplicated_observation"
+    ]
+  },
+  {
+    "id": "VF-20260831-107",
+    "title": "Adding remote observability could have made production depend on the collector",
+    "stage": "observability",
+    "reproduction": "Run generation with Phoenix disabled, its Python packages absent, the collector offline, or the local event spool unwritable.",
+    "impact": "Tracing failures could otherwise interrupt the video pipeline that they were intended to diagnose.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_observability.py::ObservabilityTests::test_disabled_phoenix_still_records_local_span",
+      "tests/test_observability.py::ObservabilityTests::test_missing_phoenix_packages_never_block_local_recording",
+      "tests/test_observability.py::ObservabilityTests::test_unwritable_spool_never_raises_into_observed_code"
+    ]
+  },
+  {
+    "id": "VF-20260831-108",
+    "title": "Shadow audit discarded the model's proposed fix after recording only its verdict",
+    "stage": "self_improvement",
+    "reproduction": "Run a shadow audit that returns a policy or code candidate and inspect latest-run.json.",
+    "impact": "The audit showed that a candidate passed verification but did not preserve the exact proposal needed for later review, calibration, or promotion.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_self_audit.py::SelfAuditServiceTest::test_run_caps_issue_count_and_cost"
+    ]
+  },
+  {
+    "id": "VF-20260831-109",
+    "title": "Grounded field-level copy review approved the wrong overall story",
+    "stage": "generation_story_audit",
+    "reproduction": "Give the critic a factually grounded people-move cut that spends most of its runtime on the startup mechanism rather than the incumbent's talent loss.",
+    "impact": "The generated video could pass every wording check while flattening the selected event, company conflict, evidence hierarchy, and audience payoff.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_holistic_story_review_rejects_a_grounded_but_wrong_story_axis",
+      "tests/test_llm_transport.py::LLMTransportTests::test_holistic_story_failure_uses_full_rebuild_not_copy_patch",
+      "tests/test_quality.py::QualityTest::test_rejects_overcrowded_flash_scene_by_mobile_reading_rate"
+    ]
+  },
+  {
+    "id": "VF-20260831-110",
+    "title": "Discovery heartbeat hid a source/query recall gap for AI hardware news",
+    "stage": "discovery_audit",
+    "reproduction": "Run the ten-minute scheduler after The Information reported OpenAI buying Macs and Anthropic renting Mac mini capacity through AWS.",
+    "impact": "The news channel woke normally but its narrow queries, trusted-domain list, missing hardware feed, and 12-hour window prevented the event from ever reaching scoring; the saved run did not explain the first failing gate.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_news_defaults_cover_reported_ai_hardware_procurement",
+      "tests/test_discovery.py::DiscoveryTest::test_rss_trace_preserves_source_query_and_funnel_counts",
+      "tests/test_discovery.py::DiscoveryTest::test_structural_discovery_funnel_gap_is_added_to_nightly_audit"
+    ]
+  },
+  {
+    "id": "VF-20260831-111",
+    "title": "X-attached explanatory GIF was dropped from the generated video",
+    "stage": "source_acquisition",
+    "reproduction": "Generate a technical X post whose structured capture exposes an animated GIF as a video.twimg.com MP4.",
+    "impact": "The writer received only post text, so the final cut replaced the author's explanatory motion graphic with static paraphrase cards.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_x_attached_gif_is_archived_as_source_video"
+    ]
+  },
+  {
+    "id": "VF-20260831-112",
+    "title": "Unicode math subscripts rendered as missing-glyph boxes",
+    "stage": "wechat_composition",
+    "reproduction": "Render Q₁₀, K₁, or QKᵀ with the bundled Noto Sans CJK font.",
+    "impact": "Correct source notation became visibly corrupted in the final phone video.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_mobile_math_indexes_use_supported_ascii_glyphs"
+    ]
+  },
+  {
+    "id": "VF-20260831-113",
+    "title": "Grounded videos could remain source paraphrases with no editorial extension",
+    "stage": "generation_story_audit",
+    "reproduction": "Translate each source excerpt accurately while repeating the announcement in the closing rail and adding no use case, implication, context, comparison, or explicit open question.",
+    "impact": "Viewers learned what the source said but received no additional reason to care or understand what changes next.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_non_github_prompt_never_exposes_low_level_scene_schema",
+      "tests/test_llm_transport.py::LLMTransportTests::test_editorial_value_failure_uses_full_rebuild_not_copy_patch"
+    ]
+  },
+  {
+    "id": "VF-20260901-114",
+    "title": "X-attached animation displaced the complete root post",
+    "stage": "material_canonicalization",
+    "reproduction": "Attach source_video evidence to an X-rooted Flash story and canonicalize its visual families.",
+    "impact": "The animation became shot one, removing root provenance and its adjacent Chinese translation.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_x_attached_video_follows_complete_root_post"
+    ]
+  },
+  {
+    "id": "VF-20260901-115",
+    "title": "Readable Flash repair exceeded 24 seconds while delivery still enforced 15 seconds",
+    "stage": "timing_and_delivery",
+    "reproduction": "Let semantic repair add a fourth proof beat and render a dense 20-second Radar Flash.",
+    "impact": "Mechanical timing caused another LLM repair loop, then a valid readable final MP4 was falsely blocked at delivery.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_flash_compiler_fits_repaired_story_without_another_llm_call",
+      "tests/test_publish_batch.py::PublishBatchTest::test_flash_publish_gate_accepts_readable_cut_up_to_30_seconds"
+    ]
+  },
+  {
+    "id": "VF-20260901-116",
+    "title": "Sub-second X animation collapsed a planned proof shot",
+    "stage": "source_video_render",
+    "reproduction": "Render a 0.32-second tweet_video MP4 into a seven-second source-video evidence beat.",
+    "impact": "The original diagram flashed once and shortened the final cut, so viewers could not inspect it.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_source_video.py::SourceVideoTest::test_short_animation_can_loop_for_the_planned_proof_hold"
+    ]
+  },
+  {
+    "id": "VF-20260901-117",
+    "title": "Motion-story viewport cropped the X-post Chinese translation",
+    "stage": "wechat_composition",
+    "reproduction": "Place a 1602px complete long-post card before a 1092px source-video track and crop from the top.",
+    "impact": "The large translation existed in the source card but disappeared from the final video.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_motion_story_tweet_card_keeps_translation_inside_short_viewport"
+    ]
+  },
+  {
+    "id": "VF-20260901-118",
+    "title": "Recorder failure discarded an already complete browser MP4",
+    "stage": "browser_capture",
+    "reproduction": "Let the browser recorder write a duration-complete MP4, then exit nonzero or hang during cleanup.",
+    "impact": "The agent retried slowly or failed even though a verified artifact was already available.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_capture_reuses_complete_mp4_when_recorder_cleanup_exits_nonzero",
+      "tests/test_quality.py::QualityTest::test_capture_reuses_complete_mp4_when_recorder_times_out_after_write"
+    ]
+  },
+  {
+    "id": "VF-20260901-119",
+    "title": "Grounded paper translation remained literal and academic",
+    "stage": "generation_copy_audit",
+    "reproduction": "Translate tacit-collusion paper excerpts into grammatically correct Chinese using formal nouns such as 默契合谋、背离者 and 多维评估体系.",
+    "impact": "A technically correct video still required viewers to decode paper language and obscured the concrete action sequence.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_company_and_research_prompts_include_channel_specific_editorial_contracts",
+      "tests/test_factory.py::VideoFactoryTest::test_composite_copy_reviewer_requires_both_taste_and_spoken_chinese",
+      "tests/test_llm_transport.py::LLMTransportTests::test_spoken_chinese_review_cannot_approve_unexplained_tacit_collusion_label",
+      "tests/test_llm_transport.py::LLMTransportTests::test_semantic_copy_repair_cannot_rewrite_clean_targets_or_other_shots"
+    ]
+  },
+  {
+    "id": "VF-20260901-120",
+    "title": "Company rewrite replaced the recognizable Smart-versus-Liux conflict with certification news",
+    "stage": "generation_story_axis",
+    "reproduction": "Regenerate a Liux company story whose locked competition reason says Smart moved production to China while Liux chose European manufacturing, then headline only Liux's EU certification.",
+    "impact": "The new cut lost its strongest recognizable brand, flattened the market reversal, and made a complete challenger story feel like an ordinary certification announcement.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_company_competition_hook_preserves_exact_smart_brand_axis"
+    ]
+  },
+  {
+    "id": "VF-20260901-121",
+    "title": "Radar canonicalization silently cut Chinese sentences mid-word",
+    "stage": "generation_copy_layout",
+    "reproduction": "Canonicalize a complete Mayo or electricity-paper fact whose width exceeds the current shot budget.",
+    "impact": "The saved manifest and rendered video contained fragments such as '缺少治理与安全报' and '只要有谁降价抢单', while every automated review still passed.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_canonicalizer_preserves_complete_overlong_sentences_for_repair"
+    ]
+  },
+  {
+    "id": "VF-20260901-122",
+    "title": "Hook named a condition or component pairing but omitted the result",
+    "stage": "generation_retention_hook",
+    "reproduction": "Generate a hook such as 'AI竞价智能体无需任何通信' or 'TRON 2结合无极手2' without saying what happened next.",
+    "impact": "The first screen was factual but gave viewers no event, capability, or reason to continue watching.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_hook_rejects_setup_or_components_without_an_outcome"
+    ]
+  },
+  {
+    "id": "VF-20260901-123",
+    "title": "Copy critic falsely rejected valid targets located late in a long source page",
+    "stage": "generation_copy_audit",
+    "reproduction": "Review Waymo lessons whose black-box and VLM proof appears after the first 2,200 characters of the archived page.",
+    "impact": "The critic claimed exact source quotes were absent, then repairs damaged the five-beat story and eventually produced an incomplete shot object.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_copy_critic_receives_late_page_target_context"
+    ]
+  },
+  {
+    "id": "VF-20260901-124",
+    "title": "Research hook hid the strongest exact result behind a neutral framework announcement",
+    "stage": "generation_retention_hook",
+    "reproduction": "Generate the AGENT-O story with 84.6% and 82.8% findings in the attention strategy, then select only 'Mayo Clinic提出语义框架' as the hook.",
+    "impact": "The new video remained accurate but lost the concrete surprise and was less compelling than the existing publish candidate.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_research_hook_prefers_exact_result_over_neutral_framework_launch"
+    ]
+  },
+  {
+    "id": "VF-20260901-125",
+    "title": "Fixed-width Radar hook compiler removed the eyebrow-raising result",
+    "stage": "generation_retention_hook",
+    "reproduction": "Canonicalize a complete result-first hook such as '梅奥诊所评估279篇医疗AI论文：84.6%说不清自己的系统怎么跑' through the old 28/36-equivalent title budget.",
+    "impact": "The hook was reduced to the dangling, press-release-style setup 'Mayo Clinic评估279篇论文发现', while the stronger accepted version was lost.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_radar_hook_preserves_complete_eyebrow_angle_instead_of_clipping"
+    ]
+  },
+  {
+    "id": "VF-20260901-126",
+    "title": "Missing live quote fallback rendered a nearly blank source page",
+    "stage": "browser_capture",
+    "reproduction": "Render an archived official-page quote after the dynamic live page removes or hides that exact text.",
+    "impact": "The recorder successfully held the page bottom, so quality checks passed even though the proof shot was visually empty.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_missing_live_quote_requests_grounded_card_visual_fallback",
+      "tests/test_factory.py::VideoFactoryTest::test_non_missing_capture_repair_keeps_real_source_visual"
+    ]
+  },
+  {
+    "id": "VF-20260901-127",
+    "title": "Policy regeneration silently replaced a stronger human-accepted hook",
+    "stage": "generation_retention_regression",
+    "reproduction": "Regenerate a ready-for-review source after changing UI or writer policy, then accept a grounded but flatter headline such as a neutral announcement or framework label.",
+    "impact": "Style work erased the accepted eyebrow-raising angle even though the user requested primarily visual changes; truncated platform captions also risked becoming the baseline.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_ready_hook_incumbent_survives_a_weaker_policy_regeneration",
+      "tests/test_radar.py::RadarV2Test::test_accepted_eyebrow_angles_outrank_flattened_news_summaries"
+    ]
+  },
+  {
+    "id": "VF-20260901-128",
+    "title": "Routine iOS beta iteration passed discovery as meaningful technology news",
+    "stage": "discovery_selection",
+    "reproduction": "Score the MacRumors iOS 27 public beta 6 article, which explicitly says it follows beta 5 and contains no notable new features.",
+    "impact": "A routine changelog item consumed a channel selection and generation budget while stronger technology events competed for attention.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_news_channel_rejects_uneventful_sixth_os_beta",
+      "tests/test_discovery.py::DiscoveryTest::test_news_channel_keeps_versioned_release_with_material_security_change"
+    ]
+  },
+  {
+    "id": "VF-20260901-129",
+    "title": "Static Radar timing could expand toward 30 seconds like motion-led stories",
+    "stage": "generation_timing",
+    "reproduction": "Canonicalize a static three- or four-card Radar story with dense text and let readability timing extend every hold.",
+    "impact": "Static text videos became slower than necessary, while original source footage did not receive a distinct case-specific timing policy.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_flash_compiler_fits_repaired_story_without_another_llm_call",
+      "tests/test_radar.py::RadarV2Test::test_original_video_earns_a_case_specific_longer_flash_budget",
+      "tests/test_radar.py::RadarV2Test::test_static_radar_duration_gate_is_strictly_below_fifteen_seconds",
+      "tests/test_radar.py::RadarV2Test::test_source_video_radar_uses_the_case_specific_motion_duration_band"
+    ]
+  },
+  {
+    "id": "VF-20260901-130",
+    "title": "Disabled MacRumors source could re-enter through a forum/feed configuration",
+    "stage": "discovery_source_resolution",
+    "reproduction": "Configure an old MacRumors RSS/forum source after the publication was removed from the editorial source list.",
+    "impact": "Ordinary consumer-hardware stories could re-enter discovery through stale runtime configuration despite the source-level editorial exclusion.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_disabled_source_is_rejected_even_if_runtime_config_bypasses_config_loader"
+    ]
+  },
+  {
+    "id": "VF-20260901-131",
+    "title": "Model selected source_image when acquisition archived no renderable image",
+    "stage": "generation_material_reconciliation",
+    "reproduction": "Generate a robotics or paper shot with visual_family=source_image but cite only text/visual-analysis evidence without a captured image asset.",
+    "impact": "The semantic agent spent bounded repairs on an impossible rendering choice and the candidate was eventually rejected.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_radar.py::RadarV2Test::test_unacquired_source_image_is_compiled_to_a_grounded_card"
+    ]
+  },
+  {
+    "id": "VF-20260901-132",
+    "title": "Research hook rejected a numerically identical percentage with shorter formatting",
+    "stage": "generation_story_axis_validation",
+    "reproduction": "Validate a source result written as 61.0% when the Chinese hook naturally renders the same value as 61%.",
+    "impact": "A strong institution-plus-result hook failed every bounded repair because the validator compared percentage strings rather than numeric values.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_research_hook_prefers_exact_result_over_neutral_framework_launch"
+    ]
+  },
+  {
+    "id": "VF-20260901-133",
+    "title": "Final quality gate rejected 61% when source evidence wrote 61.0%",
+    "stage": "generation_final_quality",
+    "reproduction": "Validate a manifest whose visible copy uses 61% and whose cited paper reports the same result as 61.0%.",
+    "impact": "The semantic agent converged and all reading/timing gates passed, but the finished manifest remained non-publishable due only to numeric formatting.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_quality_accepts_equivalent_percentage_decimal_format"
+    ]
+  },
+  {
+    "id": "VF-20260901-134",
+    "title": "Benign README credential setup triggered the security-disclosure publishing gate",
+    "stage": "generation_safety_review",
+    "reproduction": "Attach a project README that says credentials are read from environment variables and never written to files.",
+    "impact": "An unrelated safe setup sentence caused an ordinary research benchmark video to require exploit-disclosure review.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_benign_environment_credential_setup_is_not_a_security_disclosure",
+      "tests/test_quality.py::QualityTest::test_sensitive_security_material_requires_editorial_review"
+    ]
+  },
+  {
+    "id": "VF-20260901-135",
+    "title": "Currency quantity parser swallowed sentence punctuation into a float",
+    "stage": "generation_final_quality",
+    "reproduction": "Validate an OpenRouter workload sentence ending with '$0.019800.'.",
+    "impact": "A fully generated price manifest crashed final QA with float('0.019800.') instead of returning a quality result.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_quality.py::QualityTest::test_quality_currency_parser_ignores_sentence_period"
+    ]
+  },
+  {
+    "id": "VF-20260901-136",
+    "title": "YouTube relevance search returned old popular videos instead of recent channel uploads",
+    "stage": "youtube_discovery_recall",
+    "reproduction": "Add All-In, Sequoia, a16z, Lightspeed, MAD Podcast, and SaaStr as query pools, then run the 30-day discovery window.",
+    "impact": "Every probed result was outside the lookback even though the configured channels had uploads from the previous few days.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_channel_sources_are_primary_and_search_is_recent_filtered",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_failed_channel_feed_falls_back_to_semantic_search"
+    ]
+  },
+  {
+    "id": "VF-20260901-137",
+    "title": "Fixed YouTube metadata budget starved later discovery pools",
+    "stage": "youtube_discovery_probe_allocation",
+    "reproduction": "Configure 13 YouTube pools while metadata_probe_limit remains 10.",
+    "impact": "The final startup, robotics, and autonomous-driving pools received no metadata inspection and could never become eligible.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_probe_budget_expands_to_cover_every_pool_with_candidates",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_direct_channel_receives_a_second_probe_for_next_newest_upload",
+      "tests/test_discovery.py::DiscoveryTest::test_unified_youtube_does_not_reapply_the_ten_probe_cap"
+    ]
+  },
+  {
+    "id": "VF-20260901-138",
+    "title": "One broad substring awarded full YouTube audience relevance",
+    "stage": "youtube_discovery_audience_scoring",
+    "reproduction": "Score text containing a generic word such as team or a word containing the letters ai, without a concrete technical topic or consequence.",
+    "impact": "Unrelated or generic discussions received the same 25 audience points as specific developer, hardware, robotics, and autonomy stories.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_audience_relevance_uses_weighted_exact_markers"
+    ]
+  },
+  {
+    "id": "VF-20260901-139",
+    "title": "Long YouTube interview transcript exhausted editorial-planning output",
+    "stage": "youtube_generation_planning",
+    "reproduction": "Send a 70K–98K character interview transcript and unrestricted terminology request to the translation planner.",
+    "impact": "The selected OpenRouter model returned empty content with finish_reason=length, and semantic repair repeated the same oversized prompt.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_interview_planning_uses_bounded_nonpolitical_technical_windows",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_structural_interview_plan_is_repaired_before_another_llm_call"
+    ]
+  },
+  {
+    "id": "VF-20260901-140",
+    "title": "Curated interview failed when the model omitted speaker_label",
+    "stage": "youtube_generation_identity",
+    "reproduction": "Plan an a16z interview whose description names David George and Gavin Baker but whose model response omits speaker_label.",
+    "impact": "A fully grounded highlight was rejected because fallback identity logic recognized only globally preconfigured people.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_speaker_label_falls_back_to_metadata_participants"
+    ]
+  },
+  {
+    "id": "VF-20260901-141",
+    "title": "OpenRouter rate limit required manual generation restart",
+    "stage": "llm_transport_resilience",
+    "reproduction": "Return HTTP 429 for all bounded OpenRouter attempts during YouTube planning.",
+    "impact": "The factory stopped after two short retries and repeated the same delay for later calls instead of switching providers.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_http_429_uses_retry_after_and_records_recovery",
+      "tests/test_llm_transport.py::LLMTransportTests::test_transport_exhaustion_falls_back_to_secondary_provider"
+    ]
+  },
+  {
+    "id": "VF-20260901-142",
+    "title": "Malformed terminology rows and repeated first-use explanations blocked SaaStr generation",
+    "stage": "youtube_translation_contract",
+    "reproduction": "Return bilingual_once without an explanation, translate without a target, or repeat a bilingual explanation in multiple subtitle cues.",
+    "impact": "The agent detected the glossary error but could not normalize it, so the translated clip never reached rendering.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_incomplete_terminology_rows_downgrade_to_source_preservation",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_bilingual_explanation_is_kept_only_on_first_source_use"
+    ]
+  },
+  {
+    "id": "VF-20260901-143",
+    "title": "Interview boundary caption and cached bounded clip were handled as full source",
+    "stage": "youtube_clip_timeline",
+    "reproduction": "Select a clip ending 0.08 seconds after the next caption starts, then rebuild from a previously downloaded bounded clip.",
+    "impact": "A nearly out-of-range caption failed reading speed, and local reuse could shift the clip timeline or trigger another blocked download.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_rebase_drops_tiny_boundary_caption_overlap",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_cached_bounded_interview_media_is_reused_as_a_clip"
+    ]
+  },
+  {
+    "id": "VF-20260901-144",
+    "title": "Bounded YouTube media download re-encoded and incomplete audio shortened final output",
+    "stage": "youtube_media_acquisition",
+    "reproduction": "Download a 184-second 1080p section with forced keyframes, or render a stream-copy clip whose audio CDN response ends several seconds early.",
+    "impact": "The acquisition ran below realtime and a later render had 176.21 seconds of audio for a 180-second video.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_download_command_uses_only_padded_selected_interval",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_wechat_split_layout_preserves_complete_composite_frame"
+    ]
+  },
+  {
+    "id": "VF-20260901-145",
+    "title": "YouTube headline and cold-open evidence were selected independently",
+    "stage": "youtube_generation_retention_hook",
+    "reproduction": "Pair the hook 'AI不是零和：开源、云、应用都能赢' with the highest generic source window 'Here is Fable 5.1', or accept 'SAS 末日论' in a SaaS market story.",
+    "impact": "The title promised one claim while the first source footage proved another, and a visible acronym typo weakened trust despite all structural checks passing.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_hook_normalizes_saas_typo_and_matches_cold_open_to_headline"
+    ]
+  },
+  {
+    "id": "VF-20260901-146",
+    "title": "Interview header repeated the problem but omitted its trigger and the speaker's answer",
+    "stage": "youtube_interview_story_layout",
+    "reproduction": "Render a no-footer interview with a short hook only, or load a human-edited translation plan whose terminology no longer matches its original glossary.",
+    "impact": "Unused vertical space did not help comprehension, the causal chain was incomplete, and cached editorial improvements could render before a terminology mismatch was reported.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_hook_persists_with_causal_payoff_below_title",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_cached_reviewed_translation_is_reaudited_before_render"
+    ]
+  },
+  {
+    "id": "VF-20260901-147",
+    "title": "Dashboard repeated an expired WeChat preflight and offered no login or interview-rights recovery",
+    "stage": "publish_dashboard_recovery",
+    "reproduction": "Click publish with an expired Tencent cookie, or enqueue a YouTube interview whose only failed check is rights_review.",
+    "impact": "The retry repeated the same invalid-cookie check, terminal escapes leaked into the UI, and interview videos remained permanently blocked with no auditable human-review action.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_dashboard.py::DashboardTest::test_expired_login_becomes_bounded_login_and_publish_recovery",
+      "tests/test_dashboard.py::DashboardTest::test_collection_rights_review_is_explicit_and_bound_into_approval",
+      "tests/test_publish_batch.py::PublishBatchTest::test_auth_recovery_detects_current_chinese_cookie_message_and_ansi"
+    ]
+  },
+  {
+    "id": "VF-20260901-148",
+    "title": "Cached YouTube asset reuse copied a content-addressed file onto itself",
+    "stage": "youtube_cached_asset_reuse",
+    "reproduction": "Regenerate from a subtitle path already inside workspace/assets/youtube-subtitles.",
+    "impact": "The otherwise recoverable rerun crashed with shutil.SameFileError and required a manual path workaround.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_archive_asset_reuses_an_already_archived_source"
+    ]
+  },
+  {
+    "id": "VF-20260901-149",
+    "title": "Interview repair silently center-clamped long selections and accepted dangling cold-open fragments",
+    "stage": "youtube_interview_semantic_boundaries",
+    "reproduction": "Return a 200-second interview range or a 7-second hook cue ending on a connector such as 'the'.",
+    "impact": "A structurally valid 180-second clip could start or end mid-argument, while the first source caption visibly stopped before completing its claim.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_oversized_interview_range_is_not_center_clamped_to_180_seconds",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_hook_candidate_rejects_dangling_source_thought"
+    ]
+  },
+  {
+    "id": "VF-20260901-150",
+    "title": "Mixed Chinese-English interview title overflowed despite character-count wrapping",
+    "stage": "youtube_interview_visual_layout",
+    "reproduction": "Render the a16z hook 'AI不是零和：开源、云、应用都能赢' at a fixed 64px size.",
+    "impact": "The final words crossed the right edge even though the title passed the character limit.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_hook_uses_actual_pixel_width_for_long_mixed_title"
+    ]
+  },
+  {
+    "id": "VF-20260901-151",
+    "title": "Speech fillers were translated as visible Chinese subtitle words",
+    "stage": "youtube_translation_style",
+    "reproduction": "Translate 'Um, open source wins, you know, inference cloud, uh.' as a bilingual subtitle.",
+    "impact": "Chinese captions showed meaningless hesitation words and sounded mechanically translated.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_spoken_fillers_are_omitted_without_dropping_meaning"
+    ]
+  },
+  {
+    "id": "VF-20260901-152",
+    "title": "WeChat subtitle cards stayed narrow and centered on a wide mobile viewport",
+    "stage": "youtube_subtitle_visual_layout",
+    "reproduction": "Render a bilingual interview caption in the 1080px WeChat profile.",
+    "impact": "Both languages wrapped prematurely inside a small centered chip while useful horizontal space remained empty.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_wechat_bilingual_subtitle_card_is_wide_and_left_aligned"
+    ]
+  },
+  {
+    "id": "VF-20260901-153",
+    "title": "Direct source clips were marked original and short titles were cut mid-thought",
+    "stage": "wechat_publish_policy",
+    "reproduction": "Publish a direct YouTube interview clip with the global originality patch and derive its short title by slicing the first 15 characters.",
+    "impact": "The originality claim was unsafe and the public short title ended as an incomplete phrase.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_publish_batch.py::PublishBatchTest::test_publisher_policy_patch_requires_verified_wechat_original_declaration",
+      "tests/test_publish_batch.py::PublishBatchTest::test_direct_youtube_source_does_not_receive_original_category",
+      "tests/test_publish_batch.py::PublishBatchTest::test_wechat_short_title_uses_complete_clause_instead_of_raw_truncation",
+      "tests/test_publish_batch.py::PublishBatchTest::test_wechat_feed_title_selects_a_complete_claim_instead_of_slicing",
+      "tests/test_dashboard.py::DashboardTest::test_withdrawn_batch_is_kept_for_audit_but_hidden_from_queue"
+    ]
+  },
+  {
+    "id": "VF-20260902-154",
+    "title": "Chinese interview title began its second line with list punctuation",
+    "stage": "youtube_interview_visual_layout",
+    "reproduction": "Fit 'AI不是零和：开源、云、应用都能赢' by pixel width while optimizing only for balanced line lengths.",
+    "impact": "The second line began with '、', making an otherwise fitted title visibly malformed.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_hook_uses_actual_pixel_width_for_long_mixed_title"
+    ]
+  },
+  {
+    "id": "VF-20260902-155",
+    "title": "Physical-technology stories could be selected without video and then became tiring text slides",
+    "stage": "physical_technology_discovery_and_direction",
+    "reproduction": "Select a robotics or autonomous-driving article with several images but no explicit source video, or give a valid source clip less time than two explanatory cards.",
+    "impact": "A motion-dependent story entered production without its key visual proof; accepted stories underused the original action and overused text cards.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_physical_technology_without_source_video_is_rejected_even_with_images",
+      "tests/test_discovery.py::DiscoveryTest::test_rss_video_extractor_normalizes_youtube_embeds",
+      "tests/test_factory.py::VideoFactoryTest::test_multi_step_source_action_gets_more_time_than_cards",
+      "tests/test_source_video.py::SourceVideoTest::test_source_clip_duration_varies_with_action_scenario"
+    ]
+  },
+  {
+    "id": "VF-20260902-156",
+    "title": "A published YouTube interview was regenerated under a second story angle",
+    "stage": "youtube_discovery_deduplication",
+    "reproduction": "Publish one clip from a YouTube source, reset or lose its generated-event state, then discover a different insight from the same source video.",
+    "impact": "The station received a second post made from footage the audience had already seen.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_published_youtube_source_is_never_selected_for_a_second_angle",
+      "tests/test_discovery.py::DiscoveryTest::test_remote_collection_publish_builds_durable_youtube_source_ledger"
+    ]
+  },
+  {
+    "id": "VF-20260902-157",
+    "title": "Routine city expansions and supplier certificates passed the physical-tech video gate",
+    "stage": "physical_technology_adoption",
+    "reproduction": "Provide a source video for an existing robotaxi service entering more cities, or for a supplier earning a quality-management certificate.",
+    "impact": "Trade-news updates with no new technical boundary occupied scarce video slots.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_routine_autonomous_driving_city_expansion_is_not_video_worthy",
+      "tests/test_discovery.py::DiscoveryTest::test_supplier_certification_alone_is_not_video_worthy"
+    ]
+  },
+  {
+    "id": "VF-20260902-158",
+    "title": "Startup cash and valuation stories scored as audience-relevant technology",
+    "stage": "business_story_adoption",
+    "reproduction": "Discover a startup acquisition article dominated by sale price, cash balance, valuation, and shareholder terms but with no AI or technology consequence.",
+    "impact": "A finance-only story was turned into a video even though it did not serve the product's technology audience.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_finance_only_startup_deal_without_technology_consequence_is_rejected"
+    ]
+  },
+  {
+    "id": "VF-20260902-159",
+    "title": "YouTube stage directions were translated as visible Chinese speech",
+    "stage": "youtube_subtitle_translation_and_render",
+    "reproduction": "Translate a mixed cue such as 'Um [clears throat] and then...' and render a cached collection manifest.",
+    "impact": "The subtitle displayed '[清喉咙]' as if it were part of the speaker's argument, making the translation look mechanically copied from accessibility captions.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_non_speech_directions_are_omitted_from_both_visible_languages"
+    ]
+  },
+  {
+    "id": "VF-20260902-160",
+    "title": "A developer tool story led with financing instead of its explicit SRE audience pain",
+    "stage": "company_story_hook_and_upper_rail",
+    "reproduction": "Generate the Empirik story with an opportunity that explicitly names DevOps/SRE outage pressure, then select a hook led by the $21M round and spinout status.",
+    "impact": "The first screen looked like generic startup financing news, hid the reason engineers should care, and greedily split the Chinese word '提前' across lines.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_editorial.py::EditorialContractTests::test_funding_led_sre_story_must_name_sre_and_its_pain_in_the_hook",
+      "tests/test_editorial.py::EditorialContractTests::test_two_line_sre_hook_breaks_at_question_not_inside_a_chinese_word"
+    ]
+  },
+  {
+    "id": "VF-20260916-161",
+    "title": "Long bilingual interview subtitles were forced into two clipped lines",
+    "stage": "youtube_subtitle_visual_layout",
+    "reproduction": "Render a long English interview cue and its Chinese translation in the 1080px WeChat subtitle card.",
+    "impact": "Both languages extended beyond the right edge because character-count wrapping recombined three required lines into two and the PNG renderer never checked actual font width.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_bilingual_subtitles_reflow_by_actual_pixel_width"
+    ]
+  },
+  {
+    "id": "VF-20260916-162",
+    "title": "Interview hooks reordered mid-sentence footage and could promise an unrelated idea",
+    "stage": "youtube_interview_clip_selection_and_render",
+    "reproduction": "Select a high-scoring 6–10 second window from the middle of a continuous interview excerpt, move it to 0:00, and pair it with a title whose concrete concepts occur elsewhere in the full video but not in the selected passage.",
+    "impact": "Sentences resumed up to a minute later, the story appeared scrambled, and fluent titles such as the AI-coding or model-profit claims were not delivered by the footage.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_wechat_hook_keeps_interview_source_chronological",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_title_must_be_entailed_by_selected_source",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_title_entailment_accepts_matching_source"
+    ]
+  },
+  {
+    "id": "VF-20260916-163",
+    "title": "Bounded YouTube clips moved missing leading audio into a late internal gap",
+    "stage": "youtube_interview_acquisition_and_audio_render",
+    "reproduction": "Download a YouTube interview interval by stream-copy so video begins on an earlier keyframe and audio starts at a positive PTS, then reset each trimmed audio branch with asetpts=PTS-STARTPTS and pad it to the video duration.",
+    "impact": "The missing leading audio was moved to the end of a reordered segment, producing a 3.15-second silent gap late in the Jensen Huang video before speech returned; the old ten-second silence probe reported no problem.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_download_command_uses_only_padded_selected_interval",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_wechat_split_layout_preserves_complete_composite_frame",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_audio_loudness_probe_reads_volumedetect_levels"
+    ]
+  },
+  {
+    "id": "VF-20260916-164",
+    "title": "Interview subtitle cards rendered paragraph-sized bilingual cues without adaptive reflow",
+    "stage": "youtube_subtitle_timing_and_readability",
+    "reproduction": "Render a long aligned bilingual source thought inside a fixed-height, character-count-wrapped subtitle card.",
+    "impact": "The complete thought was hard to read because line breaks ignored actual glyph widths and the card could not expand to preserve the full sentence.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_renderer_never_invents_alignment_by_splitting_two_languages",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_bilingual_subtitles_reflow_by_actual_pixel_width"
+    ]
+  },
+  {
+    "id": "VF-20260916-165",
+    "title": "YouTube refresh ignored archived transcripts after a transient subtitle failure",
+    "stage": "youtube_transcript_acquisition_fallback",
+    "reproduction": "Regenerate an archived YouTube interview while the live yt-dlp subtitle request ends with an SSL EOF error.",
+    "impact": "The agent stopped before editorial planning even though it already had a valid content-addressed transcript, requiring a human or Codex to restart it manually.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_acquirer_falls_back_to_archived_subtitle_on_network_failure"
+    ]
+  },
+  {
+    "id": "VF-20260916-166",
+    "title": "Interview repair could not see the timestamp passage supplied by editorial guidance",
+    "stage": "youtube_interview_editorial_retrieval_and_repair",
+    "reproduction": "Supply a strong title plus a 34:04–35:38 retrieval hint for a long interview whose default ranked planning windows omit that passage, then let the first plan choose an invalid short range.",
+    "impact": "The repair loop repeatedly selected a sub-45-second excerpt and rejected a supported title because the relevant timestamp transcript was absent from its bounded planning input.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_timestamp_guidance_adds_omitted_source_range_to_planning_input",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_competition_title_accepts_explicit_competitive_cycle"
+    ]
+  },
+  {
+    "id": "VF-20260916-167",
+    "title": "Subtitle pixel fitting ignored the width added by text strokes",
+    "stage": "youtube_subtitle_visual_layout",
+    "reproduction": "Render a Chinese interview subtitle whose un-stroked glyph advance fits the 880px safe width but whose 2px outline expands the painted bitmap to 884px.",
+    "impact": "The agent aborted a fully planned and translated video during final rendering instead of reflowing the subtitle safely.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_subtitle_pixel_fit_reserves_width_for_visible_stroke"
+    ]
+  },
+  {
+    "id": "VF-20260916-168",
+    "title": "A bounded YouTube download could exit successfully with a truncated audio stream",
+    "stage": "youtube_interview_acquisition_and_resume",
+    "reproduction": "Download a 179.7-second source interval whose Matroska video stream is complete but whose audio DURATION tag ends at 84.946 seconds, then resume rendering from that archived clip.",
+    "impact": "The final interview played normally for 83 seconds and then remained silent for 92.7 seconds; resume also retained the original full-video duration instead of the bounded media duration.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_probe_video_reads_matroska_audio_duration_tag",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_remote_interval_retries_when_audio_ends_before_video"
+    ]
+  },
+  {
+    "id": "VF-20260916-169",
+    "title": "Translation density was detected only after final interview rendering",
+    "stage": "youtube_translation_reading_speed_repair",
+    "reproduction": "Translate a 3.04-second caption into more than 36 visible Chinese characters, then finish the expensive media render before checking the 12-character-per-second limit.",
+    "impact": "A fully rendered video remained blocked even though one concise, meaning-preserving subtitle repair could make it readable.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_shortens_only_overfast_cues",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_retries_with_exact_limit_feedback",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_retries_when_required_term_is_dropped",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_keeps_bilingual_first_use_explanation"
+    ]
+  },
+  {
+    "id": "VF-20260916-170",
+    "title": "Subtitle translation aborted on the first malformed cue-id response",
+    "stage": "youtube_translation_retry",
+    "reproduction": "Ask the subtitle model to translate cue-0190 through cue-0215 and receive 0190 through 0215 without the required cue- prefix on the first attempt.",
+    "impact": "The agent discarded its two remaining bounded attempts and stopped the entire video before media acquisition.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_retries_when_model_drops_cue_id_prefix"
+    ]
+  },
+  {
+    "id": "VF-20260916-171",
+    "title": "Metadata speaker fallback ignored overlong model-generated labels",
+    "stage": "youtube_interview_editorial_repair",
+    "reproduction": "Return an evidence-grounded but longer-than-24-character speaker_label while channel metadata has a concise valid identity.",
+    "impact": "The agent exhausted semantic repair and rejected an otherwise valid title-matched interview clip.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_overlong_interview_speaker_label_falls_back_to_metadata_identity",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_speaker_fallback_extracts_guest_who_joins_show"
+    ]
+  },
+  {
+    "id": "VF-20260916-172",
+    "title": "The interview planner weakened an explicitly approved supported title",
+    "stage": "youtube_interview_title_selection",
+    "reproduction": "Supply the supported title '营销仪表盘将死：AI 把营销变成高频交易，人类只负责监督' with the matching 13:29–14:21 passage and receive only '营销仪表盘将死'.",
+    "impact": "The regenerated clip matched the desired story but lost the stronger causal hook that the user had already approved.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_supported_requested_title_is_preserved_after_model_weakens_it",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_unsupported_requested_title_is_not_forced_onto_clip"
+    ]
+  },
+  {
+    "id": "VF-20260916-173",
+    "title": "Bounded YouTube media acquisition could hang without a deadline",
+    "stage": "youtube_interview_acquisition_backoff",
+    "reproduction": "Start a bounded yt-dlp/FFmpeg interval request whose remote streams stop making progress while the child processes remain alive.",
+    "impact": "One interview regeneration remained stuck indefinitely until manually interrupted, violating the agent's mandatory autonomous fallback behavior.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_remote_interval_retries_after_bounded_acquisition_timeout"
+    ]
+  },
+  {
+    "id": "VF-20260917-174",
+    "title": "Interview captions split one thought into dependent visual fragments",
+    "stage": "youtube_subtitle_semantic_display",
+    "reproduction": "Render a 7.7-second aligned bilingual source cue and mechanically divide it into four 1.9-second cards based on duration and visual width.",
+    "impact": "Viewers had to connect several subtitle shots to reconstruct one sentence, even though the complete aligned thought fit on a dynamically sized card.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_renderer_never_invents_alignment_by_splitting_two_languages",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_caption_does_not_slice_one_source_thought_into_cards"
+    ]
+  },
+  {
+    "id": "VF-20260917-175",
+    "title": "Colon-biased headline wrapping left most of the first line empty",
+    "stage": "youtube_interview_hook_layout",
+    "reproduction": "Fit a two-line left-aligned title containing an early colon while both a colon break and a later fuller break fit the same width.",
+    "impact": "The title jumped to line two too early, leaving a visibly underfilled first line and a crowded second line.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_hook_uses_actual_pixel_width_for_long_mixed_title"
+    ]
+  },
+  {
+    "id": "VF-20260917-176",
+    "title": "Editorial transport fallback silently weakened interview hooks",
+    "stage": "youtube_interview_directing_audit",
+    "reproduction": "Let the primary OpenRouter planning request end with finish_reason=length or IncompleteRead, then accept the native transport fallback's factual topic labels as final hooks.",
+    "impact": "The selected clips remained factual, but recent videos lost the conflict, curiosity, and audience stake that made older versions stop the scroll.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_directing_audit_uses_primary_model_not_transport_fallback",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_directing_audit_blocks_invalid_primary_output"
+    ]
+  },
+  {
+    "id": "VF-20260917-177",
+    "title": "Pixel-balanced interview headline split one Chinese phrase across lines",
+    "stage": "youtube_interview_hook_layout",
+    "reproduction": "Lay out a two-line headline at the largest possible font and choose an arbitrary CJK character break before checking whether a slightly smaller font fits at a comma or clause boundary.",
+    "impact": "Visible titles split phrases such as 模型竞赛 or 营销变成, making otherwise strong hooks look mechanically typeset.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_hook_prefers_clause_boundary_over_split_chinese_phrase"
+    ]
+  },
+  {
+    "id": "VF-20260917-178",
+    "title": "Deterministic rerender rejected YouTube collection manifests",
+    "stage": "youtube_collection_rerender",
+    "reproduction": "Pass a reviewed collection-manifest.json to the rerender command after a no-render directing audit.",
+    "impact": "The agent attempted to parse the collection as a static RenderManifest and failed on a missing content_type field, forcing another model call instead of deterministic rendering.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_rerender_dispatches_youtube_collection_without_llm_or_acquisition"
+    ]
+  },
+  {
+    "id": "VF-20260917-179",
+    "title": "Cached YouTube cues still displayed dependent sentence fragments",
+    "stage": "youtube_subtitle_semantic_display",
+    "reproduction": "Render cached caption cues such as 'the concept of' followed by 'a human being logging into...' as separate subtitle cards even after disabling mechanical bilingual splitting.",
+    "impact": "Viewers still had to connect adjacent cards to understand one phrase, and some cards contained no standalone meaning.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_dependent_caption_fragments_merge_into_one_complete_display_phrase"
+    ]
+  },
+  {
+    "id": "VF-20260918-180",
+    "title": "Large merged-caption repair dropped cue ids in one oversized model response",
+    "stage": "youtube_interview_caption_repair",
+    "reproduction": "Send thirteen merged interview cues through one constrained JSON translation response and receive only a subset of the required ids.",
+    "impact": "A long interview failed after several minutes even though every caption could be repaired independently in bounded batches.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_merged_caption_repair_batches_large_interview_without_dropping_ids"
+    ]
+  },
+  {
+    "id": "VF-20260918-181",
+    "title": "Old terminology plans forced established Chinese technical terms back to English",
+    "stage": "youtube_translation_terminology",
+    "reproduction": "Load a cached plan that marks infrastructure, data centers, open-source, or application layer as preserve-English terminology.",
+    "impact": "Natural repaired Chinese either failed the terminology gate or regressed into awkward English-heavy subtitles.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_established_technical_terms_use_natural_chinese_not_forced_english"
+    ]
+  },
+  {
+    "id": "VF-20260918-182",
+    "title": "Chinese closing punctuation wrapped onto an isolated subtitle line",
+    "stage": "youtube_subtitle_pixel_layout",
+    "reproduction": "Fit a long Chinese subtitle exactly to the card width so the final full stop overflows after the last glyph.",
+    "impact": "The subtitle remained technically inside the card but displayed a lone punctuation mark on a fourth line.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_subtitle_closing_punctuation_never_starts_its_own_line"
+    ]
+  },
+  {
+    "id": "VF-20260918-183",
+    "title": "Kinsoku-safe subtitle exceeded the card width at the normal minimum font",
+    "stage": "youtube_subtitle_pixel_layout",
+    "reproduction": "Keep closing punctuation with its preceding glyph or render a long indivisible source token when the resulting line is a few pixels wider than the safe area at the normal minimum font size.",
+    "impact": "The renderer correctly blocked instead of clipping, but deterministic rerender could not finish even though a small bounded font reduction would preserve every character legibly.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_subtitle_uses_bounded_emergency_font_before_overflow"
+    ]
+  },
+  {
+    "id": "VF-20260918-184",
+    "title": "Semantic subtitle preservation overcorrected into paragraph-sized cards",
+    "stage": "youtube_interview_semantic_subtitle_cards",
+    "reproduction": "Render a fourteen-second interview cue containing several coordinated clauses after disabling all bilingual display splitting.",
+    "impact": "The source and translation stayed aligned, but viewers had to read three or four lines at once instead of following the speaker clause by clause.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_renderer_never_invents_alignment_by_splitting_two_languages",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_gemini_semantic_cards_are_shorter_and_losslessly_timed",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_card_review_retries_dependent_translated_chinese",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_independent_fidelity_review_corrects_temporal_meaning",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_caption_does_not_slice_one_source_thought_into_cards"
+    ]
+  },
+  {
+    "id": "VF-20260918-185",
+    "title": "Translate terminology rows did not require Chinese output",
+    "stage": "youtube_translation_terminology",
+    "reproduction": "Mark chips and applications as translate entries while leaving those English words inside one or more cached Chinese subtitle cues.",
+    "impact": "The terminology plan looked correct in the manifest, but ordinary English nouns still appeared in the visible Chinese subtitles.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_established_translate_terms_are_enforced_per_cue",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translate_term_cannot_be_masked_by_a_different_good_cue"
+    ]
+  },
+  {
+    "id": "VF-20260918-186",
+    "title": "Host fallback font rendered Chinese headline comma at mid-height",
+    "stage": "youtube_interview_hook_typography",
+    "reproduction": "Render a fullwidth Chinese comma in the large interview headline with STHeiti Medium selected by the generic OS-font fallback.",
+    "impact": "The title fit its box but the comma floated near the vertical middle of the line, making the headline look incorrectly typeset.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_headline_font_places_fullwidth_comma_near_baseline"
+    ]
+  },
+  {
+    "id": "VF-20260918-187",
+    "title": "Renderer repartitioned model-reviewed semantic caption cards",
+    "stage": "youtube_final_srt_semantic_partition",
+    "reproduction": "Pass a reviewed -card- cue containing a complete when/that construction into the generic duration-based display splitter, which divides it again before the complement.",
+    "impact": "The manifest held one complete readable thought, but the actual bilingual SRT displayed dependent fragments such as '我们部署算力时，' and its payoff on separate shots.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_reviewed_semantic_card_is_not_partitioned_again_by_renderer",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_uses_dependent_boundaries_to_avoid_overlong_cards",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_relative_payoff_uses_three_publishable_cards",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_hedge_maybe_stays_with_the_claim_that_follows",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_merged_thought_splits_before_maybe_not_after_it"
+    ]
+  },
+  {
+    "id": "VF-20260918-188",
+    "title": "Global final style review rewrote already-good Chinese captions",
+    "stage": "youtube_interview_chinese_style_gate",
+    "reproduction": "Run a final style pass over every interview caption even when no specific, auditable defect was detected.",
+    "impact": "Natural translations were flattened into more literal Chinese and changed again on every cached rerun.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_final_chinese_style_gate_does_not_rewrite_without_specific_error"
+    ]
+  },
+  {
+    "id": "VF-20260918-189",
+    "title": "Independent subtitle reviewer changed uncertainty into frequency",
+    "stage": "youtube_interview_caption_fidelity_review",
+    "reproduction": "Propose a faithful Chinese card containing 可能 for source maybe, then let the independent reviewer rewrite it with 往往.",
+    "impact": "The card remained fluent and readable but changed the speaker's uncertainty into a frequency claim.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_fidelity_reviewer_cannot_turn_maybe_into_frequency"
+    ]
+  },
+  {
+    "id": "VF-20260918-190",
+    "title": "Semantic caption cards still contained dependent continuations and stack/upstream confusion",
+    "stage": "youtube_interview_caption_standalone_gate",
+    "reproduction": "Split a long interview cue before the dependent phrase 'so that', or accept Chinese cards beginning with unresolved continuations such as '这涵盖' and translate product-stack 'up the stack' as supply-chain '上游的应用层'.",
+    "impact": "Viewers had to connect adjacent shots to finish one sentence, and one otherwise fluent card stated a conceptually contradictory industry-layer relationship.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_may_create_so_that_card_for_translation_to_localize",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_fallback_keeps_parent_when_clause_terms_are_misaligned",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_split_never_leaves_nonfinal_card_on_connector",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_unsplit_interview_parent_fails_closed_before_renderer",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_tiny_supplier_fragment_coalesces_before_translation",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_cards_retry_when_uppercase_entity_moves_between_rows",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_cards_retry_translation_that_exceeds_its_time_budget",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_fallback_rejects_entity_shifted_chinese_partition",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_failed_batch_recovers_each_semantic_card_in_isolation"
+    ]
+  },
+  {
+    "id": "VF-20260918-191",
+    "title": "Cached terminology repair aborted on a transient directing-provider failure",
+    "stage": "youtube_cached_translation_recovery",
+    "reproduction": "Regenerate an interview from a cached translation plan while the directing model's terminology-repair request fails with a transient SSL EOF.",
+    "impact": "The agent aborted before semantic caption review even though its normal translation writer and deterministic exact-term enforcement were both available.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_terminology_repair_falls_back_after_directing_provider_failure"
+    ]
+  },
+  {
+    "id": "VF-20260918-192",
+    "title": "Cached interview captions were semantically processed again",
+    "stage": "youtube_cached_caption_idempotence",
+    "reproduction": "Generate from a translation plan that already contains reviewed -card- cues and an interview_semantic_subtitle_cards trace.",
+    "impact": "A 25-card approved subtitle plan collapsed to 18 cards; translations changed and one card grew to 16.95 seconds.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_cached_semantic_cards_are_immutable_during_rerender"
+    ]
+  },
+  {
+    "id": "VF-20260918-193",
+    "title": "Dependent-clause exclusions created a 16.95-second subtitle card",
+    "stage": "youtube_interview_semantic_boundaries",
+    "reproduction": "Segment disfluent ASR containing if/where/so that/when clauses while excluding all dependent-clause boundaries.",
+    "impact": "The middle of a 25.6-second thought remained unreadably long even though several defensible speech boundaries existed.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_caption_timing_gate_rejects_avoidable_seventeen_second_card",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_uses_dependent_boundaries_to_avoid_overlong_cards",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_may_create_so_that_card_for_translation_to_localize"
+    ]
+  },
+  {
+    "id": "VF-20260918-194",
+    "title": "Fidelity reviewer rewrote translations instead of auditing them",
+    "stage": "youtube_interview_caption_fidelity_review",
+    "reproduction": "Ask the independent reviewer to return replacement Chinese for every card after the translation pass.",
+    "impact": "The review stage introduced literal wording and made model provenance impossible to interpret as a clean translation-versus-verdict separation.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_independent_fidelity_review_corrects_temporal_meaning",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_fidelity_reviewer_cannot_turn_maybe_into_frequency"
+    ]
+  },
+  {
+    "id": "VF-20260918-195",
+    "title": "Kimi coding-plan calls could be misrouted to metered APIs",
+    "stage": "llm_kimi_coding_plan_routing",
+    "reproduction": "Request Kimi K3 using the display alias while only the generic Moonshot/OpenRouter paths and temperature 0.2 are supported.",
+    "impact": "The monthly subscription was bypassed or K3 rejected the request because it requires temperature 1.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_llm_transport.py::LLMTransportTests::test_kimi3_alias_uses_monthly_coding_plan_endpoint",
+      "tests/test_llm_transport.py::LLMTransportTests::test_kimi3_request_uses_supported_temperature_and_reasoning_effort",
+      "tests/test_factory.py::VideoFactoryTest::test_translation_model_alias_routes_to_kimi_coding_plan_before_openrouter"
+    ]
+  },
+  {
+    "id": "VF-20260919-196",
+    "title": "Hook critic was also trusted as the subtitle fidelity reviewer",
+    "stage": "youtube_interview_model_role_separation",
+    "reproduction": "Use the Gemini directing critic to approve Chinese subtitle fidelity after Kimi translation.",
+    "impact": "Fluent but literal or semantically shifted Chinese passed because visual directing taste and bilingual fidelity were conflated.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_factory.py::VideoFactoryTest::test_youtube_subtitle_review_uses_independent_deepseek_for_kimi_translation",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_reviewer_cannot_approve_merely_understandable_chinese_at_score_three"
+    ]
+  },
+  {
+    "id": "VF-20260919-197",
+    "title": "A batch rejection exploded into one model call per subtitle card",
+    "stage": "youtube_interview_caption_retry_budget",
+    "reproduction": "Reject a few rows in an otherwise valid translated subtitle batch and recover every card independently.",
+    "impact": "A single interview could trigger roughly twenty extra translation calls, increasing cost and latency while discarding already approved captions.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_independent_fidelity_review_corrects_temporal_meaning"
+    ]
+  },
+  {
+    "id": "VF-20260919-198",
+    "title": "Reviewer outage could silently publish unreviewed subtitle cards",
+    "stage": "youtube_interview_caption_fail_closed",
+    "reproduction": "Configure an independent subtitle reviewer, then make its transport fail while the translation batch remains structurally valid.",
+    "impact": "The agent treated deterministic length and terminology checks as a substitute for bilingual review and could publish naturalness or fidelity errors.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_configured_fidelity_reviewer_failure_never_publishes_unreviewed_cards"
+    ]
+  },
+  {
+    "id": "VF-20260919-199",
+    "title": "Trusted YouTube channels and sponsor copy admitted non-IT episodes",
+    "stage": "youtube_discovery_scope",
+    "reproduction": "Score an All-In episode about NASA, engineering history, or investigative journalism whose description appends AI-cloud and software sponsor copy.",
+    "impact": "A trusted channel plus advertisement keywords could place aerospace, politics, or media-personality clips in the IT/software/AI review queue.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_all_in_sponsor_copy_cannot_qualify_off_scope_episodes",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_episode_subject_still_qualifies_when_sponsor_copy_is_removed",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_curated_channel_tech_company_market_interview_is_outside_it_scope",
+      "tests/test_discovery.py::DiscoveryTest::test_non_it_business_or_aerospace_story_is_rejected"
+    ]
+  },
+  {
+    "id": "VF-20260919-200",
+    "title": "Raw HTML fallback masqueraded as usable article evidence",
+    "stage": "web_discovery_evidence",
+    "reproduction": "Let article extraction fail and fall back to a large raw HTML page containing metadata, navigation, ads, and script text.",
+    "impact": "Page chrome and metadata inflated relevance, narrative, and visual scores even when the article body was paywalled or unreadable.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_discovery.py::DiscoveryTest::test_raw_html_fallback_cannot_pass_as_article_evidence"
+    ]
+  },
+  {
+    "id": "VF-20260919-201",
+    "title": "Noisy ASR boundaries stranded corrupted fragments for literal translation",
+    "stage": "youtube_interview_asr_semantic_boundaries",
+    "reproduction": "Split immediately before 'and if' when the following ASR span repeats words and phrases, or end a card on the broken parenthetical word 'though'.",
+    "impact": "The translator received fragments such as 'constraints constraints' without their governing predicate and produced unnatural Chinese that viewers could not understand on first read.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_noisy_asr_condition_keeps_bottleneck_predicate_in_same_card",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_corrupt_compet_cycle_fragment_is_not_stranded_before_its_payoff"
+    ]
+  },
+  {
+    "id": "VF-20260919-202",
+    "title": "Long SQLite readers blocked every generation write",
+    "stage": "workspace_concurrent_persistence",
+    "reproduction": "Run a long dashboard or diagnostic SELECT against the workspace index while generation saves a candidate or collection manifest.",
+    "impact": "Generation completed its model work but failed at persistence with 'database is locked', forcing an expensive manual rerun.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_storage.py::WorkspaceStorageTest::test_save_retries_a_transient_concurrent_sqlite_write_lock"
+    ]
+  },
+  {
+    "id": "VF-20260919-203",
+    "title": "Every interview risked paying for full-video Whisper transcription",
+    "stage": "youtube_interview_targeted_asr_verification",
+    "reproduction": "Treat ordinary YouTube captions as equally unreliable and run speech recognition over the complete selected clip.",
+    "impact": "Generation became unnecessarily slow and expensive even though only a few visibly corrupted ASR spans needed audio verification.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_targeted_whisper_audit_runs_once_then_uses_its_cache"
+    ]
+  },
+  {
+    "id": "VF-20260919-204",
+    "title": "A cached local-caption timeline was rebased as full-video seconds",
+    "stage": "youtube_interview_cached_clip_reuse",
+    "reproduction": "Reuse a no-render translation plan whose cues were already clip-local while its historical source_clip metadata still said rebased=false.",
+    "impact": "All captions fell outside the local media duration, disappeared, and triggered unrelated hook-generation failures.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_no_render_plan_with_local_cues_is_not_rebased_as_original_seconds"
+    ]
+  },
+  {
+    "id": "VF-20260919-205",
+    "title": "Removing corrupt ASR also invalidated an evidence-backed interview title",
+    "stage": "youtube_interview_title_entailment",
+    "reproduction": "Correct the corrupt word 'compet' in a passage whose complete argument still contrasts model competition with application-layer earnings.",
+    "impact": "The agent rejected the strongest accurate title because the validator depended on the transcription error instead of the full evidence chain.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_competition_title_accepts_complete_industry_cycle_argument"
+    ]
+  },
+  {
+    "id": "VF-20260919-206",
+    "title": "Repeated optimization silently replaced human-accepted captions",
+    "stage": "youtube_interview_caption_incumbent",
+    "reproduction": "Rerun the same source clip after changing prompts, model routing, or subtitle segmentation and accept the newest structurally valid translation automatically.",
+    "impact": "A concise accepted line such as '长期来看，行业利润会逐渐向应用层转移。' regressed into literal, awkward Chinese despite passing automated checks.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_human_accepted_caption_plan_beats_same_clip_challenger",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_caption_incumbent_never_overrides_a_different_requested_clip",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_audio_verified_successor_of_incumbent_is_reused_without_repair_loop"
+    ]
+  },
+  {
+    "id": "VF-20260919-207",
+    "title": "Audio verification created a meaningless standalone subtitle fragment",
+    "stage": "youtube_interview_audio_verified_caption_repair",
+    "reproduction": "Correct 'The compet cycle tends to be though' to the short fragment 'cycle tends to be' and translate it as an independent card.",
+    "impact": "The viewer saw a weak sentence such as '这个周期往往如此。' before the real payoff, making the argument harder rather than easier to follow.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_audio_verified_dangling_fragment_merges_into_accepted_payoff"
+    ]
+  },
+  {
+    "id": "VF-20260921-208",
+    "title": "Headline optimization broke the fixed first-screen story package",
+    "stage": "youtube_interview_directing_audit",
+    "reproduction": "Rerun an accepted interview plan after a directing-policy change, rank headlines independently, and preserve or replace hook_context in a separate decision.",
+    "impact": "The first screen combined a stronger-sounding title with an unrelated or shortened explanatory subtitle, so viewers could no longer grasp the full clip meaning.",
+    "status": "fixed",
+    "tests": [
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_directing_preserves_complete_incumbent_pair",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_old_directing_policy_cannot_reopen_unchanged_accepted_pair",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_approved_queue_manifest_restores_exact_first_screen_pair",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_atomic_hook_package_never_takes_context_from_another_candidate"
     ]
   }
 ]

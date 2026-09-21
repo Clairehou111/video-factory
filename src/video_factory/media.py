@@ -27,11 +27,16 @@ class AudioLoudness:
     longest_silence_seconds: float = 0.0
 
 
-def probe_audio_loudness(path: Path) -> AudioLoudness:
+def probe_audio_loudness(
+    path: Path, minimum_silence_seconds: float = 10.0,
+) -> AudioLoudness:
     """Decode the audio track and reject AAC containers that contain silence."""
+    if minimum_silence_seconds <= 0:
+        raise ValueError("minimum_silence_seconds must be positive")
     command = [
         "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
-        "-map", "0:a:0", "-af", "silencedetect=noise=-50dB:d=10,volumedetect",
+        "-map", "0:a:0", "-af",
+        f"silencedetect=noise=-50dB:d={minimum_silence_seconds:g},volumedetect",
         "-f", "null", "/dev/null",
     ]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -49,13 +54,26 @@ def probe_audio_loudness(path: Path) -> AudioLoudness:
 def probe_video(path: Path) -> VideoProbe:
     command = [
         "ffprobe", "-v", "error", "-show_entries",
-        "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,duration,bit_rate",
+        "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,duration,bit_rate:stream_tags=DURATION",
         "-of", "json", str(path),
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     payload = json.loads(result.stdout)
     video = next(stream for stream in payload["streams"] if stream["codec_type"] == "video")
     audio = next((stream for stream in payload["streams"] if stream["codec_type"] == "audio"), None)
+    def stream_duration(stream: dict[str, object] | None) -> float | None:
+        if not stream:
+            return None
+        if stream.get("duration") not in (None, "", "N/A"):
+            return float(stream["duration"])
+        tagged = str((stream.get("tags") or {}).get("DURATION") or "") \
+            if isinstance(stream.get("tags"), dict) else ""
+        match = re.fullmatch(r"(\d+):(\d+):([0-9.]+)", tagged)
+        if not match:
+            return None
+        hours, minutes, seconds = match.groups()
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
     return VideoProbe(
         path=path,
         duration=float(payload["format"]["duration"]),
@@ -64,7 +82,7 @@ def probe_video(path: Path) -> VideoProbe:
         video_codec=video["codec_name"],
         pixel_format=video["pix_fmt"],
         audio_codec=audio["codec_name"] if audio else None,
-        audio_duration=float(audio["duration"]) if audio and audio.get("duration") else None,
+        audio_duration=stream_duration(audio),
         audio_bitrate=int(audio["bit_rate"]) if audio and audio.get("bit_rate") else None,
     )
 

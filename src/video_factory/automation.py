@@ -17,9 +17,12 @@ from urllib.request import Request, urlopen
 from .collection_publish import create_collection_publish_batch
 from .discovery import ChannelRun, DiscoveryChannel, ResourceDiscoveryRun
 from .models import InformationRenderProfile, RenderManifest, TopicType, VideoCollectionManifest
-from .publish import PublishBatchState, PublishPlatform, PublishTarget, create_publish_batch
+from .publish import (
+    PublishBatchState, PublishPlatform, PublishTarget, create_publish_batch, wechat_feed_title,
+)
 from .radar import build_tencent_radar_copy
 from .serde import load_collection_manifest, load_manifest
+from .self_audit import ProblemLedger, ProblemObservation
 
 
 TOPIC_TAGS: dict[TopicType, list[str]] = {
@@ -124,15 +127,17 @@ class DiscoveryPublishBridge:
     def prepare(self, run: ResourceDiscoveryRun) -> list[PreparedPublishBatch]:
         prepared: list[PreparedPublishBatch] = []
         for channel_name, entry in run.channels.items():
-            selected = entry.selected
-            adoption = entry.adoption or {}
-            if selected is None or adoption.get("status") != "generated":
-                continue
-            result = adoption.get("result") if isinstance(adoption.get("result"), dict) else {}
-            if selected.channel == DiscoveryChannel.YOUTUBE:
-                prepared.append(self._prepare_youtube(channel_name, selected, result))
-            else:
-                prepared.append(self._prepare_tencent(channel_name, selected, result))
+            pairs = list(zip(entry.selections, entry.adoptions))
+            if not pairs and entry.selected is not None:
+                pairs = [(entry.selected, entry.adoption or {})]
+            for selected, adoption in pairs:
+                if adoption.get("status") != "generated":
+                    continue
+                result = adoption.get("result") if isinstance(adoption.get("result"), dict) else {}
+                if selected.channel == DiscoveryChannel.YOUTUBE:
+                    prepared.append(self._prepare_youtube(channel_name, selected, result))
+                else:
+                    prepared.append(self._prepare_tencent(channel_name, selected, result))
         return prepared
 
     def _prepare_tencent(self, channel: str, candidate: Any, result: dict[str, Any]) -> PreparedPublishBatch:
@@ -147,7 +152,9 @@ class DiscoveryPublishBridge:
                 source_url=candidate.url,
             )
         else:
-            title = (manifest.fixed_title or manifest.fixed_hook or candidate.title).strip()[:30]
+            title = wechat_feed_title(
+                manifest.fixed_title or manifest.fixed_hook or candidate.title,
+            )
             description = f"来源：{publisher}｜{candidate.url}"
         topic = manifest.topic_type or candidate.topic_type or TopicType.LINKED_EXTERNAL_SOURCE
         tags = list(dict.fromkeys([*self.config.tencent_tags, *TOPIC_TAGS[topic]]))[:10]
@@ -357,6 +364,35 @@ class AutomationAuditService:
             self._append_jsonl(self.root / "problems.jsonl", {
                 "run_id": run.id, "recorded_at": report["recorded_at"], **problem,
             })
+        # Production only records observations. Diagnosis, model calls, code
+        # patches, and policy experiments belong to the separate nightly
+        # self-audit and must never add latency or failure modes here.
+        self_audit_rows: list[dict[str, Any]] = []
+        try:
+            ledger = ProblemLedger(self.workspace)
+            for problem in problems:
+                row = ledger.record(ProblemObservation(
+                    stage=str(problem.get("scope") or "pipeline"),
+                    category=str(problem.get("kind") or "runtime"),
+                    expected="pipeline stage completes without this recorded problem",
+                    observed=str(problem.get("detail") or "runtime problem"),
+                    severity=(
+                        "high" if problem.get("kind") in {
+                            "failed", "quality_failed", "generation", "artifact_drift",
+                        } else "medium"
+                    ),
+                    reporter="runtime",
+                    job_id=run.id,
+                    metadata={"runtime_status": str(problem.get("status") or "unresolved")},
+                ))
+                self_audit_rows.append({
+                    "problem_id": row["id"], "fingerprint": row["fingerprint"],
+                    "occurrence_count": row["occurrence_count"],
+                })
+        except Exception as error:
+            report["self_audit_record_error"] = f"{type(error).__name__}: {error}"
+        report["self_audit_observations"] = self_audit_rows
+        self._write_report(report)
         return report
 
     def load(self, run_id: str | None = None) -> dict[str, Any]:
@@ -540,45 +576,47 @@ class AutomationAuditService:
                 problems.append({
                     "scope": channel, "kind": "discovery", "status": "unresolved", "detail": entry.error,
                 })
-            attempts = list((entry.adoption or {}).get("attempts") or [])
-            for attempt in attempts:
-                attempt_result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
-                for repair in attempt_result.get("automatic_repairs") or []:
-                    if not isinstance(repair, dict):
+            adoption_rows = entry.adoptions or ([entry.adoption] if entry.adoption else [])
+            for adoption in adoption_rows:
+                attempts = list((adoption or {}).get("attempts") or [])
+                for attempt in attempts:
+                    attempt_result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
+                    for repair in attempt_result.get("automatic_repairs") or []:
+                        if not isinstance(repair, dict):
+                            continue
+                        kind = str(repair.get("kind") or "automatic_repair")
+                        problems.append({
+                            "scope": channel, "kind": kind, "status": "resolved_automatically",
+                            "detail": "quality gate detected a repairable output defect",
+                        })
+                        fixes.append({
+                            "scope": channel, "kind": kind,
+                            "detail": str(repair.get("outputs") or "repair completed and revalidated"),
+                        })
+                    status = str(attempt.get("status") or "")
+                    if status not in {"failed", "quality_failed"}:
                         continue
-                    kind = str(repair.get("kind") or "automatic_repair")
+                    detail = str(attempt.get("error") or "")
+                    if not detail:
+                        failed = [
+                            str(check.get("detail") or check.get("name") or "quality check failed")
+                            for check in (attempt.get("result") or {}).get("checks", [])
+                            if isinstance(check, dict) and not check.get("passed", False)
+                        ]
+                        detail = "; ".join(failed) or status
+                    resolved = any(
+                        int(next_attempt.get("attempt") or 0) > int(attempt.get("attempt") or 0)
+                        and next_attempt.get("status") == "generated"
+                        for next_attempt in attempts
+                    )
                     problems.append({
-                        "scope": channel, "kind": kind, "status": "resolved_automatically",
-                        "detail": "quality gate detected a repairable output defect",
+                        "scope": channel, "kind": status,
+                        "status": "resolved_automatically" if resolved else "unresolved", "detail": detail,
                     })
-                    fixes.append({
-                        "scope": channel, "kind": kind,
-                        "detail": str(repair.get("outputs") or "repair completed and revalidated"),
-                    })
-                status = str(attempt.get("status") or "")
-                if status not in {"failed", "quality_failed"}:
-                    continue
-                detail = str(attempt.get("error") or "")
-                if not detail:
-                    failed = [
-                        str(check.get("detail") or check.get("name") or "quality check failed")
-                        for check in (attempt.get("result") or {}).get("checks", [])
-                        if isinstance(check, dict) and not check.get("passed", False)
-                    ]
-                    detail = "; ".join(failed) or status
-                resolved = any(
-                    int(next_attempt.get("attempt") or 0) > int(attempt.get("attempt") or 0)
-                    and next_attempt.get("status") == "generated"
-                    for next_attempt in attempts
-                )
-                problems.append({
-                    "scope": channel, "kind": status,
-                    "status": "resolved_automatically" if resolved else "unresolved", "detail": detail,
-                })
-                if resolved:
-                    fixes.append({
-                        "scope": channel, "kind": "pipeline_retry", "detail": "reused archived inputs and regenerated/rerendered successfully",
-                    })
+                    if resolved:
+                        fixes.append({
+                            "scope": channel, "kind": "pipeline_retry", "detail": "reused archived inputs and regenerated/rerendered successfully",
+                        })
         for job in jobs:
             if job.get("status") == "failed":
                 detail = str(job.get("error") or "job failed")

@@ -16,14 +16,19 @@ from urllib.request import Request, urlopen
 from .agent import AgentBudget, BoundedContentAgent, ContentAgentError, LinkedSourceResearchTool
 from .acquisition import AcquisitionResult, URLAcquirer
 from .compositor import compose_information_frame
-from .editorial import canonicalize_editorial_brief, compile_evidence_shots, route_content
+from .editorial import (
+    _hook_retention_score, apply_readable_radar_timing, canonicalize_editorial_brief,
+    compile_evidence_shots, enforce_flash_time_budget,
+    repair_fragmented_radar_hook, route_content,
+)
 from .ingest import GitHubIngestor, IngestResult
 from .github_context import enrich_github_context
 from .github_editor import canonicalize_github_brief
-from .llm import LLMSettings, OpenAICompatibleStoryWriter
+from .llm import LLMSettings, OpenAICompatibleStoryWriter, TransportFallbackStoryWriter
 from .media import probe_video, validate_wechat_mp4
 from .models import (
-    ContentType, CueAction, Evidence, EvidenceShotKind, InformationRenderProfile, Scene, TopicType,
+    ContentType, CueAction, Evidence, EvidenceShotKind, InformationRenderProfile, Scene, SourceType,
+    TopicType,
 )
 from .mpt import MPTAssemblyAdapter, MPTSettings, NativeFFmpegAssemblyAdapter
 from .multimodal import OpenRouterVisualAnalyst, find_high_value_visuals
@@ -31,11 +36,17 @@ from .openrouter import ModelQuote, ModelRequirements, OpenRouterCatalog
 from .quality import is_publishable, validate_manifest
 from .research import DirectorContextToolbox
 from .storage import Workspace
-from .serde import load_manifest
+from .serde import load_collection_manifest, load_manifest
 from .webcapture import WebCaptureRequest, WebScrollVideoAdapter, WebScrollVideoSettings
 from .writer import StoryWriterPacket
 from .tracks import TrackSegment, build_crossfade_track, build_dip_to_color_track
 from .tweetcard import render_editorial_card, render_source_image, render_tweet_card, tweet_card_video
+from .source_video import (
+    download_official_youtube_video, recommend_source_clip_duration,
+    render_source_video_clip, select_action_clip,
+)
+from .observability import Observability
+from .self_audit import ProblemLedger, ProblemObservation, load_active_policy
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,14 +65,103 @@ class GenerateOptions:
     youtube_subtitles: str | None = None
     youtube_translation_plan: str | None = None
     youtube_editorial_mode: str = "auto"
+    youtube_editorial_guidance: str | None = None
     linked_sources: tuple[str, ...] = ()
+    discovery_context: str | None = None
+    discovery_source_url: str | None = None
+    discovery_source_quote: str | None = None
+    discovery_published_at: str | None = None
+    discovery_channel: str | None = None
+    source_video_url: str | None = None
     supplemental_context: str | None = None
     price_event_metadata: dict[str, object] | None = None
     render_profile: str = InformationRenderProfile.CLASSIC.value
 
 
+def _is_kimi_coding_model(value: str | None) -> bool:
+    return (value or "").casefold() in {"kimi/kimi3", "kimi3", "kimi/k3"}
+
+
+def static_radar_target_duration(content_type: ContentType, discovery_channel: str | None) -> float:
+    """Bias ordinary static news toward eight seconds without compressing research."""
+    if content_type == ContentType.DEEP_DIVE:
+        return 20.0
+    if (discovery_channel or "").casefold() in {"news", "news_zh"}:
+        return 8.5
+    return 14.0
+
+
+class CompositeCopyReviewer:
+    """Require agreement from independent directing and Chinese-copy critics."""
+
+    def __init__(self, reviewers: list[tuple[str, OpenAICompatibleStoryWriter]]) -> None:
+        self.reviewers = reviewers
+
+    def review_visible_copy(
+        self, packet: StoryWriterPacket, draft: dict[str, object],
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        issues: list[dict[str, object]] = []
+        reviews: list[dict[str, object]] = []
+        errors: list[dict[str, str]] = []
+        for role, reviewer in self.reviewers:
+            try:
+                if role == "spoken_chinese_copy" and hasattr(reviewer, "review_spoken_chinese"):
+                    found, provenance = reviewer.review_spoken_chinese(packet, draft)
+                else:
+                    found, provenance = reviewer.review_visible_copy(packet, draft)
+            except Exception as error:
+                errors.append({"role": role, "error": f"{type(error).__name__}: {error}"})
+                continue
+            reviews.append({"role": role, "provenance": provenance})
+            issues.extend(found)
+        if not reviews:
+            raise RuntimeError("all independent copy reviewers failed: " + json.dumps(errors))
+        unique: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for issue in issues:
+            identity = (
+                str(issue.get("field_path") or ""),
+                str(issue.get("category") or ""),
+                str(issue.get("problem") or ""),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(issue)
+        return unique, {
+            "provider": "composite", "reviews": reviews, "reviewer_errors": errors,
+        }
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _browser_capture_needs_card_fallback(video: Path) -> bool:
+    """Reject a source-page hold created only because its quote disappeared.
+
+    The recorder can safely finish after replacing a missing highlight with a
+    bottom-of-page hold. That is an execution fallback, but it is not useful
+    visual evidence: dynamic/blocked pages can be almost entirely blank. The
+    editorial renderer therefore switches this shot to a grounded text card.
+    """
+    repairs_path = video.with_suffix(".capture-repairs.json")
+    try:
+        repairs = json.loads(repairs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("kind") == "missing_visible_text"
+        for item in repairs
+    )
+
+
+EDITORIAL_TRACK_WIDTH = 1384
+EDITORIAL_TRACK_HEIGHT = 1602
+# Source-video stories are composed into a landscape-ish evidence pane. Keeping
+# their concatenated track portrait-sized made the compositor fit the whole
+# 1384x1602 canvas and reduced the actual footage to a narrow strip. This aspect
+# closely follows the current 1080px-wide radar evidence viewport.
+SOURCE_VIDEO_TRACK_HEIGHT = 1092
 
 
 class VideoFactory:
@@ -74,8 +174,37 @@ class VideoFactory:
         self.cache_dir = workspace.root / "cache"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.observability = Observability(workspace.root)
+
+    def _archived_source_video_asset(self, manifest, source_video_url: str) -> Path | None:
+        for evidence in manifest.evidence:
+            if (
+                evidence.source_kind == "web:source_video"
+                and evidence.url == source_video_url
+                and evidence.captured_asset
+            ):
+                asset = self.workspace.root / evidence.captured_asset
+                if asset.is_file():
+                    return asset
+        return None
 
     def generate(self, url: str, options: GenerateOptions) -> dict[str, object]:
+        with self.observability.span("factory.generation.job", {
+            "source_url": url, "provider": options.provider,
+            "render_profile": options.render_profile, "render": options.render,
+        }) as span:
+            result = self._generate(url, options)
+            span.set_attribute("job_id", result.get("job_id", ""))
+            span.set_attribute("status", result.get("status", ""))
+            span.set_attribute("source_type", result.get("source_type", ""))
+            for stage in result.get("stages", []):
+                if isinstance(stage, dict):
+                    span.add_event("factory.stage", {
+                        "name": stage.get("name", ""), "status": stage.get("status", ""),
+                    })
+            return result
+
+    def _generate(self, url: str, options: GenerateOptions) -> dict[str, object]:
         source = self._classify(url)
         slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", url.rstrip("/").rsplit("/", 1)[-1]).strip("-") or "video"
         job_id = f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -91,7 +220,13 @@ class VideoFactory:
                 from .youtube import YouTubeCollectionFactory
 
                 writer, selection = self._translation_writer(options)
-                generated = YouTubeCollectionFactory(self.workspace, writer).generate(
+                directing_writer, directing_selection = self._youtube_directing_writer(options)
+                subtitle_reviewer, subtitle_review_selection = self._youtube_subtitle_reviewer(
+                    writer, directing_writer,
+                )
+                generated = YouTubeCollectionFactory(
+                    self.workspace, writer, directing_writer, subtitle_reviewer,
+                ).generate(
                     url, job, render=options.render,
                     local_media=Path(options.youtube_media).resolve() if options.youtube_media else None,
                     local_subtitles=(
@@ -102,9 +237,14 @@ class VideoFactory:
                         if options.youtube_translation_plan else None
                     ),
                     editorial_mode=options.youtube_editorial_mode,
+                    editorial_guidance=options.youtube_editorial_guidance,
                 )
                 result.update(generated)
-                result["model_selection"] = selection
+                result["model_selection"] = {
+                    **selection,
+                    "directing_review": directing_selection,
+                    "subtitle_review": subtitle_review_selection,
+                }
             else:
                 self._generate_cached_manifest(source, url, job, options, result)
             if result.get("status") == "running":
@@ -112,11 +252,124 @@ class VideoFactory:
         except Exception as error:
             result["status"] = "failed"
             result["error"] = f"{type(error).__name__}: {error}"
+            result["artifact_identity"] = self._artifact_identity(result)
             self._write_result(job, result)
             raise
         result["completed_at"] = _now()
+        result["artifact_identity"] = self._artifact_identity(result)
         self._write_result(job, result)
         return result
+
+    def _artifact_identity(self, result: dict[str, object]) -> dict[str, object]:
+        identity: dict[str, object] = {}
+        for result_key, hash_key in (("manifest", "manifest_sha256"), ("video", "video_sha256")):
+            raw_path = result.get(result_key)
+            if not raw_path:
+                continue
+            path = Path(str(raw_path))
+            if path.is_file():
+                identity[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
+        try:
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if revision.returncode == 0:
+                identity["code_revision"] = revision.stdout.strip()
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parents[2],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            identity["code_dirty"] = bool(dirty.stdout.strip()) if dirty.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            identity["code_revision"] = "unknown"
+        policy = self._active_agent_policy()
+        identity["prompt_policy_version"] = policy["version"]
+        identity["prompt_policy_digest"] = policy["digest"]
+        return identity
+
+    def _active_agent_policy(self) -> dict[str, object]:
+        try:
+            return load_active_policy(self.workspace)
+        except Exception as error:
+            # A malformed promoted policy is itself an asynchronous problem;
+            # generation safely continues with the source-controlled defaults.
+            try:
+                ProblemLedger(self.workspace).record(ProblemObservation(
+                    stage="generation", category="runtime_policy_integrity",
+                    expected="active runtime policy passes its recorded digest and schema checks",
+                    observed=f"{type(error).__name__}: {error}", severity="high",
+                    reporter="runtime-policy-loader",
+                ))
+            except Exception:
+                pass
+            return {
+                "version": None, "digest": "", "narrative_guidance": "",
+                "evaluator_thresholds": {},
+            }
+
+    def _ready_hook_incumbent(self, candidate_id: str) -> str:
+        """Return the strongest human-accepted hook for this exact candidate."""
+        publish_root = self.workspace.root / "publish"
+        hooks: list[str] = []
+        for path in publish_root.glob("publish-*/batch.json"):
+            try:
+                batch = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if candidate_id not in str(batch.get("manifest_id") or ""):
+                continue
+            if str(batch.get("state") or "") not in {
+                "ready_for_review", "approved", "submitting", "submitted", "completed",
+            }:
+                continue
+            video_path = Path(str(batch.get("video_path") or ""))
+            manifest_path = video_path.parent / "manifest.json" if video_path.name else Path()
+            try:
+                accepted_manifest = load_manifest(manifest_path, normalize_story=False)
+            except (OSError, ValueError, json.JSONDecodeError):
+                accepted_manifest = None
+            if accepted_manifest is not None and accepted_manifest.candidate_id == candidate_id:
+                accepted_hook = (accepted_manifest.fixed_hook or "").strip()
+                if accepted_hook:
+                    hooks.append(accepted_hook)
+                    continue
+            for target in batch.get("targets") or []:
+                if not isinstance(target, dict) or target.get("platform") != "tencent":
+                    continue
+                title = str(target.get("title") or "").strip()
+                if title:
+                    hooks.append(title)
+        return max(hooks, key=_hook_retention_score) if hooks else ""
+
+    def _retain_hook_incumbent(self, manifest, result: dict[str, object]) -> None:
+        """Give an accepted hook incumbent advantage over a policy challenger.
+
+        Regeneration is allowed to change style only when the challenger is
+        measurably stronger. A merely different, factual headline cannot erase
+        a hook that a human already accepted for this same source candidate.
+        """
+        incumbent = self._ready_hook_incumbent(manifest.candidate_id)
+        challenger = (manifest.fixed_hook or "").strip()
+        if not incumbent or not challenger:
+            return
+        incumbent_score = _hook_retention_score(incumbent)
+        challenger_score = _hook_retention_score(challenger)
+        retained = challenger_score < incumbent_score + 0.5
+        if retained:
+            manifest.fixed_hook = incumbent
+            manifest.fixed_title = incumbent
+            if manifest.editorial_brief:
+                strategy = manifest.editorial_brief.attention_strategy
+                strategy.selected_hook = incumbent
+                if incumbent not in strategy.hook_candidates:
+                    strategy.hook_candidates[0] = incumbent
+        result["stages"].append({
+            "name": "hook_regression", "status": "incumbent_retained" if retained else "challenger_won",
+            "incumbent": incumbent, "challenger": challenger,
+            "incumbent_score": incumbent_score, "challenger_score": challenger_score,
+            "required_margin": 0.5,
+        })
 
     def _generate_cached_manifest(
         self, source: str, url: str, job: Path, options: GenerateOptions,
@@ -143,6 +396,13 @@ class VideoFactory:
             return
 
         manifest = load_manifest(cache)
+        if manifest.editorial_brief is not None and not manifest.github_brief:
+            candidate = self.workspace.load_candidate(manifest.candidate_id)
+            canonicalize_editorial_brief(manifest.editorial_brief, manifest.evidence)
+            manifest.fixed_hook = manifest.editorial_brief.attention_strategy.selected_hook
+            manifest.fixed_title = manifest.fixed_hook
+            manifest.fixed_footer = manifest.editorial_brief.fixed_conclusion
+            self._recompile_editorial_manifest(manifest, candidate, normalize_story=False)
         cached_checks = validate_manifest(manifest, self.workspace.root)
         blocking = [
             check for check in cached_checks if not check.passed
@@ -177,16 +437,143 @@ class VideoFactory:
             result["checks"] = [check.to_dict() for check in cached_checks]
             result["publishable"] = is_publishable(cached_checks)
 
-    def rerender(self, manifest_path: Path) -> dict[str, object]:
+    def rerender(
+        self, manifest_path: Path, *, source_video_url: str | None = None,
+    ) -> dict[str, object]:
         """Retry deterministic rendering without reacquisition or LLM calls."""
-        manifest = load_manifest(manifest_path.resolve(), normalize_story=False)
+        manifest_path = manifest_path.resolve()
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if "collection_id" in manifest_data or (
+            "items" in manifest_data and "source_video_id" in manifest_data
+        ):
+            if source_video_url:
+                raise ValueError("source-video injection is not supported for collection rerenders")
+            from .youtube import YouTubeCollectionRenderer, validate_collection
+
+            collection = load_collection_manifest(manifest_path)
+            job_id = (
+                f"rerender-{collection.source_video_id}-"
+                f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            )
+            job = self.jobs_dir / job_id
+            job.mkdir(parents=True)
+            result: dict[str, object] = {
+                "job_id": job_id, "url": collection.source_url,
+                "source_type": "youtube", "started_at": _now(),
+                "stages": [{
+                    "name": "collection_content_reuse", "status": "ok",
+                    "manifest": str(manifest_path), "llm_calls": 0, "acquisition_calls": 0,
+                }],
+                "status": "running", "collection_id": collection.id,
+            }
+            self._write_result(job, result)
+            try:
+                YouTubeCollectionRenderer(self.workspace).render(collection)
+                rendered = [
+                    render.video_path
+                    for item in collection.items
+                    for render in item.renders
+                    if render.video_path
+                ]
+                checks = validate_collection(collection, self.workspace.root)
+                collection.quality_checks = [item.to_dict() for item in checks]
+                self.workspace.save_collection_manifest(collection)
+                job_manifest = job / "collection-manifest.json"
+                job_manifest.write_text(
+                    json.dumps(collection.to_dict(), ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                result.update({
+                    "status": "completed", "completed_at": _now(),
+                    "collection_manifest": str(job_manifest),
+                    "renders": rendered,
+                    "checks": [item.to_dict() for item in checks],
+                    "publishable": is_publishable(checks),
+                })
+            except Exception as error:
+                result["status"] = "failed"
+                result["error"] = f"{type(error).__name__}: {error}"
+                self._write_result(job, result)
+                raise
+            result["artifact_identity"] = self._artifact_identity(result)
+            self._write_result(job, result)
+            return result
+        manifest = load_manifest(manifest_path, normalize_story=False)
+        if (
+            manifest.render_profile == InformationRenderProfile.RADAR_V2.value
+            and manifest.editorial_brief is not None
+        ):
+            repaired_hook = repair_fragmented_radar_hook(manifest.editorial_brief)
+            if repaired_hook:
+                manifest.fixed_hook = repaired_hook
+                manifest.fixed_title = repaired_hook
         candidate = self.workspace.load_candidate(manifest.candidate_id)
-        if not manifest.github_brief:
-            self._recompile_editorial_manifest(manifest, candidate, normalize_story=False)
         slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", candidate.id).strip("-") or "video"
         job_id = f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         job = self.jobs_dir / job_id
         job.mkdir(parents=True)
+        source_stage: dict[str, object] | None = None
+        if source_video_url and not manifest.github_brief:
+            try:
+                downloaded = self._archived_source_video_asset(manifest, source_video_url)
+                if downloaded is not None:
+                    download_route = "workspace_asset_reuse"
+                else:
+                    downloaded, download_route = download_official_youtube_video(
+                        source_video_url, job / "source-video",
+                    )
+                hint = "\n".join(filter(None, (
+                    manifest.fixed_title or manifest.fixed_hook or "",
+                    manifest.editorial_brief.subheadline if manifest.editorial_brief else "",
+                )))
+                recommended_duration = recommend_source_clip_duration(hint)
+                clip = select_action_clip(
+                    downloaded, clip_duration=recommended_duration, semantic_hint=hint,
+                )
+                if download_route == "workspace_asset_reuse":
+                    asset = str(downloaded.relative_to(self.workspace.root))
+                    existing = next(
+                        item for item in manifest.evidence
+                        if item.source_kind == "web:source_video"
+                        and item.url == source_video_url
+                        and item.captured_asset == asset
+                    )
+                    digest = existing.sha256
+                    if not digest:
+                        digest = hashlib.sha256(downloaded.read_bytes()).hexdigest()
+                else:
+                    asset, digest = self.workspace.archive_asset(
+                        downloaded, "official-source-video",
+                    )
+                source_video = Evidence(
+                    id=f"{candidate.id}-official-source-video", candidate_id=candidate.id,
+                    url=source_video_url, quote="Official source video for the selected event.",
+                    source_kind="web:source_video", captured_asset=asset, sha256=digest,
+                    notes="Added during deterministic material rerender; approved story copy is unchanged.",
+                    metadata={
+                        "visual_role": "source_video", "editorial_priority": "high",
+                        "clip_start": clip["start"], "clip_end": clip["end"],
+                        "clip_selection_method": clip["method"],
+                        "clip_selection_score": clip["score"],
+                        "download_route": download_route,
+                    },
+                )
+                self.workspace.save_evidence(source_video)
+                self._canonicalize_source_video_visuals(manifest, candidate, source_video)
+                source_stage = {
+                    "name": "official_source_video", "status": "ok",
+                    "url": source_video_url, "asset": asset,
+                    "download_route": download_route, "clip": clip,
+                }
+            except Exception as error:
+                source_stage = {
+                    "name": "official_source_video", "status": "fallback",
+                    "url": source_video_url, "fallback": "primary_page_browser_capture",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                self._recompile_editorial_manifest(manifest, candidate, normalize_story=False)
+        elif not manifest.github_brief:
+            self._recompile_editorial_manifest(manifest, candidate, normalize_story=False)
         job_manifest = job / "manifest.json"
         job_manifest.write_text(
             json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
@@ -196,7 +583,8 @@ class VideoFactory:
             "started_at": _now(), "stages": [{
                 "name": "content_reuse", "status": "ok", "manifest": str(manifest_path.resolve()),
                 "llm_calls": 0, "acquisition_calls": 0,
-            }], "status": "running", "manifest": str(job_manifest),
+            }, *([source_stage] if source_stage else [])],
+            "status": "running", "manifest": str(job_manifest),
         }
         self._write_result(job, result)
         try:
@@ -216,8 +604,10 @@ class VideoFactory:
         except Exception as error:
             result["status"] = "failed"
             result["error"] = f"{type(error).__name__}: {error}"
+            result["artifact_identity"] = self._artifact_identity(result)
             self._write_result(job, result)
             raise
+        result["artifact_identity"] = self._artifact_identity(result)
         self._write_result(job, result)
         return result
 
@@ -232,6 +622,12 @@ class VideoFactory:
         # generation and explicit semantic repair may still normalize drafts.
         if normalize_story:
             canonicalize_editorial_brief(brief, manifest.evidence)
+        elif manifest.render_profile == InformationRenderProfile.RADAR_V2.value:
+            # Rerender is allowed to adopt deterministic UI timing policy
+            # while keeping every approved word and the shot order frozen.
+            apply_readable_radar_timing(brief)
+        if manifest.content_type == ContentType.FLASH:
+            enforce_flash_time_budget(brief)
         proposals = compile_evidence_shots(brief, candidate)
         scenes: list[Scene] = []
         cursor = 0.0
@@ -252,6 +648,102 @@ class VideoFactory:
             ))
             cursor += duration
         manifest.scenes = scenes
+
+    @staticmethod
+    def _canonicalize_source_video_visuals(manifest, candidate, source_video: Evidence) -> None:
+        """Use one official clip plus concise cards for a motion-led Flash.
+
+        This is a material decision only: approved hook, facts, conclusion,
+        and shot order remain untouched.  It prevents a page with an official
+        video from becoming three rapid jumps between unrelated DOM regions.
+        """
+        brief = manifest.editorial_brief
+        if (
+            brief is None or manifest.content_type != ContentType.FLASH
+            or not brief.evidence_shots
+        ):
+            return
+        existing_index = next((
+            index for index, item in enumerate(manifest.evidence)
+            if item.id == source_video.id
+        ), None)
+        if existing_index is None:
+            manifest.evidence.append(source_video)
+        else:
+            # A deterministic rerender may reselect a different action window
+            # under the same stable evidence ID. Replace the archived metadata
+            # instead of silently rendering the old timestamps.
+            manifest.evidence[existing_index] = source_video
+        # X stories keep the complete root post first for provenance, then
+        # play its attached animation. Webpage-led motion stories can open on
+        # the footage immediately.
+        motion_index = (
+            1
+            if candidate.source_type == SourceType.TWEET and len(brief.evidence_shots) > 1
+            else 0
+        )
+        motion = brief.evidence_shots[motion_index]
+        motion.kind = EvidenceShotKind.VIDEO
+        motion.visual_family = "source_video"
+        motion.evidence_ids = list(dict.fromkeys([
+            source_video.id, *motion.evidence_ids,
+        ]))
+        motion.source_url = source_video.url
+        motion.target = ""
+        # The large pinned hook already explains why the footage matters.
+        # Keep the motion proof unobstructed; cards carry the detailed copy.
+        motion.translation = ""
+        motion.full_translation = ""
+
+        physical_motion_first = str(
+            getattr(candidate, "metadata", {}).get("discovery_channel") or ""
+        ) in {"robotics", "autonomous_driving"}
+        card_families = ("stat_card", "impact_card", "quote_card")
+        card_index = 0
+        for index, shot in enumerate(brief.evidence_shots):
+            if index == motion_index or (
+                index == 0 and candidate.source_type == SourceType.TWEET
+            ):
+                continue
+            shot.kind = EvidenceShotKind.BROWSER_SECTION
+            shot.visual_family = card_families[min(card_index, len(card_families) - 1)]
+            shot.translation = ""
+            shot.full_translation = ""
+            if physical_motion_first:
+                # The persistent footer carries interpretation. These brief
+                # cards retain only source-backed facts between action beats.
+                shot.audience_copy = ""
+                shot.interpretation = ""
+            card_index += 1
+        if physical_motion_first and brief.fixed_conclusion.strip():
+            manifest.fixed_footer = brief.fixed_conclusion.strip()
+        apply_readable_radar_timing(brief)
+        clip_start = float(source_video.metadata.get("clip_start") or 0)
+        clip_end = float(source_video.metadata.get("clip_end") or clip_start + motion.duration)
+        motion.duration = round(max(1.5, min(12.0, clip_end - clip_start)), 3)
+        cards = [
+            shot for index, shot in enumerate(brief.evidence_shots)
+            if index != motion_index
+        ]
+        if physical_motion_first:
+            for shot in cards:
+                shot.duration = round(min(3.2, shot.duration), 3)
+        available_for_cards = max(0.0, 30.0 - motion.duration)
+        desired_cards = sum(shot.duration for shot in cards)
+        if cards and desired_cards > available_for_cards:
+            floor = min(3.5, available_for_cards / len(cards))
+            reducible = sum(max(0.0, shot.duration - floor) for shot in cards)
+            excess = desired_cards - available_for_cards
+            for shot in cards:
+                reduction = (
+                    excess * max(0.0, shot.duration - floor) / reducible
+                    if reducible else 0.0
+                )
+                shot.duration = round(max(floor, shot.duration - reduction), 3)
+        brief.duration_target = round(sum(shot.duration for shot in brief.evidence_shots), 3)
+        VideoFactory._recompile_editorial_manifest(
+            manifest, candidate, normalize_story=False,
+        )
 
     @staticmethod
     def _canonicalize_price_event_copy(manifest, metadata: dict[str, object]) -> None:
@@ -484,7 +976,7 @@ class VideoFactory:
         self.workspace.save_manifest(manifest)
         shutil.copy2(self.workspace.manifests_dir / f"{manifest.id}.json", job_manifest)
         duration_limits = {
-            ContentType.FLASH: 15.0, ContentType.EXPLAINER: 25.0, ContentType.DEEP_DIVE: 40.0,
+            ContentType.FLASH: 30.0, ContentType.EXPLAINER: 30.0, ContentType.DEEP_DIVE: 40.0,
         }
         video_checks = validate_wechat_mp4(
             probe_video(final), max_duration=duration_limits[manifest.content_type], require_audio=True,
@@ -501,9 +993,15 @@ class VideoFactory:
             "format": options.content_type.value if options.content_type else "auto",
             "duration": options.duration, "provider": options.provider, "model": options.model,
             "research": options.research, "linked_sources": options.linked_sources,
+            "discovery_context": options.discovery_context,
+            "discovery_source_url": options.discovery_source_url,
+            "discovery_source_quote": options.discovery_source_quote,
+            "discovery_published_at": options.discovery_published_at,
+            "discovery_channel": options.discovery_channel,
+            "source_video_url": options.source_video_url,
             "supplemental_context": options.supplemental_context,
             "price_event_metadata": options.price_event_metadata,
-            "render_profile": options.render_profile, "schema": 50,
+            "render_profile": options.render_profile, "schema": 52,
         }, sort_keys=True, ensure_ascii=False)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return self.cache_dir / "generations" / f"{digest}.manifest.json"
@@ -529,6 +1027,9 @@ class VideoFactory:
             acquired = URLAcquirer(self.workspace).acquire(url, job)
         candidate = acquired.ingest.candidate
         evidence = list(acquired.ingest.evidence)
+        if options.discovery_channel:
+            candidate.metadata["discovery_channel"] = options.discovery_channel
+            self.workspace.save_candidate(candidate)
         if options.supplemental_context:
             evidence = [self._price_focused_evidence(item) for item in evidence]
         if options.linked_sources:
@@ -536,6 +1037,140 @@ class VideoFactory:
                 *candidate.linked_sources, *options.linked_sources,
             ]))
             self.workspace.save_candidate(candidate)
+        source_video_evidence: Evidence | None = next((
+            item for item in evidence
+            if item.source_kind == "web:source_video" and item.captured_asset
+        ), None)
+        if source_video_evidence is not None and not source_video_evidence.metadata.get("clip_end"):
+            archived_video = self.workspace.root / source_video_evidence.captured_asset
+            if archived_video.is_file():
+                try:
+                    clip_hint = options.discovery_context or candidate.title
+                    recommended_duration = recommend_source_clip_duration(clip_hint)
+                    clip = select_action_clip(
+                        archived_video, clip_duration=recommended_duration,
+                        semantic_hint=clip_hint,
+                    )
+                    source_video_evidence.metadata.update({
+                        "clip_start": clip["start"], "clip_end": clip["end"],
+                        "clip_selection_method": clip["method"],
+                        "clip_selection_score": clip["score"],
+                        "download_route": "attached_x_media",
+                    })
+                    self.workspace.save_evidence(source_video_evidence)
+                    result["stages"].append({
+                        "name": "attached_source_video", "status": "ok",
+                        "url": source_video_evidence.url, "clip": clip,
+                    })
+                except Exception as error:
+                    # The archived motion asset is still usable from its start;
+                    # later deterministic rendering bounds the clip by the
+                    # scene duration. Preserve the fallback instead of losing
+                    # the entire post because semantic clip scoring failed.
+                    source_video_evidence.metadata.update({
+                        "clip_start": 0.0, "download_route": "attached_x_media",
+                        "clip_selection_method": "start_fallback",
+                    })
+                    self.workspace.save_evidence(source_video_evidence)
+                    result["stages"].append({
+                        "name": "attached_source_video", "status": "fallback",
+                        "url": source_video_evidence.url,
+                        "fallback": "bounded_clip_from_start",
+                        "error": f"{type(error).__name__}: {error}",
+                    })
+        if options.source_video_url:
+            candidate.linked_sources = list(dict.fromkeys([
+                *candidate.linked_sources, options.source_video_url,
+            ]))
+            self.workspace.save_candidate(candidate)
+            try:
+                downloaded, download_route = download_official_youtube_video(
+                    options.source_video_url, job / "source-video",
+                )
+                clip_hint = options.discovery_context or candidate.title
+                recommended_duration = recommend_source_clip_duration(clip_hint)
+                clip = select_action_clip(
+                    downloaded, clip_duration=recommended_duration,
+                    semantic_hint=clip_hint,
+                )
+                asset, digest = self.workspace.archive_asset(downloaded, "official-source-video")
+                source_video_evidence = Evidence(
+                    id=f"{candidate.id}-official-source-video", candidate_id=candidate.id,
+                    url=options.source_video_url,
+                    quote=(options.discovery_source_quote or (
+                        "Official source video selected for one uninterrupted motion-first proof. "
+                        "Use the page evidence for every accompanying factual statement."
+                    )),
+                    source_kind="web:source_video", captured_asset=asset, sha256=digest,
+                    notes=(
+                        "Official source footage. The clip window is selected automatically; "
+                        "if acquisition fails, retain the browser-evidence fallback."
+                    ),
+                    metadata={
+                        "visual_role": "source_video", "editorial_priority": "high",
+                        "clip_start": clip["start"], "clip_end": clip["end"],
+                        "clip_selection_method": clip["method"],
+                        "clip_selection_score": clip["score"],
+                        "download_route": download_route,
+                        "claim_source_url": options.discovery_source_url or "",
+                    },
+                )
+                self.workspace.save_evidence(source_video_evidence)
+                evidence.append(source_video_evidence)
+                result["stages"].append({
+                    "name": "official_source_video", "status": "ok",
+                    "url": options.source_video_url, "asset": asset,
+                    "download_route": download_route, "clip": clip,
+                })
+            except Exception as error:
+                # Video is a high-value visual enhancement, not a reason to
+                # lose a fully evidenced news story. Preserve a machine-readable
+                # fallback trace and continue through the real-browser route.
+                result["stages"].append({
+                    "name": "official_source_video", "status": "fallback",
+                    "fallback": "primary_page_browser_capture",
+                    "url": options.source_video_url,
+                    "error": f"{type(error).__name__}: {error}",
+                })
+        if options.discovery_source_quote:
+            report_path = job / "discovery-source-excerpt.md"
+            report_path.write_text(options.discovery_source_quote.strip() + "\n", encoding="utf-8")
+            asset, digest = self.workspace.archive_asset(report_path, "discovery-source-excerpt")
+            reported_evidence = Evidence(
+                id=f"{candidate.id}-reported-event", candidate_id=candidate.id,
+                url=options.discovery_source_url or url,
+                quote=options.discovery_source_quote.strip(),
+                source_kind="web:reported_context", captured_asset=asset, sha256=digest,
+                notes=(
+                    "Exact local excerpt that selected this event from a roundup or digest. "
+                    "It may support a derived evidence card, but is not browser text from the "
+                    "subject's linked company/product page."
+                ),
+                metadata={
+                    "render_policy": "derived_card_only",
+                    "source_video_url": options.source_video_url or "",
+                },
+            )
+            self.workspace.save_evidence(reported_evidence)
+            evidence.append(reported_evidence)
+        if options.discovery_context:
+            scope_path = job / "discovery-selection-scope.md"
+            scope_path.write_text(options.discovery_context.strip() + "\n", encoding="utf-8")
+            asset, digest = self.workspace.archive_asset(scope_path, "discovery-selection-scope")
+            scope_evidence = Evidence(
+                id=f"{candidate.id}-discovery-selection-scope",
+                candidate_id=candidate.id, url=url,
+                quote=options.discovery_context,
+                source_kind="discovery:selection_scope",
+                captured_asset=asset, sha256=digest,
+                notes=(
+                    "Binding scope selected by discovery. On a roundup or digest page, every shot must stay "
+                    "on this named event; unrelated items on the same page are excluded."
+                ),
+                metadata={"published_at": options.discovery_published_at or ""},
+            )
+            self.workspace.save_evidence(scope_evidence)
+            evidence.append(scope_evidence)
         if options.supplemental_context:
             context_path = job / "discovery-context.md"
             context_path.write_text(options.supplemental_context.strip() + "\n", encoding="utf-8")
@@ -571,14 +1206,35 @@ class VideoFactory:
         route = route_content(
             candidate, evidence, options.topic, options.content_type, options.duration,
         )
-        if (
-            options.render_profile == InformationRenderProfile.RADAR_V2.value
-            and options.duration is None and route.content_type == ContentType.FLASH
-        ):
-            route = replace(
-                route, target_duration=10.0,
-                reason=route.reason + "; Radar V2 flash target",
-            )
+        if options.render_profile == InformationRenderProfile.RADAR_V2.value and options.duration is None:
+            source_video = next((
+                item for item in evidence
+                if item.source_kind == "web:source_video" and item.captured_asset
+            ), None)
+            if source_video is None:
+                static_target = static_radar_target_duration(
+                    route.content_type, options.discovery_channel,
+                )
+                route = replace(
+                    route,
+                    target_duration=static_target,
+                    reason=(
+                        route.reason + "; static research Radar shortened to 20 seconds"
+                        if route.content_type == ContentType.DEEP_DIVE else
+                        route.reason + "; static news Radar biased to an 8-second brief"
+                        if static_target < 10 else
+                        route.reason + "; static Radar target under 15 seconds"
+                    ),
+                )
+            else:
+                clip_start = float(source_video.metadata.get("clip_start") or 0)
+                clip_end = float(source_video.metadata.get("clip_end") or clip_start)
+                clip_duration = max(0.0, clip_end - clip_start)
+                route = replace(
+                    route,
+                    target_duration=round(min(30.0, max(15.0, clip_duration + 7.0)), 3),
+                    reason=route.reason + "; source-video Radar target follows selected action window",
+                )
         result["routing"] = {
             "source_kind": self._classify(url), "topic_type": route.topic_type.value,
             "content_type": route.content_type.value, "target_duration": route.target_duration,
@@ -648,6 +1304,9 @@ class VideoFactory:
                     "name": "x_visual_analysis", "status": "failed",
                     "error": f"{type(error).__name__}: {error}",
                 })
+        runtime_policy = self._active_agent_policy()
+        runtime_guidance = str(runtime_policy.get("narrative_guidance") or "").strip()
+        incumbent_hook = self._ready_hook_incumbent(candidate.id)
         packet = StoryWriterPacket(
             candidate, evidence, route.topic_type, route.content_type, route.target_duration,
             editorial_direction=(
@@ -660,6 +1319,21 @@ class VideoFactory:
                 "结尾必须回答开头。X 原帖完整放在第一镜，不拆段。"
                 + self._causal_uncertainty_direction(evidence)
                 + self._source_identity_direction(evidence)
+                + (
+                    "这是 discovery 选中的具体事件。必须逐镜围绕 discovery:selection_scope 中的标题、主体和摘要；"
+                    "若原网页是合集、周报或多视频列表，同页其他机器人、公司或事件一律不能改成主线或镜头。"
+                    "discovery:selection_scope 只能锁定选题，绝不是可展示的网页证据，也不能作为 browser_section 的文字来源；"
+                    "若有 web:reported_context，它只允许做 quote_card/timeline/impact_card/stat_card，"
+                    "不得把相邻的公司主页或产品页伪装成包含该段文字。原视频存在时，优先用 source_video 展示动作。"
+                    if options.discovery_context else ""
+                )
+                + (
+                    "这是没有原视频的静态新闻快报。若 context research 没找到真正改变理解的因果链、对比、技术影响或后续证据，"
+                    "默认做约 8 秒：用三个极短证明镜头，把必要背景更多放进常驻 title/hook 与 footer/conclusion，"
+                    "中间镜头只保留读得完的原始证据，不用空泛延伸来凑时长。若确有重要延伸，允许为完整性和可读性自然加长。"
+                    if options.discovery_channel in {"news", "news_zh"} and source_video is None
+                    else ""
+                )
                 + (
                     "OpenRouter 折扣页只有达到高折扣选题门槛的价格异常才能成片；"
                     f"本次最高可验证折扣/同模型节省为 {discount_gate['effective_discount_percent']:.1f}%。"
@@ -678,6 +1352,18 @@ class VideoFactory:
                     "fixed_hook、fixed_title、fixed_conclusion 必须分别逐字使用 metadata.required_hook_zh、"
                     "metadata.required_headline_zh、metadata.editorial_verdict_zh，不得扩写。"
                     if options.supplemental_context else ""
+                )
+                + (
+                    "Nightly audit validated this reusable narrative correction: "
+                    + runtime_guidance
+                    if runtime_guidance else ""
+                )
+                + (
+                    " This exact source already has a human-accepted hook: " + incumbent_hook
+                    + ". Treat it as the incumbent editorial angle. Reuse it verbatim unless a new hook "
+                    "is both fully grounded and clearly more arresting, concrete, and conversational; "
+                    "a neutral summary, announcement, certification, or framework label does not beat it."
+                    if incumbent_hook else ""
                 )
             ), render_profile=options.render_profile,
         )
@@ -699,7 +1385,18 @@ class VideoFactory:
             result["content_agent_error"] = str(trace_path)
             raise
         manifest = run.manifest
+        run.trace.insert(0, {
+            "step": "runtime_policy", "status": "active" if runtime_policy.get("version") else "default",
+            "version": runtime_policy.get("version"), "digest": runtime_policy.get("digest"),
+        })
+        result["agent_policy"] = {
+            "version": runtime_policy.get("version"), "digest": runtime_policy.get("digest"),
+        }
         manifest.render_profile = options.render_profile
+        if source_video_evidence is not None:
+            self._canonicalize_source_video_visuals(
+                manifest, candidate, source_video_evidence,
+            )
         if options.price_event_metadata:
             retained_ids = {item.id for item in manifest.evidence}
             manifest.evidence.extend(
@@ -713,6 +1410,7 @@ class VideoFactory:
         if options.supplemental_context:
             self._canonicalize_price_event_visuals(manifest, url)
             self._recompile_editorial_manifest(manifest, candidate)
+        self._retain_hook_incumbent(manifest, result)
         self._reconcile_x_display_name(candidate, manifest.evidence)
         context_actions = [item for item in run.trace if item.get("step") == "context_research"]
         result["stages"].append({
@@ -938,7 +1636,7 @@ class VideoFactory:
         brief = manifest.editorial_brief
         segmented_families = {"quote_card", "timeline", "impact_card", "stat_card"}
         needs_segmented_track = bool(brief and any(
-            shot.kind in {EvidenceShotKind.TWEET_CARD, EvidenceShotKind.IMAGE}
+            shot.kind in {EvidenceShotKind.TWEET_CARD, EvidenceShotKind.IMAGE, EvidenceShotKind.VIDEO}
             or shot.visual_family in segmented_families
             for shot in brief.evidence_shots
         ))
@@ -960,7 +1658,7 @@ class VideoFactory:
         self.workspace.save_manifest(manifest)
         shutil.copy2(self.workspace.manifests_dir / f"{manifest.id}.json", job_manifest)
         video_checks = validate_wechat_mp4(
-            probe_video(final), max_duration=15 if manifest.content_type == ContentType.FLASH else None,
+            probe_video(final), max_duration=30 if manifest.content_type == ContentType.FLASH else None,
             require_audio=True,
         )
         checks = validate_manifest(manifest, self.workspace.root)
@@ -1036,6 +1734,11 @@ class VideoFactory:
         evidence_by_id = {item.id: item for item in manifest.evidence}
         derived_families = {"quote_card", "timeline", "impact_card", "stat_card"}
         radar = manifest.render_profile == InformationRenderProfile.RADAR_V2.value
+        source_video_story = any(
+            item.source_kind == "web:source_video" and item.captured_asset
+            for item in manifest.evidence
+        )
+        track_height = SOURCE_VIDEO_TRACK_HEIGHT if source_video_story else EDITORIAL_TRACK_HEIGHT
         segments: list[TrackSegment] = []
         sidecar_parts: list[dict[str, object]] = []
         # A 150ms micro-crossfade removes hard flashes without lingering long
@@ -1048,12 +1751,45 @@ class VideoFactory:
             family = (scene.visual_family or shot.visual_family or "").strip()
             if cited.source_kind == "web:reported_context" and family not in derived_families:
                 family = "timeline" if shot.retention_job in {"background", "contrast", "turn"} else "quote_card"
-            if shot.kind == EvidenceShotKind.IMAGE:
+            if shot.kind == EvidenceShotKind.VIDEO or family == "source_video":
+                video_evidence = next((
+                    evidence_by_id[item] for item in scene.evidence_ids
+                    if item in evidence_by_id
+                    and evidence_by_id[item].source_kind == "web:source_video"
+                ), None)
+                if video_evidence is None or not video_evidence.captured_asset:
+                    raise ValueError(
+                        f"source video scene {scene.id} has no archived official video asset"
+                    )
+                asset = self.workspace.root / video_evidence.captured_asset
+                start = float(video_evidence.metadata.get("clip_start") or 0)
+                selected_end = float(
+                    video_evidence.metadata.get("clip_end") or start + scene.duration
+                )
+                available = max(0.1, selected_end - start)
+                source_duration = probe_video(asset).duration
+                loop_short_animation = source_duration <= 1.5 and scene.duration > source_duration + 0.1
+                duration = scene.duration if loop_short_animation else min(scene.duration, available)
+                part = render_source_video_clip(
+                    asset, job / f"source-video-{index}.mp4",
+                    start=start, duration=duration,
+                    width=EDITORIAL_TRACK_WIDTH, height=track_height,
+                    loop=loop_short_animation,
+                )
+                local_shots = [{
+                    "id": scene.id, "action": "source_video", "start": 0,
+                    "end": duration, "translation": "",
+                }]
+            elif shot.kind == EvidenceShotKind.IMAGE:
                 image_evidence = next((
                     evidence_by_id[item] for item in scene.evidence_ids
                     if item in evidence_by_id
                     and evidence_by_id[item].source_kind in {"web:source_image", "x:media_photo"}
-                ), cited)
+                ), None)
+                if image_evidence is None:
+                    raise ValueError(
+                        f"source image scene {scene.id} does not cite an archived image asset"
+                    )
                 if not image_evidence.captured_asset:
                     raise ValueError(f"source image {image_evidence.id} has no archived asset")
                 asset = self.workspace.root / image_evidence.captured_asset
@@ -1081,7 +1817,10 @@ class VideoFactory:
             elif shot.kind == EvidenceShotKind.TWEET_CARD:
                 if not cited.source_kind.startswith("x:"):
                     raise ValueError(f"tweet_card {scene.id} must cite archived X evidence")
-                frame = render_tweet_card(candidate, cited, scene, job / f"tweet-card-{index}.png")
+                frame = render_tweet_card(
+                    candidate, cited, scene, job / f"tweet-card-{index}.png",
+                    size=(EDITORIAL_TRACK_WIDTH, track_height),
+                )
                 part = tweet_card_video(
                     frame, scene.duration, job / f"tweet-card-{index}.mp4", motion=radar,
                 )
@@ -1101,9 +1840,53 @@ class VideoFactory:
                     capture_url, cues, part, frames / f"scene-{index}", width=1384, height=1602,
                 )
                 WebScrollVideoAdapter(WebScrollVideoSettings.from_environment()).capture(request)
-                metadata = json.loads(part.with_suffix(".capture.json").read_text(encoding="utf-8"))
-                duration = float(metadata.get("duration") or scene.duration)
-                local_shots = list(metadata.get("shots", []))
+                if _browser_capture_needs_card_fallback(part):
+                    fallback_family = (
+                        "impact_card"
+                        if shot.retention_job in {"impact", "payoff", "takeaway"}
+                        else "quote_card"
+                    )
+                    frame = render_editorial_card(
+                        scene, cited, job / f"evidence-card-fallback-{index}.png",
+                        fallback_family,
+                    )
+                    fallback_part = job / f"evidence-card-fallback-{index}.mp4"
+                    part = tweet_card_video(
+                        frame, scene.duration, fallback_part, motion=radar,
+                    )
+                    duration = scene.duration
+                    local_shots = [{
+                        "id": scene.id, "action": fallback_family,
+                        "start": 0, "end": duration, "translation": "",
+                    }]
+                    fallback_part.with_suffix(".visual-fallback.json").write_text(
+                        json.dumps({
+                            "stage": "browser_evidence",
+                            "status": "fallback",
+                            "reason": "exact visible quote missing from live page",
+                            "fallback": fallback_family,
+                            "source_url": capture_url,
+                        }, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    metadata = json.loads(part.with_suffix(".capture.json").read_text(encoding="utf-8"))
+                    duration = float(metadata.get("duration") or scene.duration)
+                    local_shots = list(metadata.get("shots", []))
+            if source_video_story and probe_video(part).height != track_height:
+                # Canonical source-video stories use one clip followed by
+                # information cards. Cards put all important material at the
+                # top of their portrait canvas, so remove only the unused lower
+                # area instead of shrinking the card and its typography.
+                normalized = job / f"source-video-track-{index}.mp4"
+                subprocess.run([
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(part), "-vf",
+                    f"crop={EDITORIAL_TRACK_WIDTH}:{track_height}:0:0,setsar=1,fps=25,format=yuv420p",
+                    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25",
+                    str(normalized),
+                ], check=True)
+                part = normalized
             segments.append(TrackSegment(part, duration))
             offset = sum(item.duration for item in segments[:-1])
             for local in local_shots:
@@ -1116,7 +1899,7 @@ class VideoFactory:
         else:
             build_crossfade_track(segments, output, fade_seconds=0)
         sidecar = {
-            "version": 1, "width": 1384, "height": 1602,
+            "version": 1, "width": EDITORIAL_TRACK_WIDTH, "height": track_height,
             "duration": round(sum(item.duration for item in segments), 3),
             "shots": sidecar_parts,
         }
@@ -1164,34 +1947,53 @@ class VideoFactory:
         })
         visuals = find_high_value_visuals(readme_text, raw_base)
         if visuals and os.environ.get("OPENROUTER_API_KEY"):
-            catalog = OpenRouterCatalog(self.cache_dir / "openrouter")
-            vision_quote = catalog.select(ModelRequirements("vision", ("text", "image")), options.refresh_prices)
-            settings = LLMSettings.from_environment("openrouter", vision_quote.model_id)
-            analysis = OpenRouterVisualAnalyst(settings, vision_quote).analyze(repo_url, readme_text, visuals)
-            analysis_path = job / "visual-analysis.json"
-            analysis_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            asset, digest = self.workspace.archive_asset(analysis_path, "github-visual-analysis")
-            visual_evidence = Evidence(
-                id=f"{ingest.candidate.id}-visual-analysis", candidate_id=ingest.candidate.id,
-                url=repo_url + "#readme", quote=json.dumps(analysis, ensure_ascii=False),
-                source_kind="github:visual_analysis", captured_asset=asset, sha256=digest,
-                notes="Multimodal interpretation only; never a browser-target or sole factual source.",
-            )
-            self.workspace.save_evidence(visual_evidence)
-            evidence.append(visual_evidence)
-            visual_context = "多模态模型已读 README 中的架构/Benchmark 图；仅用于解释，浏览器目标与事实必须回到原始 README。"
-            result["stages"].append({
-                "name": "visual_analysis", "status": "ok", "images": [asdict(item) for item in visuals],
-                "model": vision_quote.to_dict(), "artifact": str(analysis_path),
-                "provenance": analysis.get("provenance"),
-            })
+            try:
+                catalog = OpenRouterCatalog(self.cache_dir / "openrouter")
+                vision_quote = catalog.select(ModelRequirements("vision", ("text", "image")), options.refresh_prices)
+                settings = LLMSettings.from_environment("openrouter", vision_quote.model_id)
+                analysis = OpenRouterVisualAnalyst(settings, vision_quote).analyze(repo_url, readme_text, visuals)
+                analysis_path = job / "visual-analysis.json"
+                analysis_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                asset, digest = self.workspace.archive_asset(analysis_path, "github-visual-analysis")
+                visual_evidence = Evidence(
+                    id=f"{ingest.candidate.id}-visual-analysis", candidate_id=ingest.candidate.id,
+                    url=repo_url + "#readme", quote=json.dumps(analysis, ensure_ascii=False),
+                    source_kind="github:visual_analysis", captured_asset=asset, sha256=digest,
+                    notes="Multimodal interpretation only; never a browser-target or sole factual source.",
+                )
+                self.workspace.save_evidence(visual_evidence)
+                evidence.append(visual_evidence)
+                visual_context = "多模态模型已读 README 中的架构/Benchmark 图；仅用于解释，浏览器目标与事实必须回到原始 README。"
+                result["stages"].append({
+                    "name": "visual_analysis", "status": "ok", "images": [asdict(item) for item in visuals],
+                    "model": vision_quote.to_dict(), "artifact": str(analysis_path),
+                    "provenance": analysis.get("provenance"),
+                })
+            except Exception as error:
+                # README text and archived source images remain sufficient for
+                # grounded generation. Multimodal interpretation enriches a
+                # story but must never make discovery-to-generation blocking.
+                result["stages"].append({
+                    "name": "visual_analysis", "status": "failed_optional",
+                    "reason": f"{type(error).__name__}: {error}",
+                    "images": [asdict(item) for item in visuals],
+                })
         else:
             reason = "no high-value README image" if not visuals else "OPENROUTER_API_KEY is not configured"
             result["stages"].append({"name": "visual_analysis", "status": "skipped", "reason": reason})
 
+        runtime_policy = self._active_agent_policy()
+        runtime_guidance = str(runtime_policy.get("narrative_guidance") or "").strip()
         packet = StoryWriterPacket(
             ingest.candidate, evidence, TopicType.GITHUB_PROJECT, ContentType.EXPLAINER,
-            options.duration or 20.0, editorial_direction=visual_context,
+            options.duration or 20.0, editorial_direction=" ".join(filter(None, (
+                visual_context,
+                (
+                    "Nightly audit validated this reusable narrative correction: "
+                    + runtime_guidance
+                    if runtime_guidance else ""
+                ),
+            ))),
             render_profile=options.render_profile,
         )
         def github_agent(
@@ -1249,6 +2051,13 @@ class VideoFactory:
                 result["content_agent_error"] = str(trace_path)
                 raise
         manifest = run.manifest
+        run.trace.insert(0, {
+            "step": "runtime_policy", "status": "active" if runtime_policy.get("version") else "default",
+            "version": runtime_policy.get("version"), "digest": runtime_policy.get("digest"),
+        })
+        result["agent_policy"] = {
+            "version": runtime_policy.get("version"), "digest": runtime_policy.get("digest"),
+        }
         manifest.render_profile = options.render_profile
         manifest_path = self.workspace.save_manifest(manifest)
         job_manifest = job / "manifest.json"
@@ -1265,6 +2074,12 @@ class VideoFactory:
 
     def _story_writer(self, options: GenerateOptions) -> tuple[OpenAICompatibleStoryWriter, ModelQuote | None, dict[str, object]]:
         provider = options.provider
+        if provider == "auto" and _is_kimi_coding_model(options.model):
+            settings = LLMSettings.from_environment("kimi", options.model)
+            return OpenAICompatibleStoryWriter(settings), None, {
+                "provider": "kimi", "model": settings.model,
+                "billing": "kimi_coding_plan",
+            }
         if provider == "auto" and os.environ.get("OPENROUTER_API_KEY"):
             try:
                 quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(
@@ -1295,14 +2110,52 @@ class VideoFactory:
 
     def _copy_reviewer(
         self, writer: OpenAICompatibleStoryWriter, options: GenerateOptions,
-    ) -> tuple[OpenAICompatibleStoryWriter, dict[str, object]]:
-        """Choose an independent low-cost critic; never let the writer grade itself when avoidable."""
-        if writer.settings.provider == "openrouter" and os.environ.get("DEEPSEEK_API_KEY"):
-            settings = LLMSettings.from_environment("deepseek", None)
-            return OpenAICompatibleStoryWriter(settings), {
-                "provider": "deepseek", "model": settings.model,
-                "reason": "cross-provider critic avoids a shared OpenRouter failure domain",
+    ) -> tuple[object, dict[str, object]]:
+        """Combine independent directing-taste and native-Chinese critics."""
+        configured_reviewers: list[tuple[str, OpenAICompatibleStoryWriter]] = []
+        configured_selection: list[dict[str, object]] = []
+        if os.environ.get("OPENROUTER_API_KEY"):
+            configured = os.environ.get(
+                "VIDEO_FACTORY_REVIEW_MODEL", "google/gemini-3.7-flash",
+            ).strip()
+            alternatives = [
+                configured, "google/gemini-3.7-flash", "google/gemini-3.6-flash",
+            ]
+            review_model = next((
+                model for model in alternatives
+                if model and model != writer.settings.model
+            ), "")
+            if review_model:
+                try:
+                    settings = LLMSettings.from_environment("openrouter", review_model)
+                    configured_reviewers.append((
+                        "story_and_directing_taste", OpenAICompatibleStoryWriter(settings),
+                    ))
+                    configured_selection.append({
+                        "provider": "openrouter", "model": settings.model,
+                        "reason": "independent Gemini story/directing critic selected for editorial taste",
+                    })
+                except Exception:
+                    pass
+        if os.environ.get("DEEPSEEK_API_KEY") and writer.settings.provider != "deepseek":
+            try:
+                settings = LLMSettings.from_environment("deepseek", None)
+                configured_reviewers.append((
+                    "spoken_chinese_copy", OpenAICompatibleStoryWriter(settings),
+                ))
+                configured_selection.append({
+                    "provider": "deepseek", "model": settings.model,
+                    "reason": "independent native-Chinese read-aloud copy critic",
+                })
+            except Exception:
+                pass
+        if len(configured_reviewers) > 1:
+            return CompositeCopyReviewer(configured_reviewers), {
+                "provider": "composite", "reviewers": configured_selection,
+                "reason": "Gemini directing taste plus independent spoken-Chinese copy audit",
             }
+        if configured_reviewers:
+            return configured_reviewers[0][1], configured_selection[0]
         if os.environ.get("OPENROUTER_API_KEY"):
             try:
                 quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(
@@ -1318,28 +2171,44 @@ class VideoFactory:
                 }
             except Exception:
                 pass
-        if os.environ.get("DEEPSEEK_API_KEY") and writer.settings.provider != "deepseek":
-            settings = LLMSettings.from_environment("deepseek", None)
-            return OpenAICompatibleStoryWriter(settings), {
-                "provider": "deepseek", "model": settings.model,
-                "reason": "economical independent critic fallback",
-            }
         return writer, {
             "provider": writer.settings.provider, "model": writer.settings.model,
             "reason": "no independent reviewer configured",
         }
 
-    def _translation_writer(self, options: GenerateOptions) -> tuple[OpenAICompatibleStoryWriter, dict[str, object]]:
+    def _translation_writer(self, options: GenerateOptions) -> tuple[object, dict[str, object]]:
+        if options.provider == "auto" and _is_kimi_coding_model(options.model):
+            settings = replace(
+                LLMSettings.from_environment("kimi", options.model),
+                reasoning_effort=os.environ.get(
+                    "KIMI_TRANSLATION_REASONING_EFFORT", "low",
+                ),
+            )
+            return OpenAICompatibleStoryWriter(settings), {
+                "provider": "kimi", "model": settings.model,
+                "purpose": "translation", "billing": "kimi_coding_plan",
+            }
         if options.provider == "auto" and os.environ.get("OPENROUTER_API_KEY"):
             try:
                 quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(
                     ModelRequirements("translation", ("text",)), options.refresh_prices,
                 )
                 settings = LLMSettings.from_environment("openrouter", options.model or quote.model_id)
-                return OpenAICompatibleStoryWriter(settings), {
+                primary = OpenAICompatibleStoryWriter(settings)
+                selection: dict[str, object] = {
                     "provider": "openrouter", "quote": quote.to_dict(),
                     "purpose": "translation", "daily_catalog": True,
                 }
+                if os.environ.get("DEEPSEEK_API_KEY"):
+                    fallback_settings = LLMSettings.from_environment("deepseek", None)
+                    selection["transport_fallback"] = {
+                        "provider": "deepseek", "model": fallback_settings.model,
+                        "reason": "used only after bounded transient transport retries are exhausted",
+                    }
+                    return TransportFallbackStoryWriter(
+                        primary, OpenAICompatibleStoryWriter(fallback_settings),
+                    ), selection
+                return primary, selection
             except Exception as error:
                 fallback_reason = f"OpenRouter translation selection failed: {type(error).__name__}: {error}"
         else:
@@ -1349,6 +2218,54 @@ class VideoFactory:
         return OpenAICompatibleStoryWriter(settings), {
             "provider": selected, "model": settings.model, "purpose": "translation",
             "fallback_reason": fallback_reason,
+        }
+
+    def _youtube_directing_writer(
+        self, options: GenerateOptions,
+    ) -> tuple[OpenAICompatibleStoryWriter, dict[str, object]]:
+        """Select a focused taste critic independently from translation routing."""
+        if os.environ.get("OPENROUTER_API_KEY"):
+            model = os.environ.get(
+                "VIDEO_FACTORY_REVIEW_MODEL", "google/gemini-3.7-flash",
+            ).strip()
+            if model:
+                settings = LLMSettings.from_environment("openrouter", model)
+                return OpenAICompatibleStoryWriter(settings), {
+                    "provider": "openrouter", "model": settings.model,
+                    "purpose": "youtube_directing_taste",
+                    "reason": "independent focused directing pass after clip selection",
+                }
+        selected = "deepseek" if options.provider == "auto" else options.provider
+        settings = LLMSettings.from_environment(selected, options.model)
+        return OpenAICompatibleStoryWriter(settings), {
+            "provider": selected, "model": settings.model,
+            "purpose": "youtube_directing_taste",
+            "reason": "OpenRouter independent review model is unavailable",
+        }
+
+    def _youtube_subtitle_reviewer(
+        self, writer: object, directing_writer: OpenAICompatibleStoryWriter,
+    ) -> tuple[OpenAICompatibleStoryWriter, dict[str, object]]:
+        """Select a Chinese-language caption auditor independently from directing."""
+        writer_settings = getattr(writer, "settings", None)
+        writer_provider = str(getattr(writer_settings, "provider", ""))
+        if os.environ.get("DEEPSEEK_API_KEY") and writer_provider != "deepseek":
+            settings = LLMSettings.from_environment(
+                "deepseek",
+                os.environ.get(
+                    "VIDEO_FACTORY_SUBTITLE_REVIEW_MODEL", "deepseek-chat",
+                ).strip() or "deepseek-chat",
+            )
+            return OpenAICompatibleStoryWriter(settings), {
+                "provider": "deepseek", "model": settings.model,
+                "purpose": "youtube_subtitle_fidelity_and_naturalness",
+                "reason": "independent native-Chinese verdict-only caption audit",
+            }
+        return directing_writer, {
+            "provider": directing_writer.settings.provider,
+            "model": directing_writer.settings.model,
+            "purpose": "youtube_subtitle_fidelity_and_naturalness",
+            "reason": "directing reviewer reused because no independent Chinese reviewer is configured",
         }
 
     @staticmethod

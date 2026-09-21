@@ -5,11 +5,11 @@ from pathlib import Path
 import re
 
 from .models import ContentType, InformationRenderProfile, MaterialRole, RenderManifest
-from .github_editor import compose_github_hook, select_github_focuses, validate_github_brief
+from .github_editor import compose_github_hook, copy_width, select_github_focuses, validate_github_brief
 from .github_editor import normalize_source_text
 from .narrative import requirements_for
 from .safety import review_evidence
-from .editorial import validate_editorial_structure
+from .editorial import is_audience_glossary_definition, validate_editorial_structure
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,10 +299,64 @@ def validate_manifest(manifest: RenderManifest, workspace: Path | None = None) -
             not highlighted or bool((scene.highlight_translation or "").strip()),
             "高亮外文时必须提供对应中文翻译" if highlighted else "本幕无外文高亮要求",
         ))
+        cadence_limit = (
+            12 if scene.visual_family == "source_video" else
+            10 if scene.visual_family in {"tweet", "quoted_post"} else
+            10
+        )
         checks.append(CheckResult(
             f"scene:{scene.id}:visual_cadence",
-            scene.duration <= 5,
-            "视觉变化间隔不超过 5 秒" if scene.duration <= 5 else "镜头超过 5 秒，必须拆分或添加明确视觉变化",
+            scene.duration <= cadence_limit,
+            (
+                f"视觉变化间隔不超过 {cadence_limit} 秒"
+                if scene.duration <= cadence_limit else
+                f"镜头超过 {cadence_limit} 秒，必须拆分或添加明确视觉变化"
+            ),
+        ))
+        if manifest.editorial_brief and scene.visual_family == "source_video":
+            unique_copy = []
+        elif manifest.editorial_brief and scene.visual_family in {"tweet", "quoted_post"}:
+            unique_copy = list(dict.fromkeys(filter(None, (
+                (scene.highlight_translation or "").strip(),
+                (
+                    (scene.screen_interpretation or "").strip()
+                    if is_audience_glossary_definition(scene.screen_interpretation or "") else ""
+                ),
+            ))))
+        elif manifest.editorial_brief and scene.visual_family == "source_image":
+            unique_copy = list(dict.fromkeys(filter(None, (
+                (scene.screen_fact or scene.caption or "").strip(),
+                (scene.screen_interpretation or "").strip(),
+            ))))
+        elif manifest.editorial_brief and scene.visual_family in {
+            "quote_card", "timeline", "impact_card", "stat_card",
+        }:
+            unique_copy = list(dict.fromkeys(filter(None, (
+                (scene.screen_fact or scene.caption or "").strip(),
+                (scene.screen_interpretation or "").strip(),
+                (scene.highlight_translation or "").strip(),
+            ))))
+        elif manifest.editorial_brief:
+            # In a browser scene the page already renders the fact; the only
+            # extra generated copy is its nearby Chinese gloss.
+            unique_copy = list(dict.fromkeys(filter(None, (
+                (scene.highlight_translation or "").strip(),
+            ))))
+        else:
+            unique_copy = list(dict.fromkeys(filter(None, (
+                (scene.caption or "").strip(), (scene.screen_fact or "").strip(),
+                (scene.screen_interpretation or "").strip(),
+                (scene.highlight_translation or "").strip(),
+            ))))
+        reading_rate = copy_width(" ".join(unique_copy)) / max(0.1, scene.duration)
+        checks.append(CheckResult(
+            f"scene:{scene.id}:reading_rate",
+            reading_rate <= 12.0,
+            (
+                f"移动端阅读负载 {reading_rate:.1f}，不超过每秒 12 个中文字宽"
+                if reading_rate <= 12.0 else
+                f"移动端阅读负载 {reading_rate:.1f} 过高；删减/合并文字或延长镜头"
+            ),
         ))
         if scene.material_role in {MaterialRole.PROOF, MaterialRole.EXPLANATION}:
             missing = sorted(set(scene.evidence_ids) - evidence_ids)
@@ -312,12 +366,22 @@ def validate_manifest(manifest: RenderManifest, workspace: Path | None = None) -
                 "证据镜头必须引用已记录证据" if not missing else f"缺失 evidence_ids: {', '.join(missing)}",
             ))
 
-    if manifest.topic_type and manifest.topic_type.value == "github_project":
+    radar_static = (
+        getattr(manifest, "render_profile", "classic") == "radar_v2"
+        and not any(scene.visual_family == "source_video" for scene in manifest.scenes)
+    )
+    if radar_static:
+        bounds = {
+            ContentType.FLASH: (8, 14.8),
+            ContentType.EXPLAINER: (8, 14.8),
+            ContentType.DEEP_DIVE: (15, 20),
+        }
+    elif manifest.topic_type and manifest.topic_type.value == "github_project":
         bounds = {ContentType.FLASH: (12, 15), ContentType.EXPLAINER: (15, 25), ContentType.DEEP_DIVE: (25, 40)}
     else:
         # A dense technical explanation may be complete below 20 seconds.
         # Duration is a ceiling/legibility constraint, not a quota to fill.
-        bounds = {ContentType.FLASH: (8, 15), ContentType.EXPLAINER: (15, 45), ContentType.DEEP_DIVE: (25, 90)}
+        bounds = {ContentType.FLASH: (8, 30), ContentType.EXPLAINER: (15, 45), ContentType.DEEP_DIVE: (25, 90)}
     lower, upper = bounds[manifest.content_type]
     checks.append(CheckResult(
         "duration_band",
@@ -369,8 +433,8 @@ def _quantity_supported(claim: str, evidence_text: str) -> bool:
         claim_dollars = value * claim_scale
         source_amounts: list[float] = []
         currency_patterns = (
-            r"\$\s*([\d,.]+)\s*(billion|million|bn|m)?",
-            r"([\d,.]+)\s*(billion|million|bn|m)?\s*(?:usd|u\.s\. dollars?|dollars?)",
+            r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*(billion|million|bn|m)?",
+            r"(\d[\d,]*(?:\.\d+)?)\s*(billion|million|bn|m)?\s*(?:usd|u\.s\. dollars?|dollars?)",
         )
         source_scales = {"billion": 1_000_000_000, "bn": 1_000_000_000, "million": 1_000_000, "m": 1_000_000}
         for pattern in currency_patterns:
@@ -423,6 +487,16 @@ def _quantity_supported(claim: str, evidence_text: str) -> bool:
     units = next((pattern for markers, pattern in unit_groups if any(marker in claim for marker in markers)), None)
     if not units:
         return False
+    source_values = [
+        float(item.replace(",", ""))
+        for item in re.findall(
+            rf"(?<!\d)(\d[\d,]*(?:\.\d+)?)\s*(?:{units})",
+            evidence_text,
+            re.IGNORECASE,
+        )
+    ]
+    if any(abs(item - value) <= max(1.0, abs(value)) * 1e-9 for item in source_values):
+        return True
     variants = {f"{value:g}"}
     if value.is_integer():
         integer = int(value)

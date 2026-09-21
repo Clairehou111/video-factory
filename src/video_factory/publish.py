@@ -153,6 +153,76 @@ PLATFORM_OPTION_NAMES: dict[PublishPlatform, set[str]] = {
 FILE_OPTION_NAMES = {"thumbnail", "thumbnail_landscape", "thumbnail_portrait"}
 
 
+def wechat_feed_title(value: str, maximum: int = 30) -> str:
+    """Fit a WeChat publish title by meaning boundaries, never character slicing."""
+    compact = re.sub(r"\s+", " ", value).strip().rstrip("。.!！")
+    if len(compact) <= maximum:
+        return compact
+    clauses = [
+        row.strip().rstrip("，、：；,;: ")
+        for row in re.split(r"[，：；。！？,;:!?—]+", compact)
+        if row.strip()
+    ]
+    dangling_end = re.compile(r"(?:关|进|收|装|学|存|把|与|和|的|在|为|到|从)$")
+    complete = [
+        row for row in clauses
+        if 7 <= len(row) <= maximum and not dangling_end.search(row)
+    ]
+    if complete:
+        def information_score(row: str) -> tuple[int, int]:
+            named = len(re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,}", row))
+            numeric = len(re.findall(r"\d+(?:\.\d+)?%?", row))
+            return named * 5 + numeric * 4, len(row)
+
+        selected = max(complete, key=information_score)
+        return selected + ("？" if compact.endswith(("?", "？")) and len(selected) < maximum else "")
+    names = re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,12}", compact)
+    action = re.search(
+        r"(?:发布|推出|宣布|装进|用于|开源|收购|加入|进入|拒绝|支持|完成)[^，：；。！？,;:!?—]{2,14}",
+        compact,
+    )
+    if names and action:
+        fallback = f"{names[0]}：{action.group(0)}"
+        if len(fallback) <= maximum:
+            return fallback
+    if len(names) >= 2:
+        fallback = f"{names[0]}与{names[1]}发生了什么？"
+    elif names:
+        fallback = f"{names[0]}这次改变了什么？"
+    else:
+        fallback = "这条技术快报发生了什么？"
+    return fallback if len(fallback) <= maximum else "今天的技术变化是什么？"
+
+
+def wechat_short_title(value: str) -> str:
+    """Return a complete 7–15 character WeChat short title, never a raw slice."""
+    compact = re.sub(r"\s+", " ", value).strip().rstrip("。.!！")
+    allowed_special_chars = "《》“”:+?%°：？"
+    compact = "".join(
+        char if char.isalnum() or char in allowed_special_chars else " "
+        if char in ",，、；;" else ""
+        for char in compact
+    )
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if 7 <= len(compact) <= 15:
+        return compact
+    clauses = [
+        row.strip().rstrip("，、：；,;: ")
+        for row in re.split(r"[，、：；。！？,;:!?]+", value)
+        if row.strip()
+    ]
+    for row in clauses:
+        cleaned = re.sub(r"[^\w\u3400-\u9fff《》“”+?%°-]", "", row)
+        if 7 <= len(cleaned) <= 15:
+            return cleaned
+    latin_name = re.search(r"[A-Za-z][A-Za-z0-9.+-]{1,10}", value)
+    if latin_name:
+        candidate = f"{latin_name.group(0)}关键变化"
+        if 7 <= len(candidate) <= 15:
+            return candidate
+    return "今天这条技术快报"
+
+
 @dataclass(slots=True)
 class PublishTarget:
     platform: PublishPlatform
@@ -175,6 +245,10 @@ class PublishTarget:
         for name in FILE_OPTION_NAMES & set(self.options):
             if isinstance(self.options[name], Path):
                 self.options[name] = str(self.options[name])
+        if self.platform == PublishPlatform.TENCENT:
+            self.options["short_title"] = wechat_short_title(
+                str(self.options.get("short_title") or self.title)
+            )
         self.validate()
 
     def validate(self) -> None:
@@ -237,6 +311,9 @@ class PublishBatch:
     approval_digest: str | None = None
     approved_by: str | None = None
     approved_at: str | None = None
+    queue_hidden: bool = False
+    queue_hidden_reason: str = ""
+    queue_hidden_at: str = ""
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
 
@@ -266,6 +343,14 @@ class PublishBatch:
             "targets": [target.approval_payload() for target in self.targets],
             "review_overrides": self.review_overrides,
         }
+
+    def withdraw_from_queue(self, reason: str) -> None:
+        if not reason.strip():
+            raise ValueError("queue withdrawal requires a reason")
+        self.queue_hidden = True
+        self.queue_hidden_reason = reason.strip()
+        self.queue_hidden_at = now_iso()
+        self.updated_at = now_iso()
 
     def compute_approval_digest(self) -> str:
         encoded = json.dumps(self.approval_payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -787,6 +872,19 @@ def create_publish_batch(
     workspace: Path | None = None,
     backend_commit: str = SOCIAL_AUTO_UPLOAD_COMMIT,
 ) -> PublishBatch:
+    direct_youtube_source = any(
+        "youtube.com/" in value.casefold() or "youtu.be/" in value.casefold()
+        for value in manifest.source_urls
+    )
+    for target in targets:
+        if (
+            target.platform == PublishPlatform.TENCENT
+            and not direct_youtube_source
+            and not target.options.get("category")
+        ):
+            # A fully composed editorial video may claim its own audiovisual
+            # expression. Direct third-party source footage may not.
+            target.options["category"] = "科技"
     checks = validate_manifest(manifest, workspace)
     video_path = Path(manifest.video_path or "")
     if manifest.video_path and workspace is not None and not video_path.is_absolute():
@@ -979,7 +1077,7 @@ def _final_video_checks(path: Path, content_type: ContentType) -> list[CheckResu
     try:
         probe = probe_video(path)
         raw_checks = validate_wechat_mp4(
-            probe, max_duration=15 if content_type == ContentType.FLASH else None,
+            probe, max_duration=30 if content_type == ContentType.FLASH else None,
             require_audio=True,
         )
     except Exception as error:
@@ -992,7 +1090,24 @@ def _final_video_checks(path: Path, content_type: ContentType) -> list[CheckResu
 
 
 def _redact_output(value: str, runtime_home: Path) -> str:
-    return _redact_secret_values(value.replace(str(runtime_home), "<sau-runtime>"))[-4000:]
+    cleaned = _strip_terminal_control(value.replace(str(runtime_home), "<sau-runtime>"))
+    return _redact_secret_values(cleaned)[-4000:]
+
+
+def account_auth_required(value: str | None) -> bool:
+    """Return whether a safe pre-submit failure requires interactive login."""
+    evidence = _strip_terminal_control(value or "").casefold()
+    markers = (
+        "cookie is missing or expired", "account file is missing",
+        "cookie文件不存在", "cookie文件已失效", "cookie 失效",
+        "cookie 已失效", "跳转到登录页", "得重新登录",
+    )
+    return any(marker in evidence for marker in markers)
+
+
+def publisher_error_text(value: str | None) -> str:
+    """Return a terminal-control-free, secret-redacted dashboard message."""
+    return _redact_secret_values(_strip_terminal_control(value or "")).strip()[-1000:]
 
 
 def _is_definitive_pre_submit_failure(arguments: list[str], stdout: str, stderr: str) -> bool:
@@ -1019,6 +1134,10 @@ def _redact_secret_values(value: str) -> str:
     )
 
 
+def _strip_terminal_control(value: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+
+
 def _timeout_text(value: str | bytes | None) -> str:
     if value is None:
         return ""
@@ -1026,7 +1145,7 @@ def _timeout_text(value: str | bytes | None) -> str:
 
 
 def _result_error(result: BackendResult, fallback: str) -> str:
-    detail = (result.stderr or result.stdout).strip()
+    detail = _strip_terminal_control(result.stderr or result.stdout).strip()
     return detail[-1000:] if detail else fallback
 
 
@@ -1128,10 +1247,18 @@ def _apply_upstream_compatibility_patches(source: Path) -> list[str]:
                 "        # Avoid a third browser-only cookie probe; open_upload_page verifies login before file selection.\n"
             )
             patched = patched.replace(duplicate_base_check, real_page_check, 1)
-        original_statement_marker = "Video Factory requires a verified WeChat original-content declaration."
+        original_statement_marker = "Video Factory applies its source-aware WeChat originality policy."
         original_statement = (
             "    async def apply_original_statement(self, page: Page) -> None:\n"
             f"        # {original_statement_marker}\n"
+            "        # category is deliberately present only for videos whose audiovisual expression is our own.\n"
+            "        # Direct third-party footage (including YouTube interview clips) must remain undeclared.\n"
+            "        if not self.category:\n"
+            "            main_checkbox = page.locator('.declare-original-checkbox input.ant-checkbox-input').first\n"
+            "            if await main_checkbox.count() and await main_checkbox.is_checked():\n"
+            "                await main_checkbox.click(force=True)\n"
+            "            tencent_logger.info(_msg(\"🧾\", \"包含第三方源视频，未勾选原创声明\"))\n"
+            "            return\n"
             "        text = page.get_by_text(\"声明原创\", exact=True).first\n"
             "        await text.wait_for(state=\"visible\", timeout=10000)\n"
             "        main_checkbox = page.locator('.declare-original-checkbox input.ant-checkbox-input').first\n"

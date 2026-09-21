@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shutil
 import sys
 from dataclasses import replace
@@ -43,6 +45,11 @@ from .automation import (
     PipelinePublishConfig, is_pipeline_lock_collision, pipeline_lock,
 )
 from .dashboard import serve_dashboard
+from .observability import Observability
+from .self_audit import ProblemLedger, ProblemObservation, SelfAuditService, load_active_policy
+from .self_audit_runtime import (
+    OpenRouterGeminiAuditModel, RepositoryCandidateVerifier, ReviewBranchExecutor,
+)
 
 
 def _workspace(path: str) -> Workspace:
@@ -208,11 +215,41 @@ def main() -> None:
     )
     automation_status.add_argument("--run", help="discovery run id；默认读取 latest")
     automation_status.add_argument("--notify", action="store_true", help="重发这次审计的 macOS 通知")
+    problem_note = subcommands.add_parser(
+        "problem-note", help="记录一个供夜间异步审计的问题，不触发模型或修复",
+    )
+    problem_note.add_argument("--stage", required=True)
+    problem_note.add_argument("--category", required=True)
+    problem_note.add_argument("--expected", required=True)
+    problem_note.add_argument("--observed", required=True)
+    problem_note.add_argument("--severity", choices=["low", "medium", "high", "critical"], default="medium")
+    problem_note.add_argument("--reporter", default="human")
+    problem_note.add_argument("--job")
+    problem_note.add_argument("--manifest-id", default="")
+    problem_note.add_argument("--artifact", action="append", default=[])
+    problem_note.add_argument("--timecode", default="")
+    self_audit_command = subcommands.add_parser(
+        "self-audit", help="异步审计已记录问题；不会发现资源、登录或发布",
+    )
+    self_audit_actions = self_audit_command.add_subparsers(dest="self_audit_action", required=True)
+    self_audit_run = self_audit_actions.add_parser("run", help="运行一次有界夜间审计")
+    self_audit_run.add_argument("--max-issues", type=int, default=5)
+    self_audit_run.add_argument("--max-cost-usd", type=float, default=1.0)
+    self_audit_run.add_argument("--model", default=None)
+    self_audit_run.add_argument(
+        "--allow-policy-promotion", action="store_true",
+        help="校准完成后允许通过全部门禁的运行时 policy 原子生效",
+    )
+    self_audit_actions.add_parser("status", help="查看问题聚类、退避与修复状态")
+    self_audit_replay = self_audit_actions.add_parser("replay", help="只读取归档物料生成复现包")
+    self_audit_replay.add_argument("problem")
+    self_audit_rollback = self_audit_actions.add_parser("rollback", help="回滚到一个已有 policy 版本")
+    self_audit_rollback.add_argument("version")
     dashboard = subcommands.add_parser("dashboard", help="启动本地成片审核与逐条发布 Dashboard")
     dashboard.add_argument("--host", default="127.0.0.1", help="仅允许 loopback 地址")
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--actor", default="claire", help="写入审批记录的审核人")
-    discover_youtube = subcommands.add_parser("discover-youtube", help="按 48 小时节奏发现并最多生产一个高价值 YouTube 源视频")
+    discover_youtube = subcommands.add_parser("discover-youtube", help="按 2 小时节奏发现并最多生产一个高价值 YouTube 源视频")
     discover_youtube.add_argument("--config", help="YouTube 搜索池和质量门配置 JSON")
     discover_youtube.add_argument("--force", action="store_true", help="忽略 next_run_at，立即执行一次搜索")
     discover_youtube.add_argument("--select-only", action="store_true", help="只选择并记录候选，不启动生成")
@@ -248,6 +285,10 @@ def main() -> None:
     )
     generate.add_argument("--youtube-media", help="YouTube web 媒体不可取时，显式提供已获准使用的本地源视频")
     generate.add_argument(
+        "--source-video-url",
+        help="官方新闻视频 URL；Flash 自动选择一段连续动作镜头并保留网页录屏回退",
+    )
+    generate.add_argument(
         "--youtube-subtitles",
         help="显式提供本地 YouTube json3 时间轴字幕，避免再次下载字幕",
     )
@@ -261,8 +302,16 @@ def main() -> None:
         default="auto",
         help="覆盖 YouTube 自动分类；正常自动工厂保持 auto",
     )
+    generate.add_argument(
+        "--youtube-editorial-guidance",
+        help="YouTube Ask 或人工编辑给出的可审计选片建议；仅作选题导航，不作为事实证据",
+    )
     rerender = subcommands.add_parser("rerender", help="复用现有内容清单，只重试确定性录屏、合成和验收")
     rerender.add_argument("manifest")
+    rerender.add_argument(
+        "--source-video-url",
+        help="在不改写故事的前提下注入官方视频并自动选择连续动作片段",
+    )
     args = parser.parse_args()
     workspace = _workspace(args.workspace)
 
@@ -332,6 +381,103 @@ def main() -> None:
         if args.notify:
             auditor.notify(report, force=True)
         print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.command == "problem-note":
+        artifact_refs = list(args.artifact)
+        hashes: dict[str, str] = {}
+        manifest_id = args.manifest_id
+        if args.job:
+            job = workspace.root / "jobs" / args.job
+            result_path = job / "result.json"
+            if result_path.is_file():
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                artifact_refs.append(str(result_path.relative_to(workspace.root)))
+                for label, key in (("manifest", "manifest"), ("video", "video")):
+                    value = result.get(key)
+                    if not value:
+                        continue
+                    path = Path(str(value)).resolve()
+                    try:
+                        relative = path.relative_to(workspace.root)
+                    except ValueError:
+                        continue
+                    if path.is_file():
+                        artifact_refs.append(str(relative))
+                        hashes[f"{label}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                if not manifest_id and result.get("manifest"):
+                    try:
+                        manifest_id = load_manifest(Path(str(result["manifest"]))).id
+                    except Exception:
+                        manifest_id = ""
+        normalized_refs: list[str] = []
+        for value in artifact_refs:
+            path = Path(value)
+            if not path.is_absolute():
+                path = workspace.root / path
+            resolved = path.resolve()
+            try:
+                relative = resolved.relative_to(workspace.root)
+            except ValueError as error:
+                raise ValueError("problem artifacts must remain inside the workspace") from error
+            if not resolved.is_file():
+                raise FileNotFoundError(value)
+            normalized_refs.append(str(relative))
+            hashes.setdefault(f"artifact_{len(normalized_refs)}_sha256", hashlib.sha256(resolved.read_bytes()).hexdigest())
+        policy = load_active_policy(workspace)
+        row = ProblemLedger(workspace).record(ProblemObservation(
+            stage=args.stage, category=args.category,
+            expected=args.expected, observed=args.observed,
+            severity=args.severity, reporter=args.reporter,
+            job_id=args.job or "", manifest_id=manifest_id,
+            artifact_refs=list(dict.fromkeys(normalized_refs)), timecode=args.timecode,
+            hashes=hashes,
+            metadata={
+                "prompt_policy_version": policy.get("version"),
+                "prompt_policy_digest": policy.get("digest"),
+            },
+        ))
+        print(json.dumps(row, ensure_ascii=False, indent=2))
+    elif args.command == "self-audit":
+        ledger = ProblemLedger(workspace)
+        if args.self_audit_action == "status":
+            print(json.dumps(ledger.status(), ensure_ascii=False, indent=2))
+        elif args.self_audit_action == "replay":
+            print(json.dumps(ledger.reproduction_bundle(args.problem), ensure_ascii=False, indent=2))
+        elif args.self_audit_action == "rollback":
+            class _UnusedModel:
+                def estimate_cost(self, problem):
+                    return 0.0
+                def propose(self, problem, archive, budget_remaining_usd):
+                    return {"kind": "diagnosis"}
+            result = SelfAuditService(workspace, _UnusedModel()).rollback(args.version)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            ledger.import_legacy()
+            model_id = args.model or os.environ.get(
+                "VIDEO_FACTORY_AUDITOR_MODEL", "google/gemini-3.7-flash",
+            )
+            writer = OpenAICompatibleStoryWriter(
+                LLMSettings.from_environment("openrouter", model_id),
+            )
+            repo_root = Path(__file__).resolve().parents[2]
+            observability = Observability(
+                workspace.root, project_name="video-factory-self-audit",
+            )
+            service = SelfAuditService(
+                workspace,
+                OpenRouterGeminiAuditModel(writer, repo_root),
+                verifier=RepositoryCandidateVerifier(repo_root),
+                phoenix=observability,
+                code_executor=ReviewBranchExecutor(repo_root, workspace.root),
+                max_issues=args.max_issues, max_cost_usd=args.max_cost_usd,
+                shadow_only=not (
+                    args.allow_policy_promotion
+                    or os.environ.get("VIDEO_FACTORY_SELF_AUDIT_PROMOTION", "").lower()
+                    in {"1", "true", "yes", "on"}
+                ),
+            )
+            with pipeline_lock(workspace.root):
+                report = service.run()
+            print(json.dumps(report, ensure_ascii=False, indent=2))
     elif args.command == "discover-youtube":
         config = DiscoveryConfig.from_path(Path(args.config).resolve() if args.config else None)
         if args.select_only or args.no_render:
@@ -394,11 +540,15 @@ def main() -> None:
             youtube_subtitles=args.youtube_subtitles,
             youtube_translation_plan=args.youtube_translation_plan,
             youtube_editorial_mode=args.youtube_editorial_mode,
+            youtube_editorial_guidance=args.youtube_editorial_guidance,
+            source_video_url=args.source_video_url,
             render_profile=args.render_profile,
         ))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "rerender":
-        result = VideoFactory(workspace).rerender(Path(args.manifest))
+        result = VideoFactory(workspace).rerender(
+            Path(args.manifest), source_video_url=args.source_video_url,
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "archive-asset":
         path, digest = workspace.archive_asset(Path(args.file), args.category, args.name)

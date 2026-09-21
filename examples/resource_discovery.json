@@ -4,6 +4,13 @@
   "blocked_retry_delay_hours": 6,
   "max_blocked_retry_runs": 2,
   "event_dedupe_days": 30,
+  "adoption_policy": {
+    "general_minimum_score": 75,
+    "high_standard_minimum_score": 82,
+    "youtube_minimum_score": 80,
+    "minimum_audience_consequence": 12,
+    "llm_priority_bonus": 6
+  },
   "channels": {
     "x": {
       "cadence_hours": 2,
@@ -17,7 +24,10 @@
       ],
       "queries": [
         "AI (agent OR SDK OR API OR model OR benchmark OR funding OR launch)",
-        "(open source OR paper OR product) AI"
+        "(new AI model OR new model OR model release) (API OR developers OR early access)",
+        "(open source OR paper OR product) AI",
+        "(fastest-growing OR viral OR million users OR ARR OR unicorn) (AI product OR startup)",
+        "(robotics OR humanoid OR physical AI OR robotaxi OR autonomous driving) (launch OR demo OR deploy)"
       ]
     },
     "github": {
@@ -29,24 +39,99 @@
       "queries": [
         "AI agent created:>{date}",
         "LLM tool created:>{date}",
-        "agent SDK created:>{date}"
+        "agent SDK created:>{date}",
+        "AI app demo created:>{date}",
+        "robotics created:>{date}",
+        "autonomous driving created:>{date}"
+      ]
+    },
+    "projects": {
+      "cadence_hours": 4,
+      "lookback_hours": 24,
+      "minimum_score": 70,
+      "max_candidates": 24,
+      "probe_limit": 10,
+      "seed_domains": [
+        "reuters.com", "bloomberg.com", "ft.com", "techcrunch.com",
+        "sifted.eu", "forbes.com", "cnbc.com", "venturebeat.com"
+      ],
+      "feeds": [
+        "https://techcrunch.com/category/startups/feed/",
+        "https://sifted.eu/feed"
+      ],
+      "queries": [
+        "breakout AI startup fastest-growing product users revenue",
+        "AI startup (ARR OR million users OR unicorn OR viral growth)",
+        "AI product startup major funding adoption launch"
+      ]
+    },
+    "robotics": {
+      "cadence_hours": 4,
+      "lookback_hours": 168,
+      "minimum_score": 70,
+      "max_candidates": 24,
+      "probe_limit": 10,
+      "seed_domains": [
+        "therobotreport.com", "spectrum.ieee.org", "robohub.org", "techcrunch.com",
+        "reuters.com", "electrek.co", "autonomousvehicleinternational.com",
+        "waymo.com", "bostondynamics.com", "figure.ai", "agilityrobotics.com",
+        "1x.tech", "physicalintelligence.company", "skild.ai", "fieldai.com",
+        "apptronik.com", "unitree.com", "sunday.ai", "robocup.org", "aihub.org",
+        "zoox.com", "nuro.ai", "tesla.com"
+      ],
+      "feeds": [
+        "https://www.therobotreport.com/feed/",
+        "https://spectrum.ieee.org/feeds/topic/robotics.rss",
+        "https://robohub.org/feed/",
+        "https://waymo.com/blog/rss.xml",
+        "https://electrek.co/guides/autonomous-driving/feed/",
+        "https://www.autonomousvehicleinternational.com/feed/"
+      ],
+      "queries": [
+        "(robotics OR humanoid robot OR physical AI) (first ever OR record OR autonomous OR uncut demo OR deployed OR ships)",
+        "robot (home OR school OR hospital OR warehouse OR farm OR delivery) (autonomous OR trial OR deployed OR demo)"
+      ]
+    },
+    "autonomous_driving": {
+      "cadence_hours": 4,
+      "lookback_hours": 168,
+      "minimum_score": 70,
+      "max_candidates": 20,
+      "probe_limit": 8,
+      "seed_domains": [
+        "waymo.com", "zoox.com", "nuro.ai", "tesla.com", "electrek.co",
+        "autonomousvehicleinternational.com", "reuters.com", "techcrunch.com",
+        "kodiak.ai", "aurora.tech", "maymobility.com"
+      ],
+      "feeds": [
+        "https://waymo.com/blog/rss.xml",
+        "https://electrek.co/guides/autonomous-driving/feed/",
+        "https://www.autonomousvehicleinternational.com/feed/"
+      ],
+      "queries": [
+        "(robotaxi OR autonomous driving) (launch OR highway OR airport OR million miles OR without safety driver)",
+        "self-driving car engineering safety field test deployment"
       ]
     },
     "news": {
       "cadence_hours": 2,
-      "lookback_hours": 12,
+      "lookback_hours": 24,
       "minimum_score": 70,
       "max_candidates": 20,
       "probe_limit": 8,
       "seed_domains": [
         "reuters.com", "bloomberg.com", "ft.com", "techcrunch.com",
         "theverge.com", "wired.com", "arstechnica.com", "axios.com",
-        "nytimes.com"
+        "nytimes.com", "theinformation.com",
+        "tomshardware.com", "9to5mac.com"
       ],
+      "feeds": [],
       "queries": [
         "AI model launch OR agent API",
+        "new AI model (developers OR API OR early access OR benchmark)",
         "AI startup funding OR founding team",
-        "AI research benchmark"
+        "AI research benchmark",
+        "(OpenAI OR Anthropic OR Google OR Meta OR xAI) (Mac OR GPU OR chip OR compute OR data center) (buy OR rent OR shortage OR training OR inference)"
       ]
     },
     "news_zh": {
@@ -67,14 +152,14 @@
     },
     "official": {
       "cadence_hours": 2,
-      "lookback_hours": 12,
+      "lookback_hours": 48,
       "minimum_score": 70,
       "max_candidates": 20,
       "probe_limit": 8,
       "seed_domains": [
         "openai.com", "anthropic.com", "deepmind.google", "ai.google",
         "meta.com", "microsoft.com", "x.ai", "mistral.ai", "cohere.com",
-        "nvidia.com", "aws.amazon.com", "huggingface.co"
+        "nvidia.com", "aws.amazon.com", "huggingface.co", "typesafe.ai"
       ],
       "feeds": [
         "https://openai.com/news/rss.xml",
@@ -116,11 +201,13 @@
       "probe_limit": 10,
       "queries": [
         "all:\"AI agent\"",
-        "all:\"large language model\" AND (all:benchmark OR all:reasoning)"
+        "all:\"large language model\" AND (all:benchmark OR all:reasoning)",
+        "all:\"embodied AI\" OR all:\"robot learning\"",
+        "all:\"autonomous driving\" AND (all:benchmark OR all:deployment)"
       ]
     },
     "youtube": {
-      "cadence_hours": 48,
+      "cadence_hours": 2,
       "lookback_hours": 720,
       "minimum_score": 70,
       "max_candidates": 20,
@@ -129,7 +216,16 @@
         "minimum_duration_seconds": 900,
         "maximum_duration_seconds": 7200,
         "results_per_query": 8,
-        "metadata_probe_limit": 10
+        "metadata_probe_limit": 10,
+        "minimum_audience_score": 12,
+        "channel_sources": {
+          "all_in": ["https://www.youtube.com/channel/UCESLZhusAkFfsNsApnjF_Cg"],
+          "sequoia": ["https://www.youtube.com/channel/UCWrF0oN6unbXrWsTN7RctTw"],
+          "a16z": ["https://www.youtube.com/channel/UC9cn0TuPq4dnbTY-CBsm8XA"],
+          "lightspeed": ["https://www.youtube.com/channel/UCwBTFE_6Bsb_EtmXlW2aTlg"],
+          "mad_podcast": ["https://www.youtube.com/channel/UCQID78IY6EOojr5RUdD47MQ"],
+          "saastr": ["https://www.youtube.com/channel/UCwOILzAcxK5CM2M7oRBuWSg"]
+        }
       }
     },
     "openrouter": {

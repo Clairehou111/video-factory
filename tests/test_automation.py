@@ -104,6 +104,10 @@ class AutomationTest(unittest.TestCase):
             self.assertAlmostEqual(audit["llm_usage"]["accounted_cost_usd"], 0.0002)
             self.assertEqual(audit["problems"][0]["status"], "resolved_automatically")
             self.assertTrue((root / "automation" / "latest.md").is_file())
+            self.assertEqual(len(audit["self_audit_observations"]), 1)
+            self.assertTrue(
+                (root / "automation" / "self-audit" / "observations.jsonl").is_file()
+            )
 
     def test_notification_never_changes_publish_state(self) -> None:
         with TemporaryDirectory() as temp:
@@ -169,6 +173,51 @@ class AutomationTest(unittest.TestCase):
             self.assertEqual([target.platform for target in targets], [PublishPlatform.TENCENT])
             self.assertEqual(prepared[0].platforms, ["tencent"])
             self.assertTrue(prepared[0].created)
+
+    def test_every_generated_selection_gets_its_own_publish_batch(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = FakeWorkspace(Path(temp))
+            candidates = [
+                DiscoveryCandidate(
+                    id=f"news-{index}", channel=DiscoveryChannel.NEWS,
+                    url=f"https://example.com/{index}", title=f"Story {index}",
+                    publisher="Example", topic_type=TopicType.MODEL_OR_PRODUCT,
+                )
+                for index in (1, 2)
+            ]
+            adoptions = [
+                {"status": "generated", "result": {"manifest": f"/tmp/manifest-{index}.json"}}
+                for index in (1, 2)
+            ]
+            run = ResourceDiscoveryRun("run-1", "completed", NOW.isoformat(), channels={
+                "news": ChannelRun(
+                    DiscoveryChannel.NEWS, "generated",
+                    selected=candidates[0], adoption=adoptions[0],
+                    selections=candidates, adoptions=adoptions,
+                ),
+            })
+            manifests = [
+                SimpleNamespace(
+                    id=f"manifest-{index}", fixed_title=f"标题 {index}", fixed_hook="",
+                    topic_type=TopicType.MODEL_OR_PRODUCT,
+                )
+                for index in (1, 2)
+            ]
+            created = [
+                SimpleNamespace(id=f"publish-{index}", state=PublishBatchState.READY_FOR_REVIEW)
+                for index in (1, 2)
+            ]
+            with patch(
+                "video_factory.automation.load_manifest", side_effect=manifests,
+            ), patch(
+                "video_factory.automation.create_publish_batch", side_effect=created,
+            ):
+                prepared = DiscoveryPublishBridge(
+                    workspace, PipelinePublishConfig(),
+                ).prepare(run)
+
+            self.assertEqual([item.candidate_id for item in prepared], ["news-1", "news-2"])
+            self.assertEqual(len(workspace.saved), 2)
 
     def test_technical_youtube_generation_routes_only_to_wechat_while_bilibili_paused(self) -> None:
         with TemporaryDirectory() as temp:

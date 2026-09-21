@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .models import RenderManifest, TopicType
+from .publish import wechat_feed_title
 
 
 FACTUAL_CATEGORY_LABELS = {
@@ -230,15 +231,7 @@ def build_tencent_radar_copy(
 ) -> tuple[str, str]:
     """Build factual external packaging; callers may still override it."""
     hook = (manifest.fixed_title or manifest.fixed_hook or fallback_title).strip()
-    title = hook
-    if len(title) > 30:
-        title = title[:30]
-        # Never leave half of an adjacent ASCII model/project token at the
-        # platform boundary. A shorter complete title is preferable.
-        if len(hook) > 30 and title[-1].isascii() and hook[30:31] and hook[30].isascii():
-            boundary = max(title.rfind(mark) for mark in (" ", "｜", "：", ":", "，"))
-            if boundary >= 12:
-                title = title[:boundary].rstrip()
+    title = wechat_feed_title(hook)
     conclusion = (manifest.fixed_footer or "").strip()
     identifier = extract_direct_identifier(manifest)
     rows = [value for value in (conclusion, identifier) if value]

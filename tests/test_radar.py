@@ -16,8 +16,8 @@ from video_factory.compositor import (
     render_spotlight_overlay,
 )
 from video_factory.editorial import (
-    _radar_shot_copy_budget, _validate_radar_contract, canonicalize_editorial_brief,
-    validate_editorial_structure,
+    _hook_retention_score, _radar_shot_copy_budget, _validate_radar_contract, apply_readable_radar_timing, canonicalize_editorial_brief,
+    enforce_flash_time_budget, validate_editorial_structure, visible_reading_rate,
 )
 from video_factory.github_editor import copy_width
 from video_factory.models import (
@@ -94,6 +94,23 @@ class RadarV2Test(unittest.TestCase):
         check = next(item for item in validate_manifest(manifest) if item.name == "render_profile")
         self.assertFalse(check.passed)
 
+    def test_static_radar_duration_gate_is_strictly_below_fifteen_seconds(self) -> None:
+        manifest = _manifest(InformationRenderProfile.RADAR_V2.value)
+        manifest.scenes[0].end = 15.0
+
+        check = next(item for item in validate_manifest(manifest) if item.name == "duration_band")
+
+        self.assertFalse(check.passed)
+
+    def test_source_video_radar_uses_the_case_specific_motion_duration_band(self) -> None:
+        manifest = _manifest(InformationRenderProfile.RADAR_V2.value)
+        manifest.scenes[0].end = 20.0
+        manifest.scenes[0].visual_family = "source_video"
+
+        check = next(item for item in validate_manifest(manifest) if item.name == "duration_band")
+
+        self.assertTrue(check.passed)
+
     def test_radar_contract_uses_direct_fact_without_forcing_shock(self) -> None:
         brief = _brief()
         evidence = [_manifest().evidence[0]]
@@ -112,24 +129,72 @@ class RadarV2Test(unittest.TestCase):
             "GLM-5.3-Flash 的第三个候选标题也不能突破手机画面预算",
         ]
         brief.attention_strategy.selected_hook = "不在候选列表里的标题"
-        brief.fixed_conclusion = "开发者现在可以下载模型权重并在本地进行红蓝对抗和安全测试验证完整工作流"
+        brief.fixed_conclusion = (
+            "开发者现在可以下载模型权重并在本地进行红蓝对抗和安全测试，"
+            "再把完整工作流、运行边界、测试结果和部署要求一次写清楚"
+        )
         brief.evidence_shots[0].narrative_beat = "shock"
-        brief.evidence_shots[0].fact = "GLM-5.3-Flash 发布了非常长的事实描述并且继续堆叠不必要的解释"
-        brief.evidence_shots[0].audience_copy = "这段附加说明也远远超过单屏预算"
-        brief.evidence_shots[0].full_translation = "模型发布说明" * 20
+        brief.evidence_shots[0].fact = "GLM-5.3-Flash 发布了非常长的事实描述并且继续堆叠不必要的解释" * 3
+        brief.evidence_shots[0].audience_copy = "这段附加说明也远远超过单屏预算" * 3
+        brief.evidence_shots[0].full_translation = "模型发布说明" * 30
         canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
         self.assertEqual(brief.category_label, "")
         self.assertIn(brief.attention_strategy.selected_hook, brief.attention_strategy.hook_candidates)
-        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 28)
-        self.assertLessEqual(copy_width(brief.fixed_conclusion), 40)
+        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 36)
+        self.assertGreater(copy_width(brief.fixed_conclusion), 40)
 
         first = brief.evidence_shots[0]
-        self.assertLessEqual(
-            copy_width(first.fact + first.audience_copy),
-            _radar_shot_copy_budget(first.duration),
+        self.assertIn("不必要的解释", first.fact)
+        self.assertIn("超过单屏预算", first.audience_copy)
+        self.assertLessEqual(_radar_shot_copy_budget(first.duration), 96)
+        self.assertGreater(copy_width(brief.evidence_shots[0].full_translation), 120)
+        errors = _validate_radar_contract(brief, [_manifest().evidence[0]])
+        self.assertTrue(any("screen budget" in error or "must fit" in error for error in errors))
+
+    def test_radar_canonicalizer_preserves_complete_overlong_sentences_for_repair(self) -> None:
+        brief = _brief()
+        complete_fact = (
+            "评估279篇医疗智能体论文发现，84.6%缺少运行时架构，"
+            "82.8%缺少治理与安全报告"
         )
-        self.assertLessEqual(_radar_shot_copy_budget(first.duration), 64)
-        self.assertLessEqual(copy_width(brief.evidence_shots[0].full_translation), 120)
+        complete_audience = "这些论文很少写清系统怎么配置、有没有人工审核、出错了怎么处理"
+        brief.headline = "医疗AI智能体论文的报告缺口"
+        brief.attention_strategy.hook_candidates = [
+            "279篇医疗AI智能体论文缺什么",
+            "医疗AI智能体的运行时架构没写清",
+            "AGENT-O检查医疗AI报告完整度",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        brief.evidence_shots = brief.evidence_shots[:1]
+        brief.evidence_shots[0].kind = EvidenceShotKind.BROWSER_SECTION
+        brief.evidence_shots[0].fact = complete_fact
+        brief.evidence_shots[0].audience_copy = complete_audience
+        brief.evidence_shots[0].translation = ""
+        brief.evidence_shots[0].full_translation = ""
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(brief.evidence_shots[0].fact, complete_fact)
+        self.assertEqual(brief.evidence_shots[0].audience_copy, complete_audience)
+        self.assertFalse(brief.evidence_shots[0].fact.endswith("报"))
+
+    def test_radar_hook_uses_dynamic_upper_rail_instead_of_semantic_clipping(self) -> None:
+        brief = _brief()
+        brief.attention_strategy.hook_candidates = [
+            "一个没有具体主体名称而且明显超过普通首屏预算的泛化技术更新标题",
+            "另一个同样没有模型名字而且超过普通首屏预算的候选标题",
+            "第三个没有具体主体名称的长候选标题也不能获得例外预算",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertGreater(copy_width(brief.attention_strategy.selected_hook), 28)
+        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 64)
+        self.assertEqual(
+            brief.attention_strategy.selected_hook,
+            "一个没有具体主体名称而且明显超过普通首屏预算的泛化技术更新标题",
+        )
         self.assertFalse(any(
             "Chinese gloss" in error for error in _validate_radar_contract(
                 brief, [_manifest().evidence[0]],
@@ -259,6 +324,96 @@ class RadarV2Test(unittest.TestCase):
         )
         self.assertFalse(brief.attention_strategy.selected_hook.endswith(("到", "让", "用")))
 
+    def test_radar_hook_preserves_complete_eyebrow_angle_instead_of_clipping(self) -> None:
+        brief = _brief()
+        complete = "梅奥诊所评估279篇医疗AI论文：84.6%说不清自己的系统怎么跑"
+        brief.headline = complete
+        brief.attention_strategy.hook_candidates = [
+            "梅奥诊所评估279篇医疗AI论文发现",
+            complete,
+            "梅奥诊所推出AGENT-O",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(brief.attention_strategy.selected_hook, complete)
+        self.assertEqual(brief.headline, complete)
+        self.assertFalse(brief.attention_strategy.selected_hook.endswith("发现"))
+
+    def test_accepted_eyebrow_angles_outrank_flattened_news_summaries(self) -> None:
+        pairs = (
+            (
+                "人形机器人不只会走路了：LimX TRON 2 在中药房抓药、称重、研磨、打包",
+                "全向底盘释放双手：TRON 2机器人实测中药房抓药与研磨打包",
+            ),
+            (
+                "OpenAI官宣：ChatGPT广告不到200天年化收入10亿美元",
+                "不到200天年化营收破10亿：OpenAI宣布ChatGPT广告全面扩张",
+            ),
+            (
+                "Waymo 2亿英里复盘：纯视觉和端到端黑盒都被否了",
+                "Waymo总结2亿英里无人驾驶认知：明确反对纯端到端黑盒",
+            ),
+            (
+                "梅奥诊所实测279篇医疗AI智能体论文：84.6%说不清自己的系统怎么跑",
+                "Mayo Clinic评估279篇医疗Agent论文发现",
+            ),
+            (
+                "Smart都迁去中国生产了，这家西班牙公司偏要在欧洲造微型车",
+                "面对中国微型电车主导地位，西班牙Liux推出Big迎战",
+            ),
+        )
+        for accepted, flattened in pairs:
+            with self.subTest(accepted=accepted):
+                self.assertGreaterEqual(
+                    _hook_retention_score(accepted),
+                    _hook_retention_score(flattened),
+                )
+
+        improved = (
+            (
+                "AI竞价算法在电力市场自发学会联手抬价并维持超额利润",
+                "没人下指令、互相看不到报价，AI竞价代理只看公开电价，就学会了在电力市场维持超竞争价格",
+            ),
+            (
+                "大模型推理天天用 KV Cache，为什么从没听说过 Q Cache？",
+                "面试必考：KV cache 为什么只存 K 和 V、从不存 Q？Avi Chawla 给出六步硬核推导",
+            ),
+        )
+        for challenger, incumbent in improved:
+            with self.subTest(challenger=challenger):
+                self.assertGreater(
+                    _hook_retention_score(challenger),
+                    _hook_retention_score(incumbent),
+                )
+
+    def test_radar_hook_rejects_setup_or_components_without_an_outcome(self) -> None:
+        evidence = [_manifest().evidence[0]]
+        absent = _brief()
+        absent.attention_strategy.selected_hook = "AI竞价智能体无需任何通信"
+        absent.attention_strategy.hook_candidates[0] = absent.attention_strategy.selected_hook
+        errors = _validate_radar_contract(absent, evidence)
+        self.assertIn(
+            "Radar hook states only an absent condition; it must also say what the subject did or what changed",
+            errors,
+        )
+
+        components = _brief()
+        components.attention_strategy.selected_hook = "逐鹿动力 TRON 2 机器人结合无极手 2"
+        components.attention_strategy.hook_candidates[0] = components.attention_strategy.selected_hook
+        errors = _validate_radar_contract(components, evidence)
+        self.assertIn(
+            "Radar capability hook names components but omits the concrete task or outcome",
+            errors,
+        )
+
+        complete = _brief()
+        complete.attention_strategy.selected_hook = "TRON 2 结合无极手，在中药房完成抓药和研磨"
+        complete.attention_strategy.hook_candidates[0] = complete.attention_strategy.selected_hook
+        errors = _validate_radar_contract(complete, evidence)
+        self.assertFalse(any("omits the concrete task" in error for error in errors))
+
     def test_radar_explains_harness_once_in_first_relevant_shot(self) -> None:
         brief = _brief()
         brief.attention_strategy.hook_candidates = [
@@ -286,8 +441,88 @@ class RadarV2Test(unittest.TestCase):
 
         self.assertGreater(original_width, 40)
         self.assertGreater(shot.duration, 2.0)
-        self.assertGreater(copy_width(shot.fact), 40)
+        self.assertGreaterEqual(copy_width(shot.fact), 39)
         self.assertLessEqual(copy_width(shot.fact), 64)
+
+    def test_derived_card_shares_one_reading_budget_across_all_visible_fields(self) -> None:
+        brief = _brief()
+        shot = brief.evidence_shots[1]
+        shot.visual_family = "impact_card"
+        shot.fact = "AI竞价代理没有互相通信，却一起把电价抬到了正常竞争结果之上"
+        shot.audience_copy = "这意味着市场监管不能只检查代理之间有没有发送消息"
+        shot.translation = "智能体在没有被要求合谋时仍学会维持高利润结果"
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertLessEqual(visible_reading_rate(shot), 12.0)
+
+    def test_autonomous_driving_story_prefers_category_explicit_model_hook(self) -> None:
+        brief = _brief()
+        brief.headline = "Waymo 自动驾驶进军德国慕尼黑"
+        brief.attention_strategy.hook_candidates = [
+            "Waymo 迈出欧洲落地关键一步",
+            "Waymo 自动驾驶进军德国慕尼黑",
+            "2027 年底开放慕尼黑叫车",
+        ]
+        brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
+        source = _manifest().evidence[0]
+        source.quote = "Waymo is laying the groundwork for fully autonomous ride hailing."
+
+        canonicalize_editorial_brief(brief, [source])
+
+        self.assertIn("自动驾驶", brief.attention_strategy.selected_hook)
+
+    def test_flash_compiler_fits_repaired_story_without_another_llm_call(self) -> None:
+        brief = _brief()
+        brief.duration_target = 31.0
+        brief.evidence_shots.append(EvidenceShot(
+            "shot-4", EvidenceShotKind.BROWSER_SECTION, "", "监管不能只查代理有没有通信", "",
+            ["e-1"], ["beat-4"], duration=9.5, visual_family="impact_card",
+        ))
+        for shot in brief.evidence_shots:
+            shot.duration = 9.5
+
+        enforce_flash_time_budget(brief)
+
+        self.assertLess(brief.duration_target, 15.0)
+        self.assertLess(sum(shot.duration for shot in brief.evidence_shots), 15.0)
+        self.assertTrue(all(1.3 <= shot.duration <= 10.0 for shot in brief.evidence_shots))
+
+    def test_original_video_earns_a_case_specific_longer_flash_budget(self) -> None:
+        brief = _brief(duration_target=24.0)
+        brief.evidence_shots[0].kind = EvidenceShotKind.VIDEO
+        brief.evidence_shots[0].visual_family = "source_video"
+        brief.evidence_shots[0].duration = 10.0
+        brief.evidence_shots[1].duration = 5.0
+        brief.evidence_shots[2].duration = 5.0
+
+        enforce_flash_time_budget(brief)
+
+        self.assertEqual(sum(shot.duration for shot in brief.evidence_shots), 20.0)
+        self.assertEqual(brief.duration_target, 24.0)
+
+    def test_dense_static_research_can_use_twenty_seconds_without_becoming_long_form(self) -> None:
+        brief = _brief(duration_target=20.0)
+        for shot in brief.evidence_shots:
+            shot.duration = 6.0
+
+        apply_readable_radar_timing(brief)
+
+        self.assertEqual(sum(shot.duration for shot in brief.evidence_shots), 18.0)
+        self.assertEqual(brief.duration_target, 20.0)
+
+    def test_unacquired_source_image_is_compiled_to_a_grounded_card(self) -> None:
+        brief = _brief()
+        brief.evidence_shots[1].kind = EvidenceShotKind.IMAGE
+        brief.evidence_shots[1].visual_family = "source_image"
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(brief.evidence_shots[1].kind, EvidenceShotKind.BROWSER_SECTION)
+        self.assertIn(
+            brief.evidence_shots[1].visual_family,
+            {"quote_card", "impact_card", "stat_card"},
+        )
 
     def test_radar_model_hook_accepts_evidence_preserving_artifact_base_name(self) -> None:
         brief = _brief()
@@ -361,17 +596,17 @@ class RadarV2Test(unittest.TestCase):
         brief.evidence_shots[0].full_translation = "折扣页当前展示多个模型与供应商价格变化" * 10
         canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
         first = brief.evidence_shots[0]
-        self.assertLessEqual(
+        self.assertGreater(
             copy_width(first.full_translation), _radar_shot_copy_budget(first.duration),
         )
         self.assertGreater(first.duration, 2.0)
-        self.assertFalse(any(
+        self.assertTrue(any(
             "Chinese gloss" in error for error in _validate_radar_contract(
                 brief, [_manifest().evidence[0]],
             )
         ))
 
-    def test_radar_hook_only_gets_extended_budget_when_subject_survives_clipping(self) -> None:
+    def test_radar_hook_uses_readable_three_line_budget_without_a_subject(self) -> None:
         brief = _brief()
         brief.attention_strategy.hook_candidates = [
             "同一折扣页的价格差距为什么会突然拉开一个数量级",
@@ -380,7 +615,7 @@ class RadarV2Test(unittest.TestCase):
         ]
         brief.attention_strategy.selected_hook = brief.attention_strategy.hook_candidates[0]
         canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
-        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 20)
+        self.assertLessEqual(copy_width(brief.attention_strategy.selected_hook), 28)
         self.assertFalse(any(
             "Radar headline" in error for error in _validate_radar_contract(
                 brief, [_manifest().evidence[0]],

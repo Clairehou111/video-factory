@@ -122,6 +122,7 @@ class EvidenceShotKind(StrEnum):
     TWEET_CARD = "tweet_card"
     BROWSER_SECTION = "browser_section"
     IMAGE = "image"
+    VIDEO = "video"
     PDF_PAGE = "pdf_page"
     FIGURE = "figure"
     BENCHMARK_CHART = "benchmark_chart"

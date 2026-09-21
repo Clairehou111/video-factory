@@ -4,7 +4,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .compositor import _font_path, _translation_only, _wrapped_lines
+from .compositor import _font_path, _translation_only, _wrapped_lines, mobile_safe_text
 from .editorial import is_audience_glossary_definition
 from .models import Candidate, Evidence, Scene
 
@@ -82,9 +82,18 @@ def render_tweet_card(
     draw.rounded_rectangle((width - 190, 105, width - 105, 190), radius=42, fill="#0f172a")
     draw.text((width - 147, 147), "X", font=ImageFont.truetype(font_file, 36), fill="white", anchor="mm")
 
-    source_text = re.sub(r"https://t\.co/\S+", "", root.quote).replace("♾", "∞")
+    source_text = mobile_safe_text(
+        re.sub(r"https://t\.co/\S+", "", root.quote).replace("♾", "∞")
+    )
     source_text = re.sub(r"(?im)^\s*(?:learn more at|read more|details)\s*:\s*$", "", source_text).strip()
-    translation = _tweet_translation_copy(scene)
+    # A motion-led story has a shorter evidence viewport. Preserve provenance
+    # and the readable Chinese translation instead of cropping the bottom of
+    # a complete 1602px post card. The archived evidence still retains the
+    # full source; this visual shows a clearly ellipsized source excerpt.
+    if height < 1400 and len(source_text) > 650:
+        excerpt = source_text[:650].rsplit(" ", 1)[0].rstrip(" ,;:")
+        source_text = excerpt + "…"
+    translation = mobile_safe_text(_tweet_translation_copy(scene))
     translation_font = None
     translation_lines: list[str] = []
     translation_height = 0
@@ -101,7 +110,7 @@ def render_tweet_card(
         if translation_font is None:
             raise ValueError("adjacent Chinese translation does not fit the complete X card")
     top = 245
-    # The complete source plus its adjacent translation already explains the
+    # The source plus its adjacent translation already explains the
     # first beat. Repeating scene.screen_fact in a separate bottom chip makes
     # short posts look duplicated and steals space from long posts, so the X
     # card deliberately reserves only translation and source metadata.
@@ -232,7 +241,7 @@ def render_editorial_card(
     fact_font = ImageFont.truetype(font_file, 61)
     interpretation_font = ImageFont.truetype(font_file, 46)
 
-    fact = (scene.screen_fact or scene.caption).strip()
+    fact = mobile_safe_text((scene.screen_fact or scene.caption).strip())
     fact_lines = _wrapped_lines(draw, fact, fact_font, width - 180, 5)
     line_height = draw.textbbox((0, 0), "中", font=fact_font)[3] + 20
     fact_top = 120
@@ -240,9 +249,11 @@ def render_editorial_card(
         draw.text((90, fact_top + index * line_height), line, font=fact_font, fill=foreground)
     rule_top = min(980, fact_top + len(fact_lines) * line_height + 54)
 
-    excerpt = (scene.source_excerpt or "").strip()
-    translation = _translation_only((scene.highlight_translation or "").strip())
-    implication = (scene.screen_interpretation or "").strip()
+    excerpt = mobile_safe_text((scene.source_excerpt or "").strip())
+    translation = mobile_safe_text(
+        _translation_only((scene.highlight_translation or "").strip())
+    )
+    implication = mobile_safe_text((scene.screen_interpretation or "").strip())
 
     # Derived pacing cards must still carry evidence. Put the exact source
     # excerpt in the large middle area and its Chinese meaning immediately
@@ -305,8 +316,8 @@ def render_source_image(
     font_file = str(_font_path())
     fact_font = ImageFont.truetype(font_file, 45)
     implication_font = ImageFont.truetype(font_file, 40)
-    fact = (scene.screen_fact or scene.caption).strip()
-    implication = (scene.screen_interpretation or "").strip()
+    fact = mobile_safe_text((scene.screen_fact or scene.caption).strip())
+    implication = mobile_safe_text((scene.screen_interpretation or "").strip())
     fact_lines = _wrapped_lines(draw, fact, fact_font, width - 180, 3)
     for index, line in enumerate(fact_lines):
         draw.text((90, 1135 + index * 61), line, font=fact_font, fill="#f7f9ff")

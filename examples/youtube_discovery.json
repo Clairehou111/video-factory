@@ -1,12 +1,21 @@
 {
-  "cadence_hours": 48,
+  "cadence_hours": 2,
   "max_source_selections": 1,
   "minimum_score": 70,
   "source_duration_minutes": [15, 120],
   "lookback_days": 30,
   "results_per_query": 8,
   "metadata_probe_limit": 10,
+  "minimum_audience_score": 12,
   "timezone": "Asia/Tokyo",
+  "channel_sources": {
+    "all_in": ["https://www.youtube.com/channel/UCESLZhusAkFfsNsApnjF_Cg"],
+    "sequoia": ["https://www.youtube.com/channel/UCWrF0oN6unbXrWsTN7RctTw"],
+    "a16z": ["https://www.youtube.com/channel/UC9cn0TuPq4dnbTY-CBsm8XA"],
+    "lightspeed": ["https://www.youtube.com/channel/UCwBTFE_6Bsb_EtmXlW2aTlg"],
+    "mad_podcast": ["https://www.youtube.com/channel/UCQID78IY6EOojr5RUdD47MQ"],
+    "saastr": ["https://www.youtube.com/channel/UCwOILzAcxK5CM2M7oRBuWSg"]
+  },
   "query_pools": {
     "perplexity": [
       "Aravind Srinivas Perplexity interview",
@@ -20,10 +29,49 @@
       "Y Combinator AI startup",
       "Y Combinator AI engineering"
     ],
+    "all_in": [
+      "\"All-In Podcast\" AI",
+      "\"All-In Podcast\" SaaS"
+    ],
+    "sequoia": [
+      "Sequoia Capital AI startup engineering",
+      "Sequoia Capital enterprise software AI"
+    ],
+    "a16z": [
+      "a16z AI enterprise software",
+      "a16z AI startup founders"
+    ],
+    "lightspeed": [
+      "Lightspeed Venture Partners AI startup engineering",
+      "Lightspeed Venture Partners enterprise AI"
+    ],
+    "mad_podcast": [
+      "\"The MAD Podcast\" enterprise AI",
+      "\"The MAD Podcast\" future of software"
+    ],
+    "saastr": [
+      "\"SaaStr AI\" SaaS",
+      "\"SaaStr AI\" enterprise software"
+    ],
     "popular_ai": [
       "AI engineering agents talk",
       "coding agents platform engineering",
       "AI developer productivity conference"
+    ],
+    "startup_builders": [
+      "AI startup team technical demo",
+      "new AI project engineering launch",
+      "startup founders building AI product technical talk"
+    ],
+    "robotics_physical_ai": [
+      "robotics startup engineering talk humanoid demo",
+      "physical AI robot learning technical presentation",
+      "humanoid robot behind the scenes engineering"
+    ],
+    "autonomous_driving": [
+      "autonomous driving engineering talk field test",
+      "self-driving robotaxi technical presentation",
+      "autonomous vehicle perception planning engineering"
     ]
   }
 }

@@ -1,9 +1,11 @@
 import json
+import signal
+import subprocess
 import unittest
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from PIL import Image, ImageDraw
 
 from video_factory.capture import BrowserCaptureImporter, BrowserCaptureRequest, CaptureKind, CapturedBrowserArtifact
@@ -31,6 +33,33 @@ from video_factory.tweetcard import _tweet_translation_copy
 
 
 class QualityTest(unittest.TestCase):
+    def test_rejects_overcrowded_flash_scene_by_mobile_reading_rate(self) -> None:
+        evidence = Evidence(
+            "e-pace", "candidate", "https://example.com/source",
+            "A fully grounded but very dense source paragraph.", "web:primary_page",
+        )
+        scene = Scene(
+            "dense", 0, 2, "OpenAI购买数万台Mac用于智能体强化学习训练",
+            "proof", [evidence.id], MaterialRole.PROOF, "show source",
+            screen_fact="Anthropic同时通过AWS租用Mac mini处理类似任务",
+            screen_interpretation="两家公司把真实桌面环境接入智能体训练流程",
+            highlight_translation="重点不是预训练算力，而是让智能体在真实电脑环境中反复操作",
+            visual_family="official_page",
+        )
+        manifest = RenderManifest(
+            "pace", "candidate", ContentType.FLASH, [scene], [evidence], [evidence.url],
+            topic_type=TopicType.MODEL_OR_PRODUCT,
+            fixed_hook="AI公司开始抢真实电脑", fixed_title="Mac进入智能体训练",
+            fixed_footer="真实操作环境成为新的训练资源",
+        )
+
+        check = next(
+            item for item in validate_manifest(manifest)
+            if item.name == "scene:dense:reading_rate"
+        )
+        self.assertFalse(check.passed)
+        self.assertIn("过高", check.detail)
+
     @staticmethod
     def github_brief(metadata_id: str, readme_id: str) -> GitHubProjectBrief:
         return GitHubProjectBrief(
@@ -308,7 +337,7 @@ class QualityTest(unittest.TestCase):
 
             with (
                 patch.object(adapter, "_write_padded_runner", side_effect=RuntimeError("patch marker changed")),
-                patch("video_factory.webcapture.subprocess.run", side_effect=create_capture) as run,
+                patch.object(adapter, "_run_capture_command", side_effect=create_capture) as run,
             ):
                 adapter.capture(request)
 
@@ -319,6 +348,80 @@ class QualityTest(unittest.TestCase):
             self.assertTrue(metadata["fallback_used"])
             repairs = json.loads(output.with_suffix(".capture-repairs.json").read_text(encoding="utf-8"))
             self.assertEqual(repairs[0]["kind"], "runner_patch_incompatible")
+
+    def test_capture_reuses_complete_mp4_when_recorder_cleanup_exits_nonzero(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "capture.mp4"
+            request = WebCaptureRequest(
+                "https://example.com",
+                [CaptureCue(CueAction.WAIT, "hold", wait_ms=1000, shot_id="hold")],
+                output, root / "frames",
+            )
+            adapter = WebScrollVideoAdapter(WebScrollVideoSettings(root / "web-scroll-video"))
+
+            def failed_after_output(_command):
+                output.write_bytes(b"complete mp4")
+                raise subprocess.CalledProcessError(1, _command)
+
+            with (
+                patch.object(adapter, "_write_padded_runner", return_value=root / "runner.mjs"),
+                patch.object(adapter, "_run_capture_command", side_effect=failed_after_output) as run,
+                patch.object(adapter, "_usable_completed_output", return_value=True),
+            ):
+                adapter.capture(request)
+
+            self.assertEqual(run.call_count, 2)
+            metadata = json.loads(output.with_suffix(".capture.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["runner_strategy"], "valid_output_after_recorder_exit")
+            repairs = json.loads(output.with_suffix(".capture-repairs.json").read_text(encoding="utf-8"))
+            self.assertEqual(repairs[-1]["kind"], "recorder_exit_after_valid_output")
+
+    def test_capture_reuses_complete_mp4_when_recorder_times_out_after_write(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "capture.mp4"
+            request = WebCaptureRequest(
+                "https://example.com",
+                [CaptureCue(CueAction.WAIT, "hold", wait_ms=1000, shot_id="hold")],
+                output, root / "frames",
+            )
+            adapter = WebScrollVideoAdapter(WebScrollVideoSettings(root / "web-scroll-video"))
+
+            def timed_out_after_output(_command):
+                output.write_bytes(b"complete mp4")
+                raise RuntimeError("recorder exceeded timeout")
+
+            with (
+                patch.object(adapter, "_write_padded_runner", return_value=root / "runner.mjs"),
+                patch.object(adapter, "_run_capture_command", side_effect=timed_out_after_output),
+                patch.object(adapter, "_usable_completed_output", return_value=True),
+            ):
+                adapter.capture(request)
+
+            metadata = json.loads(output.with_suffix(".capture.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["runner_strategy"], "valid_output_after_recorder_timeout")
+            repairs = json.loads(output.with_suffix(".capture-repairs.json").read_text(encoding="utf-8"))
+            self.assertEqual(repairs[-1]["kind"], "recorder_timeout_after_valid_output")
+
+    def test_capture_timeout_terminates_the_entire_recorder_process_group(self) -> None:
+        adapter = WebScrollVideoAdapter(WebScrollVideoSettings(
+            Path("/web-scroll-video"), capture_timeout_seconds=45,
+        ))
+        process = MagicMock(pid=4321, returncode=-signal.SIGTERM)
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["node", "runner.mjs"], 45),
+            -signal.SIGTERM,
+        ]
+
+        with patch("video_factory.webcapture.subprocess.Popen", return_value=process) as popen, patch(
+            "video_factory.webcapture.os.killpg",
+        ) as killpg:
+            with self.assertRaisesRegex(RuntimeError, "45s capture timeout"):
+                adapter._run_capture_command(["node", "runner.mjs"])
+
+        popen.assert_called_once_with(["node", "runner.mjs"], start_new_session=True)
+        killpg.assert_called_once_with(4321, signal.SIGTERM)
 
     def test_font_resolution_falls_back_after_invalid_local_configuration(self) -> None:
         with TemporaryDirectory() as temp:
@@ -754,6 +857,46 @@ class QualityTest(unittest.TestCase):
         failed = {item.name for item in validate_manifest(manifest) if not item.passed}
         self.assertIn("quantified_claims", failed)
 
+    def test_quality_accepts_equivalent_percentage_decimal_format(self) -> None:
+        candidate = Candidate("c-percent", SourceType.PAPER, "https://example.com/paper.pdf", "test")
+        evidence = Evidence(
+            "e-percent", candidate.id, candidate.source_url,
+            "The best model reached 61.0% accuracy.", "paper",
+        )
+        manifest = RenderManifest(
+            "m-percent", candidate.id, ContentType.FLASH,
+            [Scene(
+                "s-1", 0, 8, "internal", "最高准确率只有61%", [evidence.id],
+                MaterialRole.PROOF, "show source",
+            )],
+            [evidence], [candidate.source_url], fixed_hook="最高准确率只有61%",
+            fixed_footer="局部观察暴露状态追踪短板",
+        )
+
+        check = next(item for item in validate_manifest(manifest) if item.name == "quantified_claims")
+
+        self.assertTrue(check.passed)
+
+    def test_quality_currency_parser_ignores_sentence_period(self) -> None:
+        candidate = Candidate("c-cost", SourceType.WEB, "https://example.com/pricing", "test")
+        evidence = Evidence(
+            "e-cost", candidate.id, candidate.source_url,
+            "A representative developer task costs about $0.019800.", "web:page",
+        )
+        manifest = RenderManifest(
+            "m-cost", candidate.id, ContentType.FLASH,
+            [Scene(
+                "s-1", 0, 8, "internal", "一次典型任务约0.0198美元", [evidence.id],
+                MaterialRole.PROOF, "show source",
+            )],
+            [evidence], [candidate.source_url], fixed_hook="任务成本降到0.0198美元",
+            fixed_footer="适合成本敏感的批处理测试",
+        )
+
+        check = next(item for item in validate_manifest(manifest) if item.name == "quantified_claims")
+
+        self.assertTrue(check.passed)
+
     def test_sensitive_security_material_requires_editorial_review(self) -> None:
         evidence = [Evidence("e-1", "c-1", "https://example.com", "A vulnerability could expose credentials.", "research")]
         review = review_evidence(evidence)
@@ -767,6 +910,19 @@ class QualityTest(unittest.TestCase):
         )
         failed = {item.name for item in validate_manifest(manifest) if not item.passed}
         self.assertIn("editorial_safety_review", failed)
+
+    def test_benign_environment_credential_setup_is_not_a_security_disclosure(self) -> None:
+        evidence = [Evidence(
+            "e-setup", "c-setup", "https://example.com/readme",
+            "GitHub Advanced Security can find vulnerabilities. "
+            + ("ordinary navigation text " * 10)
+            + "Credentials are read from the environment and never written to a file.",
+            "github:readme",
+        )]
+
+        review = review_evidence(evidence)
+
+        self.assertFalse(review.requires_human_review)
 
     def test_provenance_removal_tool_requires_editorial_review(self) -> None:
         evidence = [Evidence("e-1", "c-1", "https://example.com", "Strip AI provenance marks and C2PA metadata.", "github:readme")]
