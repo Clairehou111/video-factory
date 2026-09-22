@@ -185,6 +185,17 @@ def main() -> None:
     publish_collection_reconcile.add_argument("batch")
     publish_collection_reconcile.add_argument("--item", required=True)
     publish_collection_reconcile.add_argument("--actor", required=True)
+    publish_collection_manual_reconcile = subcommands.add_parser(
+        "publish-collection-reconcile-tencent",
+        help="按人工核对结果，将视频号不确定项记为已发布或恢复为可安全重试",
+    )
+    publish_collection_manual_reconcile.add_argument("batch")
+    publish_collection_manual_reconcile.add_argument("--item", required=True)
+    publish_collection_manual_reconcile.add_argument("--actor", required=True)
+    publish_collection_manual_reconcile.add_argument(
+        "--outcome", required=True, choices=["published", "not_submitted"],
+    )
+    publish_collection_manual_reconcile.add_argument("--reason", required=True)
     subcommands.add_parser("publish-policy", help="显示发布安全边界")
     youtube_runtime = subcommands.add_parser(
         "youtube-runtime",
@@ -807,6 +818,16 @@ def main() -> None:
             raise ValueError("publish-collection-confirm-pre-submit-failure requires a collection batch")
         CollectionPublishBatchService(workspace, SocialAutoUploadBackend()).confirm_pre_submit_auth_rejection(
             batch, args.item, args.actor,
+        )
+        print(json.dumps(batch.to_dict(), ensure_ascii=False, indent=2))
+    elif args.command == "publish-collection-reconcile-tencent":
+        batch = workspace.load_publish_batch(args.batch)
+        if not isinstance(batch, CollectionPublishBatch):
+            raise ValueError("publish-collection-reconcile-tencent requires a collection batch")
+        CollectionPublishBatchService(
+            workspace, SocialAutoUploadBackend(),
+        ).reconcile_tencent_manual_outcome(
+            batch, args.item, args.actor, args.outcome, args.reason,
         )
         print(json.dumps(batch.to_dict(), ensure_ascii=False, indent=2))
     elif args.command == "publish-policy":

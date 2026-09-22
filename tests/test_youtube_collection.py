@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 import unittest
@@ -49,6 +50,7 @@ from video_factory.youtube import (
     _resolve_chinese_subtitle_font_path,
     _resolve_headline_font_path,
     _semantic_english_parts,
+    _semantic_card_translation_errors,
     _coalesce_short_semantic_parts,
     _split_overlong_semantic_parts,
     cached_interview_caption_pipeline_complete,
@@ -347,6 +349,39 @@ class YouTubeCollectionTest(unittest.TestCase):
             audit["corrections"][0]["verified_source"],
             "like like all obviously an insane amount of value went into the text",
         )
+
+    def test_targeted_whisper_context_can_be_bounded_for_slow_local_cpu(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_runner(command, **kwargs):
+            calls.append(command)
+            output_dir = Path(command[command.index("--output_dir") + 1])
+            media = Path(command[1])
+            (output_dir / f"{media.stem}.json").write_text(json.dumps({
+                "segments": [{"words": [
+                    {"start": 10.0, "end": 10.5, "word": " constraints"},
+                    {"start": 10.5, "end": 11.0, "word": " constraints"},
+                ]}],
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            media = root / "clip.mkv"
+            media.write_bytes(b"media")
+            cues = [TranscriptCue(
+                "card", 10, 11, "constraints constraints", "",
+            )]
+            with (
+                patch("video_factory.youtube.shutil.which", return_value="/usr/bin/whisper"),
+                patch.dict(os.environ, {"VIDEO_FACTORY_WHISPER_CONTEXT_SECONDS": "3"}),
+            ):
+                targeted_whisper_caption_audit(
+                    media, cues, root / "job", runner=fake_runner,
+                )
+
+        timestamps = calls[0][calls[0].index("--clip_timestamps") + 1]
+        self.assertEqual(timestamps, "7.000,14.000")
 
     def test_default_discovery_tracks_selected_investor_and_operator_channels(self) -> None:
         config = DiscoveryConfig()
@@ -1031,6 +1066,9 @@ class YouTubeCollectionTest(unittest.TestCase):
             command = commands[0]
             self.assertEqual(command[command.index("--download-sections") + 1], "*98.000-202.000")
             self.assertIn("--force-keyframes-at-cuts", command)
+            downloader_args = command[command.index("--downloader-args") + 1]
+            self.assertIn("-reconnect 1", downloader_args)
+            self.assertIn("-reconnect_on_network_error 1", downloader_args)
 
     def test_remote_interval_retries_when_audio_ends_before_video(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1041,9 +1079,11 @@ class YouTubeCollectionTest(unittest.TestCase):
             job.mkdir()
             media = job / "clip123.mkv"
             attempts = [0]
+            download_windows = []
 
             def download(*args, **kwargs):
                 attempts[0] += 1
+                download_windows.append(kwargs.get("download_window"))
                 media.write_bytes(f"attempt-{attempts[0]}".encode())
                 return media
 
@@ -1052,8 +1092,8 @@ class YouTubeCollectionTest(unittest.TestCase):
                 audio_duration=85,
             )
             complete = VideoProbe(
-                media, 180, 1920, 1080, "h264", "yuv420p", "aac",
-                audio_duration=180,
+                media, 600, 1920, 1080, "h264", "yuv420p", "aac",
+                audio_duration=600,
             )
             acquirer = YouTubeAcquirer(workspace, runner=lambda *args, **kwargs: None)
             candidate = Candidate(
@@ -1065,13 +1105,15 @@ class YouTubeCollectionTest(unittest.TestCase):
             with patch.object(acquirer, "_download_media", side_effect=download), patch(
                 "video_factory.youtube.probe_video", side_effect=[incomplete, complete],
             ):
-                _, media_info, _, _ = acquirer.acquire_remote_media(
+                _, media_info, _, download_window = acquirer.acquire_remote_media(
                     candidate, {"id": "clip123", "duration": 600},
                     candidate.source_url, job, source_range=SourceRange(100, 276),
                 )
 
             self.assertEqual(attempts[0], 2)
-            self.assertEqual(media_info.duration, 180)
+            self.assertEqual(download_windows, [(98.0, 278.0), None])
+            self.assertIsNone(download_window)
+            self.assertEqual(media_info.duration, 600)
 
     def test_remote_interval_retries_after_bounded_acquisition_timeout(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1237,6 +1279,18 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertTrue(copied_is_bounded)
         self.assertAlmostEqual(copied_window["download_start"], 684.58)
         self.assertEqual(copied_window["download_end"], 872.0)
+
+        planned_with_download = {
+            "original_start": 1142.559, "original_end": 1246.32,
+            "download_start": 1141.0, "download_end": 1248.0,
+            "media_duration": 107.007, "rebased": False,
+        }
+        explicit_window, explicit_is_bounded = _local_interview_media_window(
+            planned_with_download, 107.007, 3864.0,
+        )
+        self.assertTrue(explicit_is_bounded)
+        self.assertEqual(explicit_window["download_start"], 1141.0)
+        self.assertEqual(explicit_window["download_end"], 1248.0)
 
     def test_no_render_plan_with_local_cues_is_not_rebased_as_original_seconds(self) -> None:
         cached = {
@@ -1819,6 +1873,83 @@ class YouTubeCollectionTest(unittest.TestCase):
         parts = _semantic_english_parts(source, 4)
 
         self.assertTrue(any(part.casefold().startswith("so that ") for part in parts[1:]))
+
+    def test_semantic_split_keeps_leading_condition_with_its_consequence(self) -> None:
+        source = (
+            "If we don't obsolete our own products and services, someone's "
+            "going to find a way to obsolete them for us."
+        )
+
+        parts = _semantic_english_parts(source, 2)
+
+        self.assertEqual(parts, [source])
+
+    def test_semantic_split_does_not_strand_coordinated_predicate(self) -> None:
+        source = (
+            "Give each model tests to see if it will build bioweapons or nuclear "
+            "bombs or be deliberately deceptive and report the result."
+        )
+
+        parts = _semantic_english_parts(source, 3)
+
+        self.assertFalse(any(
+            re.match(r"^(?:and|or)\s+(?:be|have|do)\b", part, re.IGNORECASE)
+            for part in parts[1:]
+        ), parts)
+
+    def test_semantic_split_keeps_complement_after_figure_out(self) -> None:
+        source = (
+            "Have the smartest humans try their best to figure out if this model "
+            "is going to be a bad actor."
+        )
+
+        parts = _semantic_english_parts(source, 2)
+
+        self.assertFalse(any(part.casefold().endswith("figure out") for part in parts))
+
+    def test_semantic_split_does_not_end_on_relative_subject(self) -> None:
+        source = (
+            "Use a series of safety tests that you give to any model to see "
+            "whether it behaves deceptively."
+        )
+
+        parts = _semantic_english_parts(source, 2)
+
+        self.assertFalse(any(re.search(
+            r"\b(?:that|which|where)\s+(?:you|we|they|he|she|it)$",
+            part, re.IGNORECASE,
+        ) for part in parts[:-1]), parts)
+
+    def test_semantic_split_uses_repeated_pronoun_as_asr_restart(self) -> None:
+        source = (
+            "I think everyone applying everyone else's test harness to each other "
+            "is probably the best way we we best thing we can do to ensure safety."
+        )
+
+        parts = _semantic_english_parts(source, 2)
+
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(parts[1].casefold().startswith("we we "), parts)
+
+    def test_semantic_split_does_not_isolate_short_discourse_fragment(self) -> None:
+        source = (
+            "Um and um, yeah, I mean there's a reason, you know, students like "
+            "like why why do writers have someone else proofread their book?"
+        )
+
+        parts = _semantic_english_parts(source, 3)
+
+        self.assertNotIn("you know, students", parts)
+
+    def test_semantic_split_keeps_contracted_predicate_with_complement(self) -> None:
+        source = (
+            "And this is the problem with all these evals right now is they're "
+            "so massively overfit."
+        )
+
+        parts = _semantic_english_parts(source, 2)
+
+        self.assertFalse(any(part.casefold().endswith("they're") for part in parts))
         self.assertEqual(" ".join(parts), source)
 
     def test_semantic_split_never_leaves_nonfinal_card_on_connector(self) -> None:
@@ -1895,6 +2026,31 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertTrue(any("hard maximum" in error for error in errors), errors)
 
+    def test_semantic_segmentation_trims_only_small_unsplittable_display_overrun(self) -> None:
+        cue = TranscriptCue(
+            "short-clause", 10, 17.68,
+            "Infrastructure economics remain difficult.",
+            "基础设施经济性仍然很难。",
+            original_start=110, original_end=117.68,
+        )
+
+        trace = NaturalSubtitleTranslator(object()).segment_interview_subtitle_cards(
+            [cue], [],
+        )
+
+        self.assertAlmostEqual(cue.end, 17.5)
+        self.assertAlmostEqual(cue.original_end, 117.68)
+        self.assertFalse(interview_caption_duration_errors([cue]))
+        self.assertEqual(trace["timing_adjustments"][0]["cue_id"], cue.id)
+        self.assertAlmostEqual(trace["timing_adjustments"][0]["trimmed_seconds"], 0.18)
+
+    def test_exact_editorial_range_preserves_millisecond_boundaries(self) -> None:
+        exact = _requested_exact_range_from_editorial_guidance(
+            "Select exactly one answer from 19:02.559 to 20:46.320.",
+        )
+
+        self.assertEqual(exact, (1142.559, 1246.32))
+
     def test_caption_policy_rejects_subsecond_and_dense_cards(self) -> None:
         cue = TranscriptCue(
             "dense", 0, 0.9,
@@ -1907,6 +2063,11 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertTrue(any("minimum" in error for error in errors), errors)
         self.assertTrue(any("English words" in error for error in errors), errors)
         self.assertTrue(any("Chinese characters" in error for error in errors), errors)
+
+    def test_caption_policy_allows_brief_acknowledgement_under_standard_minimum(self) -> None:
+        cue = TranscriptCue("ack", 0, 1.04, "Yeah.", "对。")
+
+        self.assertEqual(interview_caption_duration_errors([cue]), [])
 
     def test_cached_semantic_cards_are_immutable_during_rerender(self) -> None:
         cues = [TranscriptCue(
@@ -2410,6 +2571,15 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertIn("可能", cues[1].translation)
         self.assertNotIn("往往", cues[1].translation)
 
+    def test_numeric_maybe_accepts_natural_approximation_wording(self) -> None:
+        errors = _semantic_card_translation_errors({
+            "id": "card",
+            "source": "maybe three or four leading companies were doing it.",
+            "duration_seconds": 4.0,
+        }, "大约三四家头部公司都在这样做。", [])
+
+        self.assertNotIn("modality", errors)
+
     def test_configured_fidelity_reviewer_failure_never_publishes_unreviewed_cards(self) -> None:
         class ChineseTranslator:
             def __init__(self):
@@ -2514,6 +2684,32 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertIsNone(trace)
         self.assertEqual(cues[0].translation, "AI 实验室把编程作为竞争性基准测试。")
+
+    def test_audio_verified_duplicate_cleanup_keeps_reviewed_translation(self) -> None:
+        class MustNotCall:
+            def _request_json(self, *args, **kwargs):
+                raise AssertionError("duplicate cleanup must not trigger a rewrite")
+
+        cues = [TranscriptCue(
+            "card", 0, 3.5,
+            "The best thing I can think of is is really",
+            "我能想到的最好办法。",
+        )]
+        audit = {"corrections": [{
+            "cue_id": "card",
+            "source": cues[0].source_text,
+            "verified_source": "The best thing I can think of is really",
+            "reasons": ["repeated_content_word:is"],
+            "changed": True,
+        }]}
+
+        trace = NaturalSubtitleTranslator(
+            MustNotCall(), None, MustNotCall(),
+        ).repair_audio_verified_cards(cues, [], audit)
+
+        self.assertEqual(trace["duplicate_cleanup_cue_ids"], ["card"])
+        self.assertEqual(cues[0].source_text, "The best thing I can think of is really")
+        self.assertEqual(cues[0].translation, "我能想到的最好办法。")
 
     def test_audio_verified_dangling_fragment_merges_into_accepted_payoff(self) -> None:
         class MustNotCall:
@@ -3458,6 +3654,36 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(trace["provenance"]["provider"], "deepseek")
         self.assertTrue(trace["provider_failures"])
 
+    def test_terminology_repair_retries_when_first_writer_uses_wrong_synonym(self) -> None:
+        class NoncompliantDirector:
+            def _request_json(self, *args, **kwargs):
+                return ({"translations": [{
+                    "id": "c1", "text": "模型可能会故意误导。",
+                }]}, {"provider": "director"})
+
+        class ExactWriter:
+            def _request_json(self, *args, **kwargs):
+                return ({"translations": [{
+                    "id": "c1", "text": "模型可能会刻意欺骗。",
+                }]}, {"provider": "translator"})
+
+        cues = [TranscriptCue(
+            "c1", 0, 4, "The model may be deliberately deceptive.",
+            "模型可能会故意误导。",
+        )]
+        terms = [TerminologyEntry(
+            "deceptive", TerminologyStrategy.TRANSLATE, target="刻意欺骗",
+        )]
+        errors = terminology_contract_errors(cues, terms)
+
+        trace = NaturalSubtitleTranslator(
+            ExactWriter(), NoncompliantDirector(),
+        )._repair_terminology(cues, terms, errors)
+
+        self.assertEqual(cues[0].translation, "模型可能会刻意欺骗。")
+        self.assertEqual(trace["provenance"]["provider"], "translator")
+        self.assertTrue(trace["provider_failures"])
+
     def test_cached_reviewed_translation_is_reaudited_before_render(self) -> None:
         cues = [TranscriptCue(
             "c1", 0, 4, "Agents are replacing seats.",
@@ -3513,6 +3739,62 @@ class YouTubeCollectionTest(unittest.TestCase):
         errors = terminology_contract_errors(cues, terminology)
 
         self.assertTrue(any("chips:c2" in error for error in errors))
+
+    def test_common_ai_safety_terms_normalize_to_concise_chinese(self) -> None:
+        cues = [TranscriptCue(
+            "c1", 0, 5,
+            "Use a test harness to detect deceptive behavior.",
+            "用测试框架识别刻意欺骗行为。",
+        )]
+        terminology = NaturalSubtitleTranslator._parse_terminology([
+            {"source": "test harness", "strategy": "bilingual_once", "target": "测试框架"},
+            {"source": "deceptive", "strategy": "preserve"},
+        ], cues)
+
+        self.assertEqual(
+            [(term.source, term.strategy, term.target) for term in terminology],
+            [
+                ("test harness", TerminologyStrategy.TRANSLATE, "测试框架"),
+                ("deceptive", TerminologyStrategy.TRANSLATE, "刻意欺骗"),
+            ],
+        )
+        self.assertEqual(terminology_contract_errors(cues, terminology), [])
+
+    def test_terminology_mode_alias_and_chinese_target_do_not_become_preserve(self) -> None:
+        cues = [TranscriptCue(
+            "c1", 0, 5,
+            "Permits and licensing are bureaucratic.",
+            "许可、审批和官僚主义流程令人窒息。",
+        )]
+        terminology = NaturalSubtitleTranslator._parse_terminology([
+            {"term": "permit", "mode": "translate", "translation": "许可"},
+            {"term": "licensing", "mode": "translate", "translation": "审批"},
+            {"source": "bureaucratic", "strategy": "preserve", "target": "官僚主义"},
+        ], cues)
+
+        self.assertTrue(all(
+            term.strategy == TerminologyStrategy.TRANSLATE
+            for term in terminology
+        ))
+        self.assertEqual(terminology_contract_errors(cues, terminology), [])
+
+    def test_real_estate_uses_natural_contextual_chinese(self) -> None:
+        cues = [
+            TranscriptCue("buy", 0, 2, "You have to buy real estate.", "你得先买地。"),
+            TranscriptCue(
+                "price", 2, 5, "Real estate goes from 3,000 to 180,000 an acre.",
+                "地价从每英亩三千涨到十八万。",
+            ),
+            TranscriptCue(
+                "space", 5, 8, "The real estate in space is infinite.",
+                "太空中的可用空间近乎无限。",
+            ),
+        ]
+        terminology = [TerminologyEntry(
+            "real estate", TerminologyStrategy.TRANSLATE, target="房地产",
+        )]
+
+        self.assertEqual(terminology_contract_errors(cues, terminology), [])
 
     def test_acronyms_do_not_match_inside_ordinary_words(self) -> None:
         cues = [TranscriptCue(

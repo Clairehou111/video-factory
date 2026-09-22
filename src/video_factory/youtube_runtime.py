@@ -103,11 +103,14 @@ class ManagedYouTubeRuntime:
         return metadata
 
     def status(self) -> dict[str, Any]:
+        executable_override = self._executable_override()
         installed = self.settings.executable.is_file() and self.settings.installation_path.is_file()
         metadata: dict[str, Any] = {
             "installed": installed,
             "runtime_home": str(self.settings.runtime_home),
             "executable": str(self.settings.executable),
+            "active_executable": executable_override or str(self.settings.executable),
+            "executable_override": executable_override,
             "provider_server": str(self.settings.provider_server),
         }
         if self.settings.installation_path.is_file():
@@ -122,6 +125,9 @@ class ManagedYouTubeRuntime:
         return metadata
 
     def require_executable(self) -> str:
+        executable_override = self._executable_override()
+        if executable_override:
+            return executable_override
         if not self.settings.executable.is_file():
             raise RuntimeError("YouTube runtime is not installed; run `video-factory youtube-runtime setup`")
         if not self.status().get("version_pins_valid"):
@@ -130,12 +136,35 @@ class ManagedYouTubeRuntime:
             raise RuntimeError("YouTube PO-token provider is missing; run `video-factory youtube-runtime setup`")
         return str(self.settings.executable)
 
+    @staticmethod
+    def _executable_override() -> str:
+        configured = os.environ.get("VIDEO_FACTORY_YOUTUBE_EXECUTABLE", "").strip()
+        if not configured:
+            return ""
+        executable = Path(configured).expanduser()
+        if not executable.is_absolute():
+            raise RuntimeError("VIDEO_FACTORY_YOUTUBE_EXECUTABLE must be an absolute path")
+        executable = executable.resolve()
+        if not executable.is_file():
+            raise RuntimeError(f"YouTube executable override does not exist: {executable}")
+        if not os.access(executable, os.X_OK):
+            raise RuntimeError(f"YouTube executable override is not executable: {executable}")
+        return str(executable)
+
     def extractor_arguments(self, context: str = "gvs") -> list[str]:
         token = os.environ.get("VIDEO_FACTORY_YOUTUBE_PO_TOKEN", "").strip()
         youtube = "youtube:player_client=mweb"
         if token:
             youtube += f";po_token=mweb.{context}+{token}"
-        arguments = ["--extractor-args", youtube]
+        arguments: list[str] = []
+        if self._executable_override() and not token:
+            # yt-dlp expects each --plugin-dirs entry to contain a child such
+            # as plugin/yt_dlp_plugins, so the provider checkout itself is the
+            # search root.  This keeps the managed provider available when a
+            # healthier system yt-dlp binary is selected to avoid a broken
+            # managed Python/TLS stack.
+            arguments.extend(["--plugin-dirs", str(self.settings.provider_source)])
+        arguments.extend(["--extractor-args", youtube])
         if not token:
             arguments.extend([
                 "--extractor-args",

@@ -27,7 +27,8 @@ from .self_audit import ProblemLedger, ProblemObservation
 from .storage import Workspace
 from .youtube import DiscoveryConfig as YouTubeDiscoveryConfig
 from .youtube import (
-    YouTubeCollectionRenderer, YouTubeDiscoveryService, it_software_ai_markers,
+    SourceBelow1080Error, YouTubeAcquisitionError, YouTubeCollectionRenderer,
+    YouTubeDiscoveryService, YouTubeWebAuthRequired, it_software_ai_markers,
     political_markers, technical_share_markers, youtube_editorial_subject_text,
     validate_collection,
 )
@@ -320,6 +321,34 @@ def _rerender_requires_full_regeneration(error: BaseException) -> bool:
         "does not cite an archived image asset",
         "unidentifiedimageerror",
         "cannot identify image file",
+    ))
+
+
+def _retryable_adoption_error(error: BaseException) -> bool:
+    """Keep temporary source outages out of the human-repair queue.
+
+    A YouTube metadata or media fetch can fail before any editorial work is
+    possible.  TLS disconnects, timeouts, throttling, and upstream 5xx errors
+    are operational outages, not evidence that the candidate itself needs a
+    human decision.  Permanent source-contract failures still fail closed.
+    """
+    if not isinstance(error, YouTubeAcquisitionError):
+        return False
+    if isinstance(error, (SourceBelow1080Error, YouTubeWebAuthRequired)):
+        return False
+    detail = f"{type(error).__name__}: {error}".casefold()
+    permanent_markers = (
+        "metadata has no video id", "transcript is empty", "must use yt-dlp json3",
+        "has no audio track", "below 1080", "source quality",
+    )
+    if any(marker in detail for marker in permanent_markers):
+        return False
+    return any(marker in detail for marker in (
+        "ssl", "unexpected_eof", "timed out", "timeout", "temporary failure",
+        "connection reset", "connection aborted", "remote end closed",
+        "network lookup", "name resolution", "http error 429", "too many requests",
+        "http error 500", "http error 502", "http error 503", "http error 504",
+        "unable to download webpage", "unable to download api page",
     ))
 
 
@@ -2343,19 +2372,22 @@ def _youtube_adoption_decision(
         "youtube_editorial_score": round(max(0.0, min(100.0, source)), 2),
     }
     threshold = policy.youtube_minimum_score
-    passed = item.eligible and source >= threshold
+    score_clears = source >= threshold
+    passed = item.eligible and score_clears
     reasons = [] if passed else [
-        "youtube_editorial_score_below_threshold" if item.eligible
-        else "source_quality_gate_failed"
+        "source_quality_gate_failed" if not item.eligible
+        else "youtube_editorial_score_below_threshold"
     ]
+    score_verdict = "clears" if score_clears else "does not clear"
+    state_note = "" if item.eligible else " Candidate is currently held by its source/retry state."
     return {
         "version": 1, "pool": "youtube", "category_flags": [],
         "score": round(max(0.0, min(100.0, source)), 2),
         "threshold": threshold, "passed": passed,
         "breakdown": breakdown, "reasons": reasons,
         "summary": (
-            f"YouTube editorial score {source:.1f} "
-            f"{'clears' if passed else 'does not clear'} {threshold:.1f}."
+            f"YouTube editorial score {source:.1f} {score_verdict} {threshold:.1f}."
+            f"{state_note}"
         ),
     }
 
@@ -2796,6 +2828,34 @@ class ResourceDiscoveryService:
                         for parent in items
                         for child in atomize_robotics_roundup(parent)
                     ][:config.channels[channel].max_candidates]
+                transient_retries = {
+                    str(candidate_id): dict(payload)
+                    for candidate_id, payload in dict(
+                        channel_state.get("transient_retries") or {}
+                    ).items()
+                    if isinstance(payload, dict)
+                }
+                present_ids = {item.id for item in items}
+                injected_retry_ids: list[str] = []
+                for candidate_id, retry in transient_retries.items():
+                    retry_at = _parse_date(str(retry.get("retry_at") or ""))
+                    candidate_payload = retry.get("candidate")
+                    if (
+                        candidate_id in present_ids
+                        or (scheduled and retry_at and now < retry_at)
+                        or not isinstance(candidate_payload, dict)
+                    ):
+                        continue
+                    retry_item = DiscoveryCandidate.from_dict(candidate_payload)
+                    retry_item.status = "retry_pending"
+                    items.append(retry_item)
+                    present_ids.add(candidate_id)
+                    injected_retry_ids.append(candidate_id)
+                if transient_retries:
+                    entry.trace["transient_retries"] = {
+                        "queued": len(transient_retries),
+                        "injected_due": injected_retry_ids,
+                    }
                 skipped_ids = set(str(value) for value in (state.get("skipped_ids") or []))
                 needs_human_ids = {
                     str(value.get("candidate_id") or "")
@@ -2826,6 +2886,12 @@ class ResourceDiscoveryService:
                         item.eligible = False
                         item.status = "needs_human"
                         item.rejection_reasons.append("automatic_repair_budget_exhausted")
+                    transient_retry = transient_retries.get(item.id)
+                    retry_at = _parse_date(str((transient_retry or {}).get("retry_at") or ""))
+                    if transient_retry and scheduled and retry_at and now < retry_at:
+                        item.eligible = False
+                        item.status = "retry_wait"
+                        item.rejection_reasons.append("transient_source_retry_backoff")
                     evaluate_adoption_candidate(item, config.adoption_policy)
                     self.workspace.save_discovery_candidate(item.to_dict())
                 entry.candidates = items[:evaluation_limit]
@@ -2994,6 +3060,12 @@ class ResourceDiscoveryService:
                 channel_state.pop("blocked_candidate", None)
                 channel_state.pop("blocked_retry_at", None)
                 channel_state.pop("blocked_retry_runs", None)
+                transient_retries = dict(channel_state.get("transient_retries") or {})
+                transient_retries.pop(item.id, None)
+                if transient_retries:
+                    channel_state["transient_retries"] = transient_retries
+                else:
+                    channel_state.pop("transient_retries", None)
                 state.setdefault("generated_events", []).append({
                     "event_key": item.event_key, "title": item.title, "published_at": item.published_at,
                     "topic_type": item.topic_type.value if item.topic_type else "", "url": item.url,
@@ -3005,9 +3077,13 @@ class ResourceDiscoveryService:
                     ),
                 })
             else:
-                queue_status = self._record_blocked_candidate(state, item, config, self.clock())
-                if queue_status == "needs_human":
-                    adoption_statuses[channel][-1] = "needs_human"
+                queue_status = self._record_blocked_candidate(
+                    state, item, config, self.clock(),
+                    retryable=bool(adoption.get("retryable")),
+                    last_error=str(adoption.get("last_error") or ""),
+                )
+                if queue_status in {"needs_human", "retry_pending"}:
+                    adoption_statuses[channel][-1] = queue_status
         for channel, statuses_for_channel in adoption_statuses.items():
             entry = run.channels[channel.value]
             unique_statuses = set(statuses_for_channel)
@@ -3112,7 +3188,9 @@ class ResourceDiscoveryService:
         provider: str = "auto", model: str | None = None,
     ) -> dict[str, Any]:
         item = DiscoveryCandidate.from_dict(self.workspace.load_discovery_candidate(candidate_id))
-        if not item.eligible and item.status not in {"blocked", "needs_human"}:
+        if not item.eligible and item.status not in {
+            "blocked", "needs_human", "retry_pending", "retry_wait",
+        }:
             raise ValueError(f"candidate {candidate_id} did not pass its channel quality gate")
         result = self._adopt(item, config, provider, model)
         state = self.workspace.load_discovery_state()
@@ -3121,6 +3199,12 @@ class ResourceDiscoveryService:
             channel_state.pop("blocked_candidate", None)
             channel_state.pop("blocked_retry_at", None)
             channel_state.pop("blocked_retry_runs", None)
+            transient_retries = dict(channel_state.get("transient_retries") or {})
+            transient_retries.pop(item.id, None)
+            if transient_retries:
+                channel_state["transient_retries"] = transient_retries
+            else:
+                channel_state.pop("transient_retries", None)
             state.setdefault("generated_events", []).append({
                 "event_key": item.event_key, "title": item.title, "published_at": item.published_at,
                 "topic_type": item.topic_type.value if item.topic_type else "", "url": item.url,
@@ -3138,13 +3222,16 @@ class ResourceDiscoveryService:
         else:
             result["queue_status"] = self._record_blocked_candidate(
                 state, item, config, self.clock(),
+                retryable=bool(result.get("retryable")),
+                last_error=str(result.get("last_error") or ""),
             )
         self.workspace.save_discovery_state(state)
         return result
 
     def _record_blocked_candidate(
         self, state: dict[str, Any], item: DiscoveryCandidate,
-        config: ResourceDiscoveryConfig, now: datetime,
+        config: ResourceDiscoveryConfig, now: datetime, *, retryable: bool = False,
+        last_error: str = "",
     ) -> str:
         channel_state = state.setdefault("channels", {}).setdefault(item.channel.value, {})
         previous = channel_state.get("blocked_candidate")
@@ -3163,6 +3250,31 @@ class ResourceDiscoveryService:
                     "recorded_at": _iso(now), "reason": reason,
                 })
             state["needs_human_candidates"] = rows[-100:]
+
+        transient_retries = dict(channel_state.get("transient_retries") or {})
+        if retryable:
+            previous_retry = dict(transient_retries.get(item.id) or {})
+            retry_runs = int(previous_retry.get("retry_runs") or 0) + 1
+            retry_at = now.astimezone(UTC) + timedelta(hours=config.blocked_retry_delay_hours)
+            item.status = "retry_pending"
+            item.metadata["transient_retry"] = {
+                "retry_runs": retry_runs, "retry_at": _iso(retry_at),
+                "last_error": last_error[:1000],
+            }
+            self.workspace.save_discovery_candidate(item.to_dict())
+            transient_retries[item.id] = {
+                "candidate": item.to_dict(), "retry_runs": retry_runs,
+                "retry_at": _iso(retry_at), "last_error": last_error[:1000],
+            }
+            channel_state["transient_retries"] = transient_retries
+            return "retry_pending"
+
+        if item.id in transient_retries:
+            transient_retries.pop(item.id, None)
+            if transient_retries:
+                channel_state["transient_retries"] = transient_retries
+            else:
+                channel_state.pop("transient_retries", None)
 
         if isinstance(previous, dict) and previous.get("id") != item.id:
             previous_item = DiscoveryCandidate.from_dict(previous)
@@ -3215,6 +3327,12 @@ class ResourceDiscoveryService:
             channel_state.pop("blocked_candidate", None)
             channel_state.pop("blocked_retry_at", None)
             channel_state.pop("blocked_retry_runs", None)
+        transient_retries = dict(channel_state.get("transient_retries") or {})
+        transient_retries.pop(item.id, None)
+        if transient_retries:
+            channel_state["transient_retries"] = transient_retries
+        else:
+            channel_state.pop("transient_retries", None)
         state.setdefault("skipped_ids", []).append(item.id)
         state["needs_human_candidates"] = [
             value for value in (state.get("needs_human_candidates") or [])
@@ -3227,6 +3345,18 @@ class ResourceDiscoveryService:
         self, item: DiscoveryCandidate, config: ResourceDiscoveryConfig,
         provider: str, model: str | None,
     ) -> dict[str, Any]:
+        completed = self._latest_completed_generation(item.url)
+        if completed is not None:
+            item.status = "generated"
+            self.workspace.save_discovery_candidate(item.to_dict())
+            return {
+                "status": "generated", "candidate_id": item.id,
+                "attempts": [{
+                    "attempt": 0, "mode": "reuse_completed_generation",
+                    "status": "generated", "result": completed,
+                }],
+                "result": completed,
+            }
         attempts: list[dict[str, Any]] = []
         roundup_primary = _roundup_primary_source(item)
         generation_url = roundup_primary or item.url
@@ -3371,9 +3501,11 @@ class ResourceDiscoveryService:
                     retry_mode == "deterministic_rerender"
                     and _rerender_requires_full_regeneration(error)
                 )
+                retryable_error = _retryable_adoption_error(error)
                 attempts.append({
                     "attempt": attempt, "mode": retry_mode,
                     "status": "failed", "error": f"{type(error).__name__}: {error}",
+                    "retryable": retryable_error,
                     **({"recovery": "discard_invalid_manifest_and_regenerate"} if discard_cached_manifest else {}),
                 })
                 if discard_cached_manifest:
@@ -3392,7 +3524,16 @@ class ResourceDiscoveryService:
                     break
         item.status = "blocked"
         self.workspace.save_discovery_candidate(item.to_dict())
-        return {"status": "blocked", "candidate_id": item.id, "attempts": attempts}
+        failed_attempts = [attempt for attempt in attempts if attempt.get("status") == "failed"]
+        retryable = bool(failed_attempts) and len(failed_attempts) == len(attempts) and all(
+            bool(attempt.get("retryable")) for attempt in failed_attempts
+        )
+        last_error = str((failed_attempts[-1] if failed_attempts else {}).get("error") or "")
+        return {
+            "status": "blocked", "candidate_id": item.id, "attempts": attempts,
+            "retryable": retryable, "last_error": last_error,
+            "failure_kind": "transient_source_acquisition" if retryable else "generation_or_quality",
+        }
 
     def _latest_youtube_assets(self, source_url: str) -> tuple[Path | None, Path | None]:
         """Reuse complete source assets across planning/render retries.
@@ -3459,6 +3600,57 @@ class ResourceDiscoveryService:
             manifest = payload.get("manifest")
             if manifest and Path(str(manifest)).is_file():
                 return Path(str(manifest))
+        return None
+
+    def _latest_completed_generation(self, source_url: str) -> dict[str, Any] | None:
+        """Reuse a validated direct generation when discovery later adopts it.
+
+        Manual/editor-guided generation is a normal recovery path for a
+        discovery candidate. Treating that completed artifact as invisible
+        leaves the old ``needs_human`` row active and can generate the same
+        source twice on the next discovery run.
+        """
+        jobs = self.workspace.root / "jobs"
+        if not jobs.is_dir():
+            return None
+        results = sorted(
+            jobs.glob("*/result.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        ignored_checks = {
+            "music_license_record", "editorial_safety_review", "rights_review",
+        }
+        for path in results[:100]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                payload.get("status") != "completed"
+                or not same_source(str(payload.get("url") or ""), source_url)
+            ):
+                continue
+            failed_checks = [
+                check for check in [
+                    *(payload.get("checks") or []),
+                    *(payload.get("video_checks") or []),
+                ]
+                if isinstance(check, dict)
+                and not check.get("passed", False)
+                and str(check.get("name") or "") not in ignored_checks
+            ]
+            if failed_checks:
+                continue
+            output = payload.get("collection_manifest") or payload.get("video")
+            if not output:
+                continue
+            output_path = Path(str(output))
+            if not output_path.is_absolute():
+                output_path = self.workspace.root / output_path
+            if not output_path.is_file():
+                continue
+            return payload
         return None
 
     @staticmethod

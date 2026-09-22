@@ -1116,12 +1116,15 @@ def _is_definitive_pre_submit_failure(arguments: list[str], stdout: str, stderr:
         return False
     evidence = f"{stdout}\n{stderr}".lower()
     markers = (
+        "video_factory_pre_submit_guard",
         "cookie is missing or expired",
         "account file is missing",
         "cookie文件不存在",
         "cookie文件已失效",
         "cookie 失效",
         "无法确认视频号原创声明已勾选，停止发表",
+        "无法确认视频号位置已设为不显示位置，停止发表",
+        "无法确认视频号未标注ai生成内容，停止发表",
     )
     return any(marker in evidence for marker in markers)
 
@@ -1247,6 +1250,59 @@ def _apply_upstream_compatibility_patches(source: Path) -> list[str]:
                 "        # Avoid a third browser-only cookie probe; open_upload_page verifies login before file selection.\n"
             )
             patched = patched.replace(duplicate_base_check, real_page_check, 1)
+        publish_choices_marker = "Video Factory enforces its WeChat location and AI-label policy."
+        publish_choices = (
+            "    async def apply_video_privacy_policy(self, page: Page) -> None:\n"
+            f"        # {publish_choices_marker}\n"
+            "        position = page.locator('.post-position-wrap').first\n"
+            "        try:\n"
+            "            await position.wait_for(state=\"visible\", timeout=10000)\n"
+            "        except Exception as exc:\n"
+            "            raise RuntimeError(\"VIDEO_FACTORY_PRE_SUBMIT_GUARD: 找不到视频号位置控件，停止发表\") from exc\n"
+            "        position_display = position.locator('.position-display').first\n"
+            "        if not await position_display.count():\n"
+            "            raise RuntimeError(\"VIDEO_FACTORY_PRE_SUBMIT_GUARD: 找不到视频号位置控件，停止发表\")\n"
+            "        location_text = ((await position_display.inner_text(timeout=5000)) or \"\").strip()\n"
+            "        if \"不显示位置\" not in location_text:\n"
+            "            trigger = position.locator('.position-display-wrap').first\n"
+            "            if not await trigger.count():\n"
+            "                raise RuntimeError(\"VIDEO_FACTORY_PRE_SUBMIT_GUARD: 找不到视频号位置下拉框，停止发表\")\n"
+            "            await trigger.click()\n"
+            "            panel = position.locator('.location-filter-wrap').first\n"
+            "            try:\n"
+            "                await panel.wait_for(state=\"visible\", timeout=10000)\n"
+            "            except Exception as exc:\n"
+            "                raise RuntimeError(\"VIDEO_FACTORY_PRE_SUBMIT_GUARD: 视频号位置下拉框未打开，停止发表\") from exc\n"
+            "            no_location = panel.locator('.option-item', has_text=\"不显示位置\").first\n"
+            "            try:\n"
+            "                await no_location.wait_for(state=\"visible\", timeout=10000)\n"
+            "            except Exception as exc:\n"
+            "                raise RuntimeError(\"VIDEO_FACTORY_PRE_SUBMIT_GUARD: 不显示位置选项不可见，停止发表\") from exc\n"
+            "            await no_location.click()\n"
+            "            await page.wait_for_timeout(300)\n"
+            "            location_text = ((await position_display.inner_text(timeout=5000)) or \"\").strip()\n"
+            "        if \"不显示位置\" not in location_text:\n"
+            "            raise RuntimeError(\"VIDEO_FACTORY_PRE_SUBMIT_GUARD: 无法确认视频号位置已设为不显示位置，停止发表\")\n"
+            "        tencent_logger.success(_msg(\"✅\", \"已选择不显示位置\"))\n"
+            "\n"
+            "        mark_tag = page.locator('.post-with-mark-tag').first\n"
+            "        if await mark_tag.count():\n"
+            "            display = mark_tag.locator('.select-display').first\n"
+            "            display_text = ((await display.text_content()) or \"\").strip()\n"
+            "            if \"含AI生成内容\" in display_text:\n"
+            "                await display.click()\n"
+            "                no_ai_label = mark_tag.locator('.mark-tag-option').filter(\n"
+            "                    has=page.locator('.option-main:text-is(\"无需标注\")')\n"
+            "                ).first\n"
+            "                await no_ai_label.wait_for(state=\"visible\", timeout=10000)\n"
+            "                await no_ai_label.click()\n"
+            "                await page.wait_for_timeout(300)\n"
+            "                display_text = ((await display.text_content()) or \"\").strip()\n"
+            "            if \"含AI生成内容\" in display_text:\n"
+            "                raise RuntimeError(\"无法确认视频号未标注AI生成内容，停止发表\")\n"
+            "        tencent_logger.success(_msg(\"✅\", \"未标注含AI生成内容\"))\n"
+            "\n"
+        )
         original_statement_marker = "Video Factory applies its source-aware WeChat originality policy."
         original_statement = (
             "    async def apply_original_statement(self, page: Page) -> None:\n"
@@ -1331,6 +1387,27 @@ def _apply_upstream_compatibility_patches(source: Path) -> list[str]:
         )
         if original_statement_pattern.search(patched):
             patched = original_statement_pattern.sub(original_statement, patched, count=1)
+        privacy_policy_pattern = re.compile(
+            r"(?ms)^    async def apply_video_privacy_policy\(self, page: Page\) -> None:\n"
+            r".*?(?=^    (?:async )?def |\Z)"
+        )
+        if privacy_policy_pattern.search(patched):
+            patched = privacy_policy_pattern.sub(publish_choices, patched, count=1)
+        elif publish_choices_marker not in patched:
+            patched = patched.replace(
+                "    async def apply_original_statement(self, page: Page) -> None:\n",
+                publish_choices + "    async def apply_original_statement(self, page: Page) -> None:\n",
+                1,
+            )
+        if "await self.apply_video_privacy_policy(page)" not in patched:
+            patched = patched.replace(
+                "            await self.set_short_title(page, self.title, self.short_title)\n"
+                "            await self.submit_publish(page)\n",
+                "            await self.set_short_title(page, self.title, self.short_title)\n"
+                "            await self.apply_video_privacy_policy(page)\n"
+                "            await self.submit_publish(page)\n",
+                1,
+            )
         if patched != original:
             path.write_text(patched, encoding="utf-8")
             changed.append(str(path.relative_to(source)))

@@ -503,6 +503,46 @@ class CollectionPublishBatchService:
         self.save(batch)
         return batch
 
+    def reconcile_tencent_manual_outcome(
+        self, batch: CollectionPublishBatch, item_id: str, actor: str,
+        outcome: str, reason: str,
+    ) -> CollectionPublishBatch:
+        """Resolve an uncertain WeChat attempt using an operator-observed outcome."""
+        item = next((value for value in batch.items if value.id == item_id), None)
+        if item is None:
+            raise KeyError(item_id)
+        if item.platform != PublishPlatform.TENCENT:
+            raise ValueError("manual outcome reconciliation is only supported for Tencent")
+        if item.state != CollectionPublishItemState.UNCERTAIN:
+            raise ValueError("only an uncertain item can be reconciled")
+        if not actor.strip() or not reason.strip():
+            raise ValueError("manual outcome reconciliation requires an actor and reason")
+        normalized_outcome = outcome.strip().lower()
+        if normalized_outcome not in {"published", "not_submitted"}:
+            raise ValueError("manual outcome must be published or not_submitted")
+
+        previous_error = item.last_error
+        if normalized_outcome == "published":
+            item.state = CollectionPublishItemState.SUBMITTED
+            item.submitted_at = item.submitted_at or now_iso()
+            item.last_error = ""
+        else:
+            item.state = CollectionPublishItemState.FAILED_PRE_SUBMIT
+            item.last_error = (
+                "operator confirmed the final publish click did not complete: "
+                + reason.strip()
+            )
+        self.workspace.append_publish_attempt(
+            batch.id, item.platform.value, f"reconcile_manual_outcome:{item.id}",
+            {
+                "actor": actor.strip(), "outcome": normalized_outcome,
+                "reason": reason.strip(), "previous_error": previous_error,
+                "recorded_at": now_iso(),
+            },
+        )
+        self._finish(batch)
+        return batch
+
     def _record(self, batch: CollectionPublishBatch, platform: str, action: str, result: BackendResult) -> None:
         self.workspace.append_publish_attempt(
             batch.id, platform, action, {**result.to_audit_dict(), "recorded_at": now_iso()},

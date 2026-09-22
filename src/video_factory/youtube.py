@@ -277,6 +277,8 @@ ESTABLISHED_CHINESE_TERMS: dict[str, str] = {
     "evals": "评测",
     "eval": "评测",
     "benchmark": "基准测试",
+    "test harness": "测试框架",
+    "deceptive": "刻意欺骗",
     "knowledge work": "知识工作",
     "vertical": "垂直行业",
     "productivity gain": "生产力提升",
@@ -302,6 +304,9 @@ CONTEXTUAL_CHINESE_TERMS: dict[tuple[str, str], tuple[str, ...]] = {
     ("open-source check", "open-source check"): ("开源的制衡", "制衡"),
     ("royalty", "royalty"): ("版税", "收益"),
     ("app tier", "app tier"): ("应用层", "应用"),
+    ("real estate", "buy real estate"): ("买地", "土地"),
+    ("real estate", "real estate goes"): ("地价",),
+    ("real estate", "real estate in space"): ("可用空间", "空间"),
 }
 CAPTION_ENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "TSMC": ("TSMC", "台积电"),
@@ -325,10 +330,11 @@ INTERVIEW_BOUNDARY_PADDING_SECONDS = 2.0
 INTERVIEW_MIN_SECONDS = 45.0
 INTERVIEW_MAX_SECONDS = 180.0
 INTERVIEW_MAX_INTERNAL_SILENCE_SECONDS = 3.0
-INTERVIEW_CAPTION_POLICY_VERSION = "2026-09-21-v1"
+INTERVIEW_CAPTION_POLICY_VERSION = "2026-09-22-v3"
 INTERVIEW_CAPTION_TARGET_MAX_SECONDS = 5.0
 INTERVIEW_CAPTION_HARD_MAX_SECONDS = 7.5
 INTERVIEW_CAPTION_MIN_SECONDS = 1.2
+INTERVIEW_CAPTION_BRIEF_ACK_MIN_SECONDS = 0.75
 INTERVIEW_CAPTION_TARGET_MAX_ENGLISH_WORDS = 14
 INTERVIEW_CAPTION_MAX_ENGLISH_WORDS = 28
 INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS = 22
@@ -346,6 +352,9 @@ def _interview_caption_policy_fingerprint() -> str:
         "target_max_seconds": INTERVIEW_CAPTION_TARGET_MAX_SECONDS,
         "hard_max_seconds": INTERVIEW_CAPTION_HARD_MAX_SECONDS,
         "minimum_seconds": INTERVIEW_CAPTION_MIN_SECONDS,
+        "brief_acknowledgement_minimum_seconds": (
+            INTERVIEW_CAPTION_BRIEF_ACK_MIN_SECONDS
+        ),
         "target_maximum_english_words": INTERVIEW_CAPTION_TARGET_MAX_ENGLISH_WORDS,
         "maximum_english_words": INTERVIEW_CAPTION_MAX_ENGLISH_WORDS,
         "target_maximum_chinese_characters": (
@@ -1762,18 +1771,20 @@ def _editorial_planning_transcript(
 
 
 _GUIDANCE_TIME_RANGE = re.compile(
-    r"(?<!\d)(?P<start>(?:\d{1,2}:)?\d{1,2}:[0-5]\d)\s*"
+    r"(?<!\d)(?P<start>(?:\d{1,2}:)?\d{1,2}:[0-5]\d(?:\.\d{1,3})?)\s*"
     r"(?:-|–|—|to|through)\s*"
-    r"(?P<end>(?:\d{1,2}:)?\d{1,2}:[0-5]\d)(?!\d)",
+    r"(?P<end>(?:\d{1,2}:)?\d{1,2}:[0-5]\d(?:\.\d{1,3})?)(?!\d)",
     re.IGNORECASE,
 )
 
 
 def _guidance_clock_seconds(value: str) -> float:
-    parts = [int(part) for part in value.split(":")]
+    raw_parts = value.split(":")
+    parts = [int(part) for part in raw_parts[:-1]]
+    seconds = float(raw_parts[-1])
     if len(parts) == 2:
-        return float(parts[0] * 60 + parts[1])
-    return float(parts[0] * 3600 + parts[1] * 60 + parts[2])
+        return float(parts[0] * 3600 + parts[1] * 60 + seconds)
+    return float(parts[0] * 60 + seconds)
 
 
 def _add_guidance_ranges_to_planning_transcript(
@@ -1892,6 +1903,20 @@ def _matching_completed_directing_audit(
             or str(item.get("winning_context") or "").strip() == context
         )
     ), None)
+
+
+def _asr_duplicate_cleanup_only(source: str, verified: str) -> bool:
+    """Return true when audio verification only removes adjacent duplicates."""
+    def normalized_tokens(value: str) -> list[str]:
+        tokens = re.findall(r"[a-z0-9]+(?:['’][a-z0-9]+)?", value.casefold())
+        return [
+            token for index, token in enumerate(tokens)
+            if index == 0 or token != tokens[index - 1]
+        ]
+
+    source_tokens = normalized_tokens(source)
+    verified_tokens = normalized_tokens(verified)
+    return bool(source_tokens) and source_tokens == verified_tokens
 
 
 class NaturalSubtitleTranslator:
@@ -2561,6 +2586,7 @@ class NaturalSubtitleTranslator:
         """
         _retime_existing_semantic_card_groups(cues)
         plans: dict[str, tuple[TranscriptCue, list[str]]] = {}
+        timing_adjustments: list[dict[str, float | str]] = []
         for cue in cues:
             # A stale cached plan may already contain ``-card-*`` rows from an
             # older policy. Keep compliant rows unchanged, but allow an
@@ -2581,6 +2607,26 @@ class NaturalSubtitleTranslator:
             parts = _coalesce_short_semantic_parts(parts, cue.duration)
             parts = _split_overlong_semantic_parts(parts, cue.duration)
             if len(parts) <= 1:
+                # YouTube occasionally leaves a short, indivisible sentence
+                # on screen a few frames beyond the hard display limit. A
+                # translation rewrite cannot repair timing. Trim only that
+                # small trailing display overrun and retain original_end as
+                # the source-evidence boundary; larger spans still fail
+                # closed or require a defensible semantic split.
+                if (
+                    cue.duration > INTERVIEW_CAPTION_HARD_MAX_SECONDS
+                    and cue.duration <= INTERVIEW_CAPTION_HARD_MAX_SECONDS + 0.5
+                ):
+                    previous_end = cue.end
+                    cue.end = round(
+                        cue.start + INTERVIEW_CAPTION_HARD_MAX_SECONDS, 3,
+                    )
+                    timing_adjustments.append({
+                        "cue_id": cue.id,
+                        "previous_end": previous_end,
+                        "display_end": cue.end,
+                        "trimmed_seconds": round(previous_end - cue.end, 3),
+                    })
                 if stale_card_errors:
                     # Text-density failures can often be repaired by a concise
                     # card-specific translation without changing the already
@@ -2605,6 +2651,7 @@ class NaturalSubtitleTranslator:
                 "provenance": None,
                 "translation_attempt_provenance": [],
                 "fidelity_review_provenance": None,
+                "timing_adjustments": timing_adjustments,
             }
 
         requested: list[dict[str, Any]] = []
@@ -2729,7 +2776,10 @@ class NaturalSubtitleTranslator:
                             invalid.append(card_id)
                         if (
                             _contains_term(source_value, "maybe")
-                            and not re.search(r"可能|也许|或许", text_value)
+                            and not re.search(
+                                r"可能|也许|或许|大约|约有?|差不多",
+                                text_value,
+                            )
                         ):
                             invalid.append(card_id)
                         for term in terminology:
@@ -3009,6 +3059,7 @@ class NaturalSubtitleTranslator:
             "provenance": provenance,
             "translation_attempt_provenance": translation_attempt_provenance,
             "fidelity_review_provenance": fidelity_review_provenance,
+            "timing_adjustments": timing_adjustments,
         }
 
     def repair_audio_verified_cards(
@@ -3024,6 +3075,7 @@ class NaturalSubtitleTranslator:
         if not corrections:
             return None
         merged_fragments: list[dict[str, str]] = []
+        duplicate_cleanup_cue_ids: list[str] = []
         retained_corrections: list[dict[str, Any]] = []
         for row in corrections:
             card_id = str(row.get("cue_id") or "")
@@ -3031,6 +3083,17 @@ class NaturalSubtitleTranslator:
             index = next((
                 position for position, cue in enumerate(cues) if cue.id == card_id
             ), -1)
+            if index >= 0 and _asr_duplicate_cleanup_only(
+                cues[index].source_text, verified,
+            ):
+                # Removing an adjacent ASR duplicate changes no proposition.
+                # Keep the already reviewed Chinese instead of asking a model
+                # to rewrite an intentionally short setup card, which can
+                # introduce a dangling fragment even though the audio only
+                # confirmed "is is" -> "is".
+                cues[index].source_text = verified
+                duplicate_cleanup_cue_ids.append(card_id)
+                continue
             parent = card_id.rsplit("-card-", 1)[0]
             can_merge = (
                 index >= 0
@@ -3063,6 +3126,7 @@ class NaturalSubtitleTranslator:
                 "step": "audio_verified_caption_repair",
                 "cue_ids": [],
                 "merged_fragments": merged_fragments,
+                "duplicate_cleanup_cue_ids": duplicate_cleanup_cue_ids,
                 "translation_attempts": [],
                 "review_attempts": [],
             }
@@ -3208,10 +3272,10 @@ class NaturalSubtitleTranslator:
             "step": "audio_verified_caption_repair",
             "cue_ids": sorted(expected),
             "merged_fragments": merged_fragments,
+            "duplicate_cleanup_cue_ids": duplicate_cleanup_cue_ids,
             "translation_attempts": attempts,
             "review_attempts": reviews,
         }
-
     def repair_interview_chinese_style(
         self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
     ) -> dict[str, Any] | None:
@@ -3672,6 +3736,16 @@ class NaturalSubtitleTranslator:
                     raise ValueError(
                         f"terminology repair ids mismatch; missing={missing}, extra={extra}"
                     )
+                trial_cues = [TranscriptCue(**asdict(cue)) for cue in cues]
+                trial_by_id = {cue.id: cue for cue in trial_cues}
+                for cue_id, proposed in candidate.items():
+                    trial_by_id[cue_id].translation = proposed
+                remaining = terminology_contract_errors(trial_cues, terminology)
+                if remaining:
+                    raise ValueError(
+                        "terminology repair did not satisfy the contract: "
+                        + "; ".join(remaining)
+                    )
                 translations = candidate
                 break
             except Exception as error:
@@ -3709,7 +3783,10 @@ class NaturalSubtitleTranslator:
             if not isinstance(item, dict) or not source:
                 continue
             try:
-                strategy = TerminologyStrategy(str(item.get("strategy") or item.get("choice") or "preserve"))
+                strategy = TerminologyStrategy(str(
+                    item.get("strategy") or item.get("choice")
+                    or item.get("mode") or "preserve"
+                ))
             except ValueError:
                 strategy = TerminologyStrategy.PRESERVE
             target = str(item.get("target") or item.get("translation") or "").strip()
@@ -3718,6 +3795,20 @@ class NaturalSubtitleTranslator:
             if established_target:
                 strategy = TerminologyStrategy.TRANSLATE
                 target = established_target
+                explanation = ""
+            elif (
+                strategy == TerminologyStrategy.PRESERVE
+                and source == source.casefold()
+                and target
+                and target.casefold() != source.casefold()
+                and re.search(r"[\u3400-\u9fff]", target)
+            ):
+                # Planning responses sometimes say mode=translate while an
+                # older parser only reads strategy/choice and caches the row
+                # as preserve. A lowercase ordinary word paired with an
+                # explicit Chinese target is translation vocabulary, not a
+                # product identifier that should be duplicated in brackets.
+                strategy = TerminologyStrategy.TRANSLATE
                 explanation = ""
             if strategy == TerminologyStrategy.BILINGUAL_ONCE and not explanation:
                 explanation = target
@@ -3754,7 +3845,11 @@ class NaturalSubtitleTranslator:
                 ))
                 known.add(term.casefold())
         for term in PROTECTED_TERMS:
-            if _contains_term(source, term) and term.casefold() not in known:
+            if (
+                _contains_term(source, term)
+                and term.casefold() not in known
+                and not any(_contains_term(entry.source, term) for entry in entries)
+            ):
                 strategy = TerminologyStrategy.BILINGUAL_ONCE if term in {"Harness"} else TerminologyStrategy.PRESERVE
                 entries.append(TerminologyEntry(
                     term, strategy,
@@ -4919,9 +5014,15 @@ class YouTubeAcquirer:
                 if attempt:
                     raise
                 # A bounded transfer can exit zero after one stream ends early.
-                # Remove only this job's incomplete generated file and let the
-                # agent retry the same auditable acquisition route once.
+                # Remove only this job's incomplete generated file. Direct
+                # remote section seeks are not resumable when Google closes
+                # one DASH stream early, so retry by downloading the complete
+                # source through yt-dlp's resumable native path. The renderer
+                # still uses only the exact selected source range.
                 downloaded.unlink(missing_ok=True)
+                if requested_window is not None:
+                    requested_window = None
+                    download_window = None
                 continue
             break
         self._require_1080p(probe.width, probe.height, downloaded)
@@ -5042,6 +5143,15 @@ class YouTubeAcquirer:
                 # Interview clips are short enough to pay the bounded re-encode
                 # cost for frame-accurate, zero-based A/V timelines.
                 "--force-keyframes-at-cuts",
+                # Google can close one DASH input after a long idle burst.
+                # Without reconnect, ffmpeg exits zero with a truncated audio
+                # track and yt-dlp cannot resume the sectioned transfer.
+                "--downloader-args",
+                (
+                    "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 "
+                    "-reconnect_on_network_error 1 "
+                    "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5"
+                ),
             ])
         command.extend([*self._extractor_args(), *self._auth_args(), "-o", output, url])
         try:
@@ -5386,6 +5496,17 @@ def _semantic_english_parts(value: str, desired_count: int) -> list[str]:
             # than cutting the governing clause after "I don't think".
             boundary_costs[index] = 1.0
         elif (
+            current in {"i", "we", "they", "he", "she", "it"}
+            and index >= 6
+            and index + 1 < len(clean_words)
+            and clean_words[index + 1] == current
+        ):
+            # Repeated pronouns commonly mark a fresh clause after broken
+            # interview ASR ("...is probably the best way we we best thing
+            # we can do..."). Cutting at the restart keeps the preceding
+            # claim intact and lets translation remove the duplicated token.
+            boundary_costs[index] = 0.4
+        elif (
             current == "capture" and index >= 6
             and clean_words[index - 1] == "of"
             and "work" in clean_words[max(0, index - 4):index]
@@ -5450,6 +5571,18 @@ def _semantic_english_parts(value: str, desired_count: int) -> list[str]:
                 # "so", "uh", an article, or another open connector.
                 continue
             if any(
+                re.match(
+                    r"^(?:and|or)\s+(?:be|have|do)\b",
+                    part.strip(), re.IGNORECASE,
+                )
+                for part in candidate_parts[1:]
+            ):
+                # Coordinated predicates inherit their subject from the
+                # preceding card ("...build weapons / or be deceptive").
+                # They cannot be translated as independent cards without
+                # importing context across the fixed boundary.
+                continue
+            if any(
                 (
                     candidate_parts[index + 1].casefold().startswith("and the ")
                     and not re.search(
@@ -5491,7 +5624,23 @@ def _semantic_english_parts(value: str, desired_count: int) -> list[str]:
 
 def _semantic_source_part_is_dangling(value: str) -> bool:
     """Reject fixed card cuts that leave a setup without its complement."""
-    cleaned = re.sub(r"[-,:;]+$", "", value.strip()).strip()
+    stripped = value.strip()
+    cleaned = re.sub(r"[-,:;]+$", "", stripped).strip()
+    if (
+        re.match(
+            r"^(?:(?:um+|uh+|i\s+mean|you\s+know|and)\W+)*"
+            r"(?:if|when)\b",
+            cleaned, re.IGNORECASE,
+        )
+        and not re.search(r"[.!?][\"'”’)]?$", stripped)
+    ):
+        # A card beginning with a dependent condition is not safe to split
+        # again before a sentence boundary. This catches both a comma cut
+        # ("If we don't obsolete our products,") and an earlier conjunction
+        # cut ("If we don't obsolete our products / and services, ...").
+        # Keep the complete conditional together instead of asking the
+        # translation model to invent or copy its consequence.
+        return True
     if (
         re.search(r"\b(?:uh|um)$", cleaned, re.IGNORECASE)
         and not re.search(r"\bof\s+(?:uh|um)$", cleaned, re.IGNORECASE)
@@ -5511,9 +5660,22 @@ def _semantic_source_part_is_dangling(value: str) -> bool:
     ):
         return True
     if re.search(
-        r"\b(?:predicts?|forecast(?:s|ed)?|found|divided)"
+        r"\b(?:predicts?|forecast(?:s|ed)?|found|divided|figure(?:d)?\s+out)"
         r"(?:\s+(?:that|the|a|an|our|their|his|her|its|\w+)){0,3}$",
         cleaned, re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        r"\b(?:that|which|where)\s+(?:you|we|they|he|she|it)$",
+        cleaned, re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\b(?:they're|we're|you're|it's|that's)$", cleaned, re.IGNORECASE):
+        return True
+    if (
+        re.match(r"^(?:you\s+know|i\s+mean)\b", cleaned, re.IGNORECASE)
+        and len(re.findall(r"\S+", cleaned)) <= 5
+        and not re.search(r"[.!?][\"'”’)]?$", stripped)
     ):
         return True
     # These are explicit complement heads seen in spoken interview clauses;
@@ -5569,7 +5731,9 @@ def _semantic_card_translation_errors(
     if translation and not re.search(r"[。！？!?]$", translation):
         errors.append("punctuation")
     errors.extend(_caption_entity_alignment_errors(source, translation))
-    if _contains_term(source, "maybe") and not re.search(r"可能|也许|或许", translation):
+    if _contains_term(source, "maybe") and not re.search(
+        r"可能|也许|或许|大约|约有?|差不多", translation,
+    ):
         errors.append("modality")
     if (
         _contains_term(source, "up the stack")
@@ -5905,12 +6069,21 @@ def targeted_whisper_caption_audit(
             "suspicious YouTube captions require local Whisper, but whisper is unavailable"
         )
     policy_version = TARGETED_WHISPER_POLICY_VERSION
+    try:
+        context_seconds = float(os.environ.get(
+            "VIDEO_FACTORY_WHISPER_CONTEXT_SECONDS",
+            str(TARGETED_WHISPER_CONTEXT_SECONDS),
+        ))
+    except ValueError:
+        context_seconds = TARGETED_WHISPER_CONTEXT_SECONDS
+    context_seconds = max(2.0, min(context_seconds, TARGETED_WHISPER_CONTEXT_SECONDS))
     source_fingerprint = hashlib.sha256(json.dumps({
         "media": str(media_path.resolve()),
         "size": media_path.stat().st_size,
         "mtime_ns": media_path.stat().st_mtime_ns,
         "findings": findings,
         "model": os.environ.get("VIDEO_FACTORY_WHISPER_MODEL", "large-v3-turbo"),
+        "context_seconds": context_seconds,
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     fingerprint = hashlib.sha256(
         f"{policy_version}:{source_fingerprint}".encode("utf-8")
@@ -5931,8 +6104,8 @@ def targeted_whisper_caption_audit(
     # Keep enough surrounding audio for lexical alignment to find the actual
     # phrase instead of silently accepting a nearby repeated fragment.
     padded = sorted((
-        max(0.0, float(row["start"]) - TARGETED_WHISPER_CONTEXT_SECONDS),
-        float(row["end"]) + TARGETED_WHISPER_CONTEXT_SECONDS,
+        max(0.0, float(row["start"]) - context_seconds),
+        float(row["end"]) + context_seconds,
     ) for row in findings)
     merged: list[list[float]] = []
     for start, end in padded:
@@ -6058,7 +6231,15 @@ def interview_caption_duration_errors(cues: list[TranscriptCue]) -> list[str]:
         if not source or not translation:
             errors.append(f"{cue.id} is missing bilingual caption text")
             continue
-        if cue.duration < INTERVIEW_CAPTION_MIN_SECONDS - 1e-6:
+        brief_acknowledgement = (
+            cue.duration >= INTERVIEW_CAPTION_BRIEF_ACK_MIN_SECONDS - 1e-6
+            and words <= 2
+            and len(translation) <= 4
+        )
+        if (
+            cue.duration < INTERVIEW_CAPTION_MIN_SECONDS - 1e-6
+            and not brief_acknowledgement
+        ):
             errors.append(
                 f"{cue.id} lasts {cue.duration:.2f}s, below the "
                 f"{INTERVIEW_CAPTION_MIN_SECONDS:.2f}s minimum"
@@ -7546,11 +7727,17 @@ def _local_interview_media_window(
     cached_duration = float(cached_clip.get("media_duration") or 0)
     tolerance = max(2.0, cached_duration * 0.03)
     required = ("original_start", "original_end", "download_start", "download_end")
+    has_explicit_window = all(cached_clip.get(key) is not None for key in required)
+    explicit_duration = (
+        float(cached_clip["download_end"]) - float(cached_clip["download_start"])
+        if has_explicit_window else 0.0
+    )
     if (
-        cached_clip.get("rebased")
-        and cached_duration > 0
-        and abs(media_duration - cached_duration) <= tolerance
-        and all(cached_clip.get(key) is not None for key in required)
+        has_explicit_window
+        and (
+            (cached_duration > 0 and abs(media_duration - cached_duration) <= tolerance)
+            or abs(media_duration - explicit_duration) <= max(2.0, explicit_duration * 0.03)
+        )
     ):
         return ({key: float(cached_clip[key]) for key in required}, True)
     original_start = float(cached_clip["original_start"])

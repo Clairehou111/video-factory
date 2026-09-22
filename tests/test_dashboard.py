@@ -110,6 +110,38 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["batch_id"], "dashboard-batch-new")
 
+    def test_queue_keeps_distinct_clips_from_same_youtube_source(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            batch.id = "dashboard-batch-second-clip"
+            batch.manifest_id = "second-clip-manifest"
+            batch.created_at = "9999-01-01T00:00:00Z"
+            workspace.save_publish_batch(batch)
+
+            def manifest_for(identifier):
+                original_start = 10.0 if identifier == "missing-manifest" else 90.0
+                return SimpleNamespace(
+                    source_video_id="same-video",
+                    source_url="https://youtube.test/watch",
+                    source_title="Interview",
+                    editorial_mode="known_tech_interview_clip",
+                    items=[SimpleNamespace(source_ranges=[SimpleNamespace(
+                        original_start=original_start,
+                        original_end=original_start + 45.0,
+                    )])],
+                )
+
+            with patch.object(
+                workspace, "load_collection_manifest", side_effect=manifest_for,
+            ):
+                rows, _ = PublishDashboard(workspace).queue()
+
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                {row["batch_id"] for row in rows},
+                {"dashboard-batch", "dashboard-batch-second-clip"},
+            )
+
     def test_publish_button_approves_and_submits_only_selected_wechat_item(self) -> None:
         with TemporaryDirectory() as temp:
             workspace, batch = self.make_batch(Path(temp))
@@ -142,6 +174,44 @@ class DashboardTest(unittest.TestCase):
                 restored.approval_payload()["items"][0]["schedule_at"],
                 "2099-09-16 20:30",
             )
+
+    def test_collection_retry_allows_unchanged_empty_schedule(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            for item in batch.items:
+                item.options = item.as_publish_target().options
+            batch.approve("claire")
+            batch.state = PublishBatchState.FAILED
+            batch.items[0].state = CollectionPublishItemState.FAILED_PRE_SUBMIT
+            workspace.save_publish_batch(batch)
+            backend = FakeDashboardBackend()
+            dashboard = PublishDashboard(
+                workspace, actor="claire", backend_factory=lambda: backend,
+            )
+
+            result = dashboard.publish(
+                batch.id, "wechat-item", None, update_schedule=True,
+            )
+
+            self.assertTrue(result["published"])
+            self.assertEqual(backend.uploaded, [(PublishPlatform.TENCENT, "wechat.mp4")])
+
+    def test_collection_retry_still_rejects_schedule_change(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_batch(Path(temp))
+            for item in batch.items:
+                item.options = item.as_publish_target().options
+            batch.approve("claire")
+            batch.state = PublishBatchState.FAILED
+            batch.items[0].state = CollectionPublishItemState.FAILED_PRE_SUBMIT
+            workspace.save_publish_batch(batch)
+            dashboard = PublishDashboard(workspace)
+
+            with self.assertRaisesRegex(ValueError, "最终审核前"):
+                dashboard.publish(
+                    batch.id, "wechat-item", "2099-09-16 20:30",
+                    update_schedule=True,
+                )
 
     def test_publish_rejects_schedule_without_two_hour_lead_time(self) -> None:
         with TemporaryDirectory() as temp:

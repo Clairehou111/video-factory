@@ -23,6 +23,7 @@ from video_factory.openrouter import DISCOUNTS_READER, ENDPOINTS_API, MODELS_API
 from video_factory.models import ContentType, TopicType
 from video_factory.quality import CheckResult
 from video_factory.storage import Workspace
+from video_factory.youtube import YouTubeAcquisitionError
 
 
 NOW = datetime(2026, 8, 28, 6, 0, tzinfo=UTC)
@@ -343,6 +344,38 @@ class DiscoveryTest(unittest.TestCase):
             channel_state = state["channels"]["x"]
             self.assertEqual(channel_state["blocked_candidate"]["id"], stronger.id)
             self.assertEqual(state["needs_human_candidates"][0]["candidate_id"], weaker.id)
+
+    def test_transient_failures_use_independent_retry_entries(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            service = ResourceDiscoveryService(workspace, clock=lambda: NOW)
+            state = workspace.load_discovery_state()
+            first = DiscoveryCandidate(
+                id="youtube-first", channel=DiscoveryChannel.YOUTUBE,
+                url="https://youtube.com/watch?v=first", title="AI systems interview",
+                publisher="Original Channel", published_at=NOW.isoformat(), eligible=True,
+                metadata={"adoption_decision": {"score": 93}},
+            )
+            second = DiscoveryCandidate(
+                id="youtube-second", channel=DiscoveryChannel.YOUTUBE,
+                url="https://youtube.com/watch?v=second", title="AI infrastructure interview",
+                publisher="Original Channel", published_at=NOW.isoformat(), eligible=True,
+                metadata={"adoption_decision": {"score": 89}},
+            )
+
+            for item in (first, second):
+                self.assertEqual(
+                    service._record_blocked_candidate(
+                        state, item, ResourceDiscoveryConfig(), NOW,
+                        retryable=True, last_error="YouTubeAcquisitionError: SSL EOF",
+                    ),
+                    "retry_pending",
+                )
+
+            retries = state["channels"]["youtube"]["transient_retries"]
+            self.assertEqual(set(retries), {first.id, second.id})
+            self.assertFalse(state.get("needs_human_candidates"))
+            self.assertNotIn("blocked_candidate", state["channels"]["youtube"])
 
     def test_x_adapter_retries_ok_false_then_uses_opencli(self) -> None:
         commands = []
@@ -1910,6 +1943,68 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(len(adoption["attempts"]), 3)
             self.assertEqual(len(factory.generate_calls), 3)
 
+    def test_transient_youtube_failure_is_retried_after_cooldown_even_if_search_misses_it(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            item = DiscoveryCandidate(
+                id="youtube-transient", channel=DiscoveryChannel.YOUTUBE,
+                url="https://youtube.com/watch?v=transient", title="AI infrastructure interview",
+                author="Original Channel", publisher="Original Channel",
+                published_at=NOW.isoformat(),
+                summary="A detailed AI infrastructure interview about model inference systems. " * 5,
+                body_text="A detailed AI infrastructure interview about model inference systems. " * 5,
+                stable_id="youtube:transient", eligible=True,
+                metadata={
+                    "duration_seconds": 1800, "transcript_available": True,
+                    "youtube_editorial_mode": "known_tech_interview_clip",
+                    "youtube_rejection_reasons": [], "youtube_score": 90,
+                    "it_scope_markers": ["ai", "inference"],
+                    "adoption_decision": {"score": 90, "pool": "youtube", "passed": True},
+                },
+            )
+            failing_factory = FakeFactory([
+                YouTubeAcquisitionError("SSL unexpected EOF while reading"),
+            ])
+            service = ResourceDiscoveryService(
+                workspace, factory=failing_factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+            config = ResourceDiscoveryConfig(
+                retry_backoff_seconds=[0], blocked_retry_delay_hours=6,
+            )
+
+            adoption = service._adopt(item, config, "auto", None)
+            self.assertTrue(adoption["retryable"])
+            state = workspace.load_discovery_state()
+            self.assertEqual(
+                service._record_blocked_candidate(
+                    state, item, config, NOW, retryable=adoption["retryable"],
+                    last_error=adoption["last_error"],
+                ),
+                "retry_pending",
+            )
+            workspace.save_discovery_state(state)
+
+            successful_factory = FakeFactory([{
+                "status": "completed", "publishable": True, "video": "final.mp4",
+            }])
+            retry_service = ResourceDiscoveryService(
+                workspace, adapters={DiscoveryChannel.YOUTUBE: StaticAdapter([])},
+                factory=successful_factory, clock=lambda: NOW + timedelta(hours=7),
+                sleeper=lambda _: None,
+            )
+            for channel in DiscoveryChannel:
+                config.channels[channel].enabled = channel == DiscoveryChannel.YOUTUBE
+
+            result = retry_service.run(config)
+
+            self.assertEqual(result.channels["youtube"].status, "generated")
+            self.assertEqual(result.channels["youtube"].selected.id, item.id)
+            self.assertEqual(len(successful_factory.generate_calls), 1)
+            updated = workspace.load_discovery_state()
+            self.assertNotIn("transient_retries", updated["channels"]["youtube"])
+            self.assertFalse(updated.get("needs_human_candidates"))
+
     def test_x_canonical_author_url_reuses_failed_manifest_without_llm_retry(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
@@ -2141,6 +2236,49 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(options.youtube_media, str(media))
             self.assertEqual(options.youtube_subtitles, str(subtitles))
             self.assertEqual(options.youtube_translation_plan, str(translation_plan))
+
+    def test_adoption_reuses_completed_direct_generation_without_duplicate_render(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            source_url = "https://www.youtube.com/watch?v=already123"
+            completed_job = workspace.root / "jobs" / "completed-direct-generation"
+            completed_job.mkdir(parents=True)
+            manifest = completed_job / "collection-manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            completed = {
+                "url": source_url,
+                "status": "completed",
+                "collection_manifest": str(manifest),
+                "checks": [{
+                    "name": "rights_review", "passed": False,
+                    "detail": "human review required",
+                }],
+            }
+            (completed_job / "result.json").write_text(
+                json.dumps(completed), encoding="utf-8",
+            )
+            item = DiscoveryCandidate(
+                id="youtube-already123", channel=DiscoveryChannel.YOUTUBE,
+                url=source_url, title="Already rendered interview",
+                eligible=True, status="needs_human", discovered_at=NOW.isoformat(),
+            )
+            factory = FakeFactory([RuntimeError("must not regenerate")])
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+
+            result = service._adopt(
+                item, ResourceDiscoveryConfig(retry_backoff_seconds=[0]),
+                "deepseek", None,
+            )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(result["attempts"][0]["mode"], "reuse_completed_generation")
+            self.assertEqual(factory.generate_calls, [])
+            self.assertEqual(
+                workspace.load_discovery_candidate(item.id)["status"], "generated",
+            )
 
     def test_youtube_audio_failure_is_repaired_and_revalidated_in_same_attempt(self) -> None:
         with TemporaryDirectory() as temp:

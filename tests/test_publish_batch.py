@@ -304,6 +304,16 @@ class PublishBatchTest(unittest.TestCase):
         self.assertTrue(_is_definitive_pre_submit_failure(
             ["tencent", "upload-video"], "", "无法确认视频号原创声明已勾选，停止发表",
         ))
+        self.assertTrue(_is_definitive_pre_submit_failure(
+            ["tencent", "upload-video"], "", "无法确认视频号位置已设为不显示位置，停止发表",
+        ))
+        self.assertTrue(_is_definitive_pre_submit_failure(
+            ["tencent", "upload-video"], "", "无法确认视频号未标注AI生成内容，停止发表",
+        ))
+        self.assertTrue(_is_definitive_pre_submit_failure(
+            ["tencent", "upload-video"], "",
+            "VIDEO_FACTORY_PRE_SUBMIT_GUARD: 视频号位置下拉框未打开，停止发表",
+        ))
         self.assertFalse(_is_definitive_pre_submit_failure(
             ["tencent", "upload-video"], "", "browser closed after final publish click",
         ))
@@ -426,7 +436,10 @@ class PublishBatchTest(unittest.TestCase):
                 "        label_text = '含AI生成内容'\n\n"
                 "    async def upload(self, page: Page) -> None:\n"
                 "        try:\n"
-                "            pass\n"
+                "            await self.apply_original_statement(page)\n"
+                "            await self.set_thumbnail(page)\n"
+                "            await self.set_short_title(page, self.title, self.short_title)\n"
+                "            await self.submit_publish(page)\n"
                 "        finally:\n"
                 "            await context.close()\n",
                 encoding="utf-8",
@@ -467,6 +480,24 @@ class PublishBatchTest(unittest.TestCase):
             self.assertIn("if not self.category", patched)
             self.assertIn("包含第三方源视频，未勾选原创声明", patched)
             self.assertIn("source-aware WeChat originality policy", patched)
+            self.assertIn("location and AI-label policy", patched)
+            self.assertIn(".post-position-wrap", patched)
+            self.assertIn("position.locator('.position-display-wrap').first", patched)
+            self.assertIn("position.locator('.location-filter-wrap').first", patched)
+            self.assertIn(
+                "panel.locator('.option-item', has_text=\"不显示位置\").first",
+                patched,
+            )
+            self.assertIn("position_display.inner_text(timeout=5000)", patched)
+            self.assertIn("VIDEO_FACTORY_PRE_SUBMIT_GUARD", patched)
+            self.assertIn('text-is(\"无需标注\")', patched)
+            self.assertIn("无法确认视频号未标注AI生成内容，停止发表", patched)
+            self.assertIn(
+                "await self.set_short_title(page, self.title, self.short_title)\n"
+                "            await self.apply_video_privacy_policy(page)\n"
+                "            await self.submit_publish(page)",
+                patched,
+            )
             patched_cli = cli.read_text(encoding="utf-8")
             self.assertIn('"list", "--max-pages", "1"', patched_cli)
             self.assertIn("Batch preflight already checked credentials", patched_cli)

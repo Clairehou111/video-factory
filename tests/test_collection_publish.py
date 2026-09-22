@@ -190,6 +190,47 @@ class CollectionPublishTest(unittest.TestCase):
             restored = workspace.load_publish_batch(batch.id)
             self.assertEqual(restored.items[0].state, CollectionPublishItemState.FAILED_PRE_SUBMIT)
 
+    def test_reconciles_manually_published_tencent_item(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_tencent_batch(temp, count=1)
+            service = CollectionPublishBatchService(workspace, FakeCollectionBackend())
+            service.approve(batch, "editor")
+            batch.state = PublishBatchState.FAILED
+            batch.items[0].state = CollectionPublishItemState.UNCERTAIN
+            batch.items[0].last_error = "stopped before the automation observed success"
+            workspace.save_publish_batch(batch)
+
+            service.reconcile_tencent_manual_outcome(
+                batch, batch.items[0].id, "editor", "published",
+                "operator completed the final publish click",
+            )
+
+            self.assertEqual(batch.state, PublishBatchState.SUCCEEDED)
+            self.assertEqual(batch.items[0].state, CollectionPublishItemState.SUBMITTED)
+            self.assertTrue(batch.items[0].submitted_at)
+            self.assertEqual(batch.items[0].last_error, "")
+
+    def test_reconciles_tencent_item_stopped_before_publish_click(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace, batch = self.make_tencent_batch(temp, count=1)
+            service = CollectionPublishBatchService(workspace, FakeCollectionBackend())
+            service.approve(batch, "editor")
+            batch.state = PublishBatchState.FAILED
+            batch.items[0].state = CollectionPublishItemState.UNCERTAIN
+            batch.items[0].last_error = "location selector timed out"
+            workspace.save_publish_batch(batch)
+
+            service.reconcile_tencent_manual_outcome(
+                batch, batch.items[0].id, "editor", "not_submitted",
+                "browser remained on the editor and publish was not clicked",
+            )
+
+            self.assertEqual(batch.state, PublishBatchState.FAILED)
+            self.assertEqual(
+                batch.items[0].state, CollectionPublishItemState.FAILED_PRE_SUBMIT,
+            )
+            self.assertIn("final publish click did not complete", batch.items[0].last_error)
+
     def test_approval_digest_binds_every_video(self) -> None:
         with TemporaryDirectory() as temp:
             workspace, batch = self.make_batch(temp, count=1)

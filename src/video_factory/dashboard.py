@@ -116,9 +116,10 @@ class PublishDashboard:
                 except (KeyError, OSError, TypeError, ValueError):
                     manifest = None
                 if manifest is not None and manifest.source_video_id:
-                    # Rerenders have new collection ids but represent the same
-                    # source video. Show only the latest edition in review.
-                    logical_id = f"youtube:{manifest.source_video_id}"
+                    # Rerenders of the same clip have new collection ids but
+                    # retain their original source ranges. Distinct highlights
+                    # from one interview must remain separate queue cards.
+                    logical_id = self._collection_logical_id(manifest)
             current = latest.get(logical_id)
             if current is None or str(payload.get("created_at") or "") > str(current.get("created_at") or ""):
                 latest[logical_id] = payload
@@ -141,6 +142,30 @@ class PublishDashboard:
             media[media_id] = path
             rows.append(card.to_dict(media_id))
         return rows, media
+
+    @staticmethod
+    def _collection_logical_id(manifest: Any) -> str:
+        source_video_id = str(getattr(manifest, "source_video_id", "") or "")
+        clip_ranges: list[tuple[float, float]] = []
+        for item in getattr(manifest, "items", []) or []:
+            for source_range in getattr(item, "source_ranges", []) or []:
+                if isinstance(source_range, dict):
+                    start = source_range.get("original_start")
+                    end = source_range.get("original_end")
+                    start = source_range.get("start") if start is None else start
+                    end = source_range.get("end") if end is None else end
+                else:
+                    start = getattr(source_range, "original_start", None)
+                    end = getattr(source_range, "original_end", None)
+                    start = getattr(source_range, "start", None) if start is None else start
+                    end = getattr(source_range, "end", None) if end is None else end
+                if start is not None and end is not None:
+                    clip_ranges.append((round(float(start), 3), round(float(end), 3)))
+        if not clip_ranges:
+            return f"youtube:{source_video_id}"
+        encoded = json.dumps(sorted(clip_ranges), separators=(",", ":"))
+        clip_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+        return f"youtube:{source_video_id}:clip:{clip_digest}"
 
     def _collection_cards(self, payload: dict[str, Any]) -> list[DashboardCard]:
         manifest_id = str(payload.get("manifest_id") or "")
@@ -381,7 +406,7 @@ class PublishDashboard:
                     raise KeyError(item_id)
                 if item.platform != PublishPlatform.TENCENT:
                     raise ValueError("Bilibili publishing is paused")
-                if update_schedule:
+                if update_schedule and item.schedule_at != requested_schedule:
                     if batch.state != PublishBatchState.READY_FOR_REVIEW:
                         raise ValueError("定时发布时间只能在最终审核前设置")
                     item.schedule_at = requested_schedule
@@ -405,7 +430,7 @@ class PublishDashboard:
             if len(targets) != 1 or item_id != "tencent":
                 raise ValueError("dashboard ordinary batches require exactly one Tencent target")
             target = targets[0]
-            if update_schedule:
+            if update_schedule and target.schedule_at != requested_schedule:
                 if batch.state != PublishBatchState.READY_FOR_REVIEW:
                     raise ValueError("定时发布时间只能在最终审核前设置")
                 target.schedule_at = requested_schedule
