@@ -636,36 +636,40 @@ class AutomationAuditService:
 
     def _llm_usage(self, jobs: list[dict[str, Any]], started_at: datetime) -> dict[str, Any]:
         prices = _price_map(jobs)
-        calls: list[dict[str, Any]] = []
-        for job in jobs:
-            for provenance in _provenances({
-                "trace": _trace_rows(job, self.workspace.root),
-                "stages": job.get("stages") or [],
-            }):
-                generated = _parse_utc_or_none(str(provenance.get("generated_at") or ""))
-                if generated is not None and generated < started_at - timedelta(seconds=2):
-                    continue
-                usage = provenance.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                prompt = _int_value(usage, "prompt_tokens", "input_tokens")
-                completion = _int_value(usage, "completion_tokens", "output_tokens")
-                total = _int_value(usage, "total_tokens") or prompt + completion
-                model = str(
-                    provenance.get("model") or provenance.get("actual_model")
-                    or provenance.get("requested_model") or "unknown"
-                )
-                actual = _float_value(usage, "cost", "cost_usd")
-                estimate = None
-                if model in prices:
-                    input_price, output_price = prices[model]
-                    estimate = prompt * input_price + completion * output_price
-                calls.append({
-                    "provider": str(provenance.get("provider") or "unknown"), "model": model,
-                    "prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total,
-                    "actual_cost_usd": actual, "estimated_cost_usd": estimate,
-                })
+        calls = self._transport_usage_calls(started_at, prices)
+        source = "transport"
+        if not calls:
+            source = "legacy_provenance"
+            for job in jobs:
+                for provenance in _provenances({
+                    "trace": _trace_rows(job, self.workspace.root),
+                    "stages": job.get("stages") or [],
+                }):
+                    generated = _parse_utc_or_none(str(provenance.get("generated_at") or ""))
+                    if generated is not None and generated < started_at - timedelta(seconds=2):
+                        continue
+                    usage = provenance.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    prompt = _int_value(usage, "prompt_tokens", "input_tokens")
+                    completion = _int_value(usage, "completion_tokens", "output_tokens")
+                    total = _int_value(usage, "total_tokens") or prompt + completion
+                    model = str(
+                        provenance.get("model") or provenance.get("actual_model")
+                        or provenance.get("requested_model") or "unknown"
+                    )
+                    actual = _float_value(usage, "cost", "cost_usd")
+                    estimate = None
+                    if model in prices:
+                        input_price, output_price = prices[model]
+                        estimate = prompt * input_price + completion * output_price
+                    calls.append({
+                        "provider": str(provenance.get("provider") or "unknown"), "model": model,
+                        "prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total,
+                        "actual_cost_usd": actual, "estimated_cost_usd": estimate,
+                    })
         return {
+            "source": source,
             "calls": len(calls),
             "prompt_tokens": sum(item["prompt_tokens"] for item in calls),
             "completion_tokens": sum(item["completion_tokens"] for item in calls),
@@ -682,6 +686,46 @@ class AutomationAuditService:
             ),
             "by_model": _usage_by_model(calls),
         }
+
+    def _transport_usage_calls(
+        self, started_at: datetime, prices: dict[str, tuple[float, float]],
+    ) -> list[dict[str, Any]]:
+        ledger = self.workspace.root / "observability" / "llm-calls.jsonl"
+        if not ledger.is_file():
+            return []
+        calls: list[dict[str, Any]] = []
+        try:
+            lines = ledger.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            recorded = _parse_utc_or_none(str(row.get("recorded_at") or ""))
+            if recorded is None or recorded < started_at - timedelta(seconds=2):
+                continue
+            usage = row.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            prompt = _int_value(usage, "prompt_tokens", "input_tokens")
+            completion = _int_value(usage, "completion_tokens", "output_tokens")
+            total = _int_value(usage, "total_tokens") or prompt + completion
+            model = str(row.get("actual_model") or row.get("requested_model") or "unknown")
+            raw_cost = row.get("cost_usd")
+            actual = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
+            estimate = None
+            if model in prices:
+                input_price, output_price = prices[model]
+                estimate = prompt * input_price + completion * output_price
+            calls.append({
+                "provider": str(row.get("provider") or "unknown"), "model": model,
+                "prompt_tokens": prompt, "completion_tokens": completion,
+                "total_tokens": total, "actual_cost_usd": actual,
+                "estimated_cost_usd": estimate,
+            })
+        return calls
 
     def _human_message(
         self, pending: list[dict[str, Any]], problems: list[dict[str, Any]],

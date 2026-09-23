@@ -196,20 +196,18 @@ class ContentAgentTest(unittest.TestCase):
         self.assertEqual(model.review_calls, 0)
         self.assertEqual(model.repair_calls, 0)
 
-    def test_changed_critic_issue_gets_one_final_convergence_repair(self) -> None:
+    def test_changed_critic_issue_stops_after_one_repair_and_verification(self) -> None:
         model = ConvergingReviewModel()
-        result = BoundedContentAgent(
-            model, copy_reviewer=model,
-            budget=AgentBudget(max_llm_calls=14, max_repairs=3, max_escalations=0),
-        ).run(packet_with_link())
+        with self.assertRaisesRegex(
+            Exception, "still rejects repaired draft after final verification",
+        ):
+            BoundedContentAgent(
+                model, copy_reviewer=model,
+                budget=AgentBudget(max_llm_calls=14, max_repairs=3, max_escalations=0),
+            ).run(packet_with_link())
 
-        self.assertEqual(model.repair_calls, 4)
-        self.assertEqual(model.review_calls, 5)
-        steps = [item["step"] for item in next(
-            check for check in result.manifest.quality_checks if check["name"] == "content_agent"
-        )["detail"]["trace"]]
-        self.assertIn("copy_review_convergence_repair", steps)
-        self.assertIn("copy_review_convergence_verify", steps)
+        self.assertEqual(model.repair_calls, 1)
+        self.assertEqual(model.review_calls, 2)
 
     def test_strong_model_is_only_used_after_primary_and_repair_fail(self) -> None:
         primary = RepairingModel(fail_repair=True)

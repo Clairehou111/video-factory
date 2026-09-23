@@ -46,6 +46,7 @@ from .automation import (
 )
 from .dashboard import serve_dashboard
 from .observability import Observability
+from .llm_transport import LLMTransport
 from .self_audit import ProblemLedger, ProblemObservation, SelfAuditService, load_active_policy
 from .self_audit_runtime import (
     OpenRouterGeminiAuditModel, RepositoryCandidateVerifier, ReviewBranchExecutor,
@@ -466,12 +467,13 @@ def main() -> None:
             model_id = args.model or os.environ.get(
                 "VIDEO_FACTORY_AUDITOR_MODEL", "google/gemini-3.7-flash",
             )
-            writer = OpenAICompatibleStoryWriter(
-                LLMSettings.from_environment("openrouter", model_id),
-            )
             repo_root = Path(__file__).resolve().parents[2]
             observability = Observability(
                 workspace.root, project_name="video-factory-self-audit",
+            )
+            writer = OpenAICompatibleStoryWriter(
+                LLMSettings.from_environment("openrouter", model_id),
+                LLMTransport(workspace.root, observability),
             )
             service = SelfAuditService(
                 workspace,
@@ -640,10 +642,15 @@ def main() -> None:
         print(json.dumps({"candidate": result.candidate.id, "evidence": [item.id for item in result.evidence]}, ensure_ascii=False, indent=2))
     elif args.command == "generate-story":
         packet = packet_from_json(Path(args.packet))
-        writer = OpenAICompatibleStoryWriter(LLMSettings.from_environment(args.provider, args.model))
+        transport = LLMTransport(workspace.root, Observability(workspace.root))
+        writer = OpenAICompatibleStoryWriter(
+            LLMSettings.from_environment(args.provider, args.model), transport,
+        )
         fallback = None
         if args.fallback_provider:
-            fallback = OpenAICompatibleStoryWriter(LLMSettings.from_environment(args.fallback_provider, args.fallback_model))
+            fallback = OpenAICompatibleStoryWriter(
+                LLMSettings.from_environment(args.fallback_provider, args.fallback_model), transport,
+            )
         research_tool = LinkedSourceResearchTool(workspace) if args.allow_linked_fetch else ArchivedEvidenceTool()
         agent = BoundedContentAgent(
             writer, research_tool=research_tool, escalation=fallback,

@@ -25,6 +25,7 @@ from .ingest import GitHubIngestor, IngestResult
 from .github_context import enrich_github_context
 from .github_editor import canonicalize_github_brief
 from .llm import LLMSettings, OpenAICompatibleStoryWriter, TransportFallbackStoryWriter
+from .llm_transport import LLMTransport
 from .media import probe_video, validate_wechat_mp4
 from .models import (
     ContentType, CueAction, Evidence, EvidenceShotKind, InformationRenderProfile, Scene, SourceType,
@@ -175,6 +176,10 @@ class VideoFactory:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.observability = Observability(workspace.root)
+        self.llm_transport = LLMTransport(workspace.root, self.observability)
+
+    def _new_writer(self, settings: LLMSettings) -> OpenAICompatibleStoryWriter:
+        return OpenAICompatibleStoryWriter(settings, self.llm_transport)
 
     def _archived_source_video_asset(self, manifest, source_video_url: str) -> Path | None:
         for evidence in manifest.evidence:
@@ -215,6 +220,12 @@ class VideoFactory:
             "started_at": _now(), "stages": [], "status": "running",
         }
         self._write_result(job, result)
+        llm_scope = self.llm_transport.scope(
+            job_id=job_id, candidate_id=url,
+            max_requests=int(os.environ.get("VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS", "200")),
+            max_cost_usd=float(os.environ.get("VIDEO_FACTORY_JOB_LLM_MAX_COST_USD", "5.00")),
+        )
+        llm_scope.__enter__()
         try:
             if source == "youtube":
                 from .youtube import YouTubeCollectionFactory
@@ -224,21 +235,22 @@ class VideoFactory:
                 subtitle_reviewer, subtitle_review_selection = self._youtube_subtitle_reviewer(
                     writer, directing_writer,
                 )
-                generated = YouTubeCollectionFactory(
-                    self.workspace, writer, directing_writer, subtitle_reviewer,
-                ).generate(
-                    url, job, render=options.render,
-                    local_media=Path(options.youtube_media).resolve() if options.youtube_media else None,
-                    local_subtitles=(
-                        Path(options.youtube_subtitles).resolve() if options.youtube_subtitles else None
-                    ),
-                    translation_plan=(
-                        Path(options.youtube_translation_plan).resolve()
-                        if options.youtube_translation_plan else None
-                    ),
-                    editorial_mode=options.youtube_editorial_mode,
-                    editorial_guidance=options.youtube_editorial_guidance,
-                )
+                with self.llm_transport.stage("youtube_pipeline"):
+                    generated = YouTubeCollectionFactory(
+                        self.workspace, writer, directing_writer, subtitle_reviewer,
+                    ).generate(
+                        url, job, render=options.render,
+                        local_media=Path(options.youtube_media).resolve() if options.youtube_media else None,
+                        local_subtitles=(
+                            Path(options.youtube_subtitles).resolve() if options.youtube_subtitles else None
+                        ),
+                        translation_plan=(
+                            Path(options.youtube_translation_plan).resolve()
+                            if options.youtube_translation_plan else None
+                        ),
+                        editorial_mode=options.youtube_editorial_mode,
+                        editorial_guidance=options.youtube_editorial_guidance,
+                    )
                 result.update(generated)
                 result["model_selection"] = {
                     **selection,
@@ -250,11 +262,13 @@ class VideoFactory:
             if result.get("status") == "running":
                 result["status"] = "completed"
         except Exception as error:
+            llm_scope.__exit__(type(error), error, error.__traceback__)
             result["status"] = "failed"
             result["error"] = f"{type(error).__name__}: {error}"
             result["artifact_identity"] = self._artifact_identity(result)
             self._write_result(job, result)
             raise
+        llm_scope.__exit__(None, None, None)
         result["completed_at"] = _now()
         result["artifact_identity"] = self._artifact_identity(result)
         self._write_result(job, result)
@@ -527,9 +541,24 @@ class VideoFactory:
                     manifest.editorial_brief.subheadline if manifest.editorial_brief else "",
                 )))
                 recommended_duration = recommend_source_clip_duration(hint)
-                clip = select_action_clip(
-                    downloaded, clip_duration=recommended_duration, semantic_hint=hint,
-                )
+                cached_clip_evidence = next((
+                    item for item in manifest.evidence
+                    if item.source_kind == "web:source_video"
+                    and item.url == source_video_url
+                    and item.metadata.get("clip_end") is not None
+                ), None)
+                if cached_clip_evidence is not None:
+                    clip = {
+                        "start": float(cached_clip_evidence.metadata.get("clip_start") or 0.0),
+                        "end": float(cached_clip_evidence.metadata["clip_end"]),
+                        "score": float(cached_clip_evidence.metadata.get("clip_selection_score") or 0.0),
+                        "method": "cached_manifest_clip_selection",
+                    }
+                else:
+                    clip = select_action_clip(
+                        downloaded, clip_duration=recommended_duration, semantic_hint=hint,
+                        transport=self.llm_transport,
+                    )
                 if download_route == "workspace_asset_reuse":
                     asset = str(downloaded.relative_to(self.workspace.root))
                     existing = next(
@@ -1049,7 +1078,7 @@ class VideoFactory:
                     recommended_duration = recommend_source_clip_duration(clip_hint)
                     clip = select_action_clip(
                         archived_video, clip_duration=recommended_duration,
-                        semantic_hint=clip_hint,
+                        semantic_hint=clip_hint, transport=self.llm_transport,
                     )
                     source_video_evidence.metadata.update({
                         "clip_start": clip["start"], "clip_end": clip["end"],
@@ -1091,7 +1120,7 @@ class VideoFactory:
                 recommended_duration = recommend_source_clip_duration(clip_hint)
                 clip = select_action_clip(
                     downloaded, clip_duration=recommended_duration,
-                    semantic_hint=clip_hint,
+                    semantic_hint=clip_hint, transport=self.llm_transport,
                 )
                 asset, digest = self.workspace.archive_asset(downloaded, "official-source-video")
                 source_video_evidence = Evidence(
@@ -1263,7 +1292,9 @@ class VideoFactory:
                 for candidate_quote in vision_quotes:
                     try:
                         settings = LLMSettings.from_environment("openrouter", candidate_quote.model_id)
-                        analysis = OpenRouterVisualAnalyst(settings, candidate_quote).analyze_x_images(url, x_images)
+                        analysis = OpenRouterVisualAnalyst(
+                            settings, candidate_quote, self.llm_transport,
+                        ).analyze_x_images(url, x_images)
                         used_vision_quote = candidate_quote
                         break
                     except Exception as vision_error:
@@ -1368,7 +1399,7 @@ class VideoFactory:
             ), render_profile=options.render_profile,
         )
         try:
-            run = self._run_editorial_agent_with_fallback(
+            run = self._run_editorial_agent(
                 packet, writer, copy_reviewer, options, job, selection,
             )
         except ContentAgentError as error:
@@ -1525,62 +1556,38 @@ class VideoFactory:
             budget=AgentBudget(max_llm_calls=max_llm_calls, max_research_sources=3, max_repairs=2, max_escalations=0),
         )
 
-    def _run_editorial_agent_with_fallback(
+    def _run_editorial_agent(
         self, packet: StoryWriterPacket, writer: OpenAICompatibleStoryWriter,
         copy_reviewer: OpenAICompatibleStoryWriter, options: GenerateOptions,
         job: Path, selection: dict[str, object],
     ):
-        fallback_model = "google/gemini-3.7-flash"
-        # A cheap writer gets one complete semantic round (review, repair,
-        # verify). If that still fails, open the job-scoped semantic circuit
-        # and escalate instead of spending several more rounds on the same
-        # model. The stronger writer keeps the bounded convergence budget.
-        primary_call_budget = 14 if writer.settings.model == fallback_model else 6
+        # Direct pipeline: a low-cost planner/writer, deterministic validation,
+        # and at most two OpenRouter semantic-review POSTs. A rejected final
+        # verification is a human-review item, never a fresh Gemini rewrite.
         try:
-            return self._editorial_agent(
-                writer, copy_reviewer, options, job, max_llm_calls=primary_call_budget,
-            ).run(packet)
+            with self.llm_transport.scope(
+                job_id=job.name, candidate_id=packet.candidate.id,
+                max_requests=int(os.environ.get("VIDEO_FACTORY_STATIC_LLM_MAX_REQUESTS", "12")),
+                max_cost_usd=float(os.environ.get("VIDEO_FACTORY_STATIC_LLM_MAX_COST_USD", "0.25")),
+                max_openrouter_semantic_reviews=2,
+            ):
+                return self._editorial_agent(
+                    writer, copy_reviewer, options, job, max_llm_calls=7,
+                ).run(packet)
         except ContentAgentError as primary_error:
-            primary_trace_path = job / "content-agent-primary-error.json"
-            primary_trace_path.write_text(
+            trace_path = job / "content-agent-error.json"
+            trace_path.write_text(
                 json.dumps(
                     {"error": str(primary_error), "trace": primary_error.trace},
                     ensure_ascii=False, indent=2,
                 ) + "\n",
                 encoding="utf-8",
             )
-            can_fallback = (
-                bool(os.environ.get("OPENROUTER_API_KEY"))
-                and writer.settings.model != fallback_model
-            )
-            if not can_fallback:
-                raise
-            fallback_writer = OpenAICompatibleStoryWriter(
-                LLMSettings.from_environment("openrouter", fallback_model)
-            )
-            fallback_reviewer, fallback_reviewer_selection = self._copy_reviewer(
-                fallback_writer, options,
-            )
-            selection["fallback"] = {
-                "provider": "openrouter", "model": fallback_model,
-                "reason": "low-cost primary model exhausted bounded semantic-copy repairs",
-                "primary_error": str(primary_trace_path),
-                "copy_reviewer": fallback_reviewer_selection,
+            selection["semantic_failure"] = {
+                "action": "human_review", "trace": str(trace_path),
+                "reason": "bounded review and verification did not pass",
             }
-            try:
-                return self._editorial_agent(
-                    fallback_writer, fallback_reviewer, options, job, max_llm_calls=14,
-                ).run(packet)
-            except ContentAgentError as fallback_error:
-                trace_path = job / "content-agent-error.json"
-                trace_path.write_text(
-                    json.dumps(
-                        {"error": str(fallback_error), "trace": fallback_error.trace},
-                        ensure_ascii=False, indent=2,
-                    ) + "\n",
-                    encoding="utf-8",
-                )
-                raise
+            raise
 
     def _cached_acquisition(self, url: str) -> AcquisitionResult | None:
         """Reuse immutable archived source evidence when only the edit schema changed."""
@@ -1951,7 +1958,9 @@ class VideoFactory:
                 catalog = OpenRouterCatalog(self.cache_dir / "openrouter")
                 vision_quote = catalog.select(ModelRequirements("vision", ("text", "image")), options.refresh_prices)
                 settings = LLMSettings.from_environment("openrouter", vision_quote.model_id)
-                analysis = OpenRouterVisualAnalyst(settings, vision_quote).analyze(repo_url, readme_text, visuals)
+                analysis = OpenRouterVisualAnalyst(
+                    settings, vision_quote, self.llm_transport,
+                ).analyze(repo_url, readme_text, visuals)
                 analysis_path = job / "visual-analysis.json"
                 analysis_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 asset, digest = self.workspace.archive_asset(analysis_path, "github-visual-analysis")
@@ -2012,44 +2021,25 @@ class VideoFactory:
                 budget=AgentBudget(max_llm_calls=12, max_research_sources=2, max_repairs=3, max_escalations=0),
             )
         try:
-            run = github_agent(writer, copy_reviewer).run(packet)
+            with self.llm_transport.scope(
+                job_id=job.name, candidate_id=packet.candidate.id,
+                max_requests=int(os.environ.get("VIDEO_FACTORY_GITHUB_LLM_MAX_REQUESTS", "12")),
+                max_cost_usd=float(os.environ.get("VIDEO_FACTORY_GITHUB_LLM_MAX_COST_USD", "0.30")),
+                max_openrouter_semantic_reviews=2,
+            ):
+                run = github_agent(writer, copy_reviewer).run(packet)
         except ContentAgentError as primary_error:
-            primary_trace_path = job / "content-agent-primary-error.json"
-            primary_trace_path.write_text(
+            trace_path = job / "content-agent-error.json"
+            trace_path.write_text(
                 json.dumps({"error": str(primary_error), "trace": primary_error.trace}, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            can_fallback = (
-                options.provider in {"auto", "openrouter"}
-                and bool(os.environ.get("OPENROUTER_API_KEY"))
-                and writer.settings.model != "google/gemini-3.7-flash"
-            )
-            if not can_fallback:
-                result["content_agent_error"] = str(primary_trace_path)
-                raise
-            fallback_model = "google/gemini-3.7-flash"
-            fallback_writer = OpenAICompatibleStoryWriter(
-                LLMSettings.from_environment("openrouter", fallback_model)
-            )
-            fallback_reviewer, fallback_reviewer_selection = self._copy_reviewer(
-                fallback_writer, options,
-            )
-            selection["fallback"] = {
-                "provider": "openrouter", "model": fallback_model,
-                "reason": "low-cost primary model exhausted grounded-structure repairs",
-                "primary_error": str(primary_trace_path),
-                "copy_reviewer": fallback_reviewer_selection,
+            selection["semantic_failure"] = {
+                "action": "human_review", "trace": str(trace_path),
+                "reason": "bounded review and verification did not pass",
             }
-            try:
-                run = github_agent(fallback_writer, fallback_reviewer).run(packet)
-            except ContentAgentError as fallback_error:
-                trace_path = job / "content-agent-error.json"
-                trace_path.write_text(
-                    json.dumps({"error": str(fallback_error), "trace": fallback_error.trace}, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                result["content_agent_error"] = str(trace_path)
-                raise
+            result["content_agent_error"] = str(trace_path)
+            raise
         manifest = run.manifest
         run.trace.insert(0, {
             "step": "runtime_policy", "status": "active" if runtime_policy.get("version") else "default",
@@ -2076,7 +2066,7 @@ class VideoFactory:
         provider = options.provider
         if provider == "auto" and _is_kimi_coding_model(options.model):
             settings = LLMSettings.from_environment("kimi", options.model)
-            return OpenAICompatibleStoryWriter(settings), None, {
+            return self._new_writer(settings), None, {
                 "provider": "kimi", "model": settings.model,
                 "billing": "kimi_coding_plan",
             }
@@ -2086,7 +2076,7 @@ class VideoFactory:
                     ModelRequirements("story", ("text",)), options.refresh_prices,
                 )
                 settings = LLMSettings.from_environment("openrouter", options.model or quote.model_id)
-                return OpenAICompatibleStoryWriter(settings), quote, {
+                return self._new_writer(settings), quote, {
                     "provider": "openrouter", "quote": quote.to_dict(), "daily_catalog": True,
                 }
             except Exception as error:
@@ -2097,14 +2087,14 @@ class VideoFactory:
         if selected == "openrouter":
             if options.model:
                 settings = LLMSettings.from_environment("openrouter", options.model)
-                return OpenAICompatibleStoryWriter(settings), None, {"provider": "openrouter", "model": options.model}
+                return self._new_writer(settings), None, {"provider": "openrouter", "model": options.model}
             quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(
                 ModelRequirements("story", ("text",)), options.refresh_prices,
             )
             settings = LLMSettings.from_environment("openrouter", quote.model_id)
-            return OpenAICompatibleStoryWriter(settings), quote, {"provider": "openrouter", "quote": quote.to_dict()}
+            return self._new_writer(settings), quote, {"provider": "openrouter", "quote": quote.to_dict()}
         settings = LLMSettings.from_environment(selected, options.model)
-        return OpenAICompatibleStoryWriter(settings), None, {
+        return self._new_writer(settings), None, {
             "provider": selected, "model": settings.model, "fallback_reason": fallback_reason,
         }
 
@@ -2129,7 +2119,7 @@ class VideoFactory:
                 try:
                     settings = LLMSettings.from_environment("openrouter", review_model)
                     configured_reviewers.append((
-                        "story_and_directing_taste", OpenAICompatibleStoryWriter(settings),
+                        "story_and_directing_taste", self._new_writer(settings),
                     ))
                     configured_selection.append({
                         "provider": "openrouter", "model": settings.model,
@@ -2141,7 +2131,7 @@ class VideoFactory:
             try:
                 settings = LLMSettings.from_environment("deepseek", None)
                 configured_reviewers.append((
-                    "spoken_chinese_copy", OpenAICompatibleStoryWriter(settings),
+                    "spoken_chinese_copy", self._new_writer(settings),
                 ))
                 configured_selection.append({
                     "provider": "deepseek", "model": settings.model,
@@ -2165,7 +2155,7 @@ class VideoFactory:
                     options.refresh_prices,
                 )
                 settings = LLMSettings.from_environment("openrouter", quote.model_id)
-                return OpenAICompatibleStoryWriter(settings), {
+                return self._new_writer(settings), {
                     "provider": "openrouter", "quote": quote.to_dict(),
                     "reason": "cheapest capability-qualified independent critic",
                 }
@@ -2184,7 +2174,7 @@ class VideoFactory:
                     "KIMI_TRANSLATION_REASONING_EFFORT", "low",
                 ),
             )
-            return OpenAICompatibleStoryWriter(settings), {
+            return self._new_writer(settings), {
                 "provider": "kimi", "model": settings.model,
                 "purpose": "translation", "billing": "kimi_coding_plan",
             }
@@ -2194,7 +2184,7 @@ class VideoFactory:
                     ModelRequirements("translation", ("text",)), options.refresh_prices,
                 )
                 settings = LLMSettings.from_environment("openrouter", options.model or quote.model_id)
-                primary = OpenAICompatibleStoryWriter(settings)
+                primary = self._new_writer(settings)
                 selection: dict[str, object] = {
                     "provider": "openrouter", "quote": quote.to_dict(),
                     "purpose": "translation", "daily_catalog": True,
@@ -2206,7 +2196,7 @@ class VideoFactory:
                         "reason": "used only after bounded transient transport retries are exhausted",
                     }
                     return TransportFallbackStoryWriter(
-                        primary, OpenAICompatibleStoryWriter(fallback_settings),
+                        primary, self._new_writer(fallback_settings),
                     ), selection
                 return primary, selection
             except Exception as error:
@@ -2215,7 +2205,7 @@ class VideoFactory:
             fallback_reason = "OPENROUTER_API_KEY is not configured" if options.provider == "auto" else "explicit provider"
         selected = "deepseek" if options.provider == "auto" else options.provider
         settings = LLMSettings.from_environment(selected, options.model)
-        return OpenAICompatibleStoryWriter(settings), {
+        return self._new_writer(settings), {
             "provider": selected, "model": settings.model, "purpose": "translation",
             "fallback_reason": fallback_reason,
         }
@@ -2230,14 +2220,14 @@ class VideoFactory:
             ).strip()
             if model:
                 settings = LLMSettings.from_environment("openrouter", model)
-                return OpenAICompatibleStoryWriter(settings), {
+                return self._new_writer(settings), {
                     "provider": "openrouter", "model": settings.model,
                     "purpose": "youtube_directing_taste",
                     "reason": "independent focused directing pass after clip selection",
                 }
         selected = "deepseek" if options.provider == "auto" else options.provider
         settings = LLMSettings.from_environment(selected, options.model)
-        return OpenAICompatibleStoryWriter(settings), {
+        return self._new_writer(settings), {
             "provider": selected, "model": settings.model,
             "purpose": "youtube_directing_taste",
             "reason": "OpenRouter independent review model is unavailable",
@@ -2256,7 +2246,7 @@ class VideoFactory:
                     "VIDEO_FACTORY_SUBTITLE_REVIEW_MODEL", "deepseek-chat",
                 ).strip() or "deepseek-chat",
             )
-            return OpenAICompatibleStoryWriter(settings), {
+            return self._new_writer(settings), {
                 "provider": "deepseek", "model": settings.model,
                 "purpose": "youtube_subtitle_fidelity_and_naturalness",
                 "reason": "independent native-Chinese verdict-only caption audit",

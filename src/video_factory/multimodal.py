@@ -8,6 +8,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .llm import LLMSettings
+from .llm_transport import LLMTransport
 from .models import Evidence
 from .openrouter import ModelQuote
 from .translation import IT_TRANSLATION_CONTRACT
@@ -58,12 +59,15 @@ def find_high_value_visuals(readme: str, base_url: str, limit: int = 3) -> list[
 class OpenRouterVisualAnalyst:
     """Read charts/architecture images with the cheapest capability-qualified vision model."""
 
-    def __init__(self, settings: LLMSettings, quote: ModelQuote):
+    def __init__(
+        self, settings: LLMSettings, quote: ModelQuote, transport: LLMTransport | None = None,
+    ):
         if settings.provider != "openrouter":
             raise ValueError("visual analyst requires OpenRouter")
         if "image" not in quote.input_modalities:
             raise ValueError("selected OpenRouter model does not accept images")
         self.settings, self.quote = settings, quote
+        self.transport = transport or LLMTransport()
 
     def analyze(self, repo_url: str, readme: str, visuals: list[VisualCandidate]) -> dict[str, object]:
         content: list[dict[str, object]] = [{"type": "text", "text": "\n".join([
@@ -94,8 +98,11 @@ class OpenRouterVisualAnalyst:
                 "HTTP-Referer": "https://github.com/video-factory", "X-Title": "Video Factory",
             },
         )
-        with urlopen(request, timeout=self.settings.timeout_seconds) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        with self.transport.stage("vision_analysis"):
+            result, _ = self.transport.request_json(
+                request, timeout=self.settings.timeout_seconds, provider="openrouter",
+                requested_model=self.settings.model, opener=urlopen,
+            )
         raw = result.get("choices", [{}])[0].get("message", {}).get("content")
         if not isinstance(raw, str):
             raise RuntimeError("OpenRouter vision model returned no JSON content")
@@ -138,8 +145,11 @@ class OpenRouterVisualAnalyst:
                 "HTTP-Referer": "https://github.com/video-factory", "X-Title": "Video Factory",
             },
         )
-        with urlopen(request, timeout=self.settings.timeout_seconds) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        with self.transport.stage("vision_analysis"):
+            result, _ = self.transport.request_json(
+                request, timeout=self.settings.timeout_seconds, provider="openrouter",
+                requested_model=self.settings.model, opener=urlopen,
+            )
         raw = result.get("choices", [{}])[0].get("message", {}).get("content")
         if not isinstance(raw, str):
             raise RuntimeError("OpenRouter X-image analyst returned no JSON content")

@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from urllib.request import Request, urlopen
 
 from .llm import LLMSettings
+from .llm_transport import LLMTransport
 from .media import probe_video
 from .youtube_runtime import ManagedYouTubeRuntime
 
@@ -97,6 +98,7 @@ def download_official_youtube_video(url: str, output_dir: Path) -> tuple[Path, s
 
 def _vision_action_clip(
     path: Path, duration: float, clip_duration: float, semantic_hint: str,
+    transport: LLMTransport | None = None,
 ) -> dict[str, float | str] | None:
     """Let an available vision model rank timestamped source frames."""
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
@@ -169,8 +171,12 @@ def _vision_action_clip(
             "X-Title": "Video Factory Source Clip Selector",
         },
     )
-    with urlopen(request, timeout=settings.timeout_seconds) as response:
-        result = json.loads(response.read().decode())
+    active_transport = transport or LLMTransport()
+    with active_transport.stage("source_video_clip_selection"):
+        result, _ = active_transport.request_json(
+            request, timeout=settings.timeout_seconds, provider="openrouter",
+            requested_model=model, opener=urlopen,
+        )
     raw = result.get("choices", [{}])[0].get("message", {}).get("content")
     answer = json.loads(raw) if isinstance(raw, str) else {}
     selected_duration = max(
@@ -187,6 +193,7 @@ def _vision_action_clip(
 
 def select_action_clip(
     path: Path, clip_duration: float = 5.0, semantic_hint: str = "",
+    transport: LLMTransport | None = None,
 ) -> dict[str, float | str]:
     """Select the best continuous action clip, with a deterministic fallback."""
     from PIL import Image, ImageChops, ImageStat
@@ -199,7 +206,9 @@ def select_action_clip(
         }
     if semantic_hint.strip():
         try:
-            selected = _vision_action_clip(path, duration, clip_duration, semantic_hint)
+            selected = _vision_action_clip(
+                path, duration, clip_duration, semantic_hint, transport=transport,
+            )
             if selected is not None:
                 return selected
         except Exception:

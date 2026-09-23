@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -92,10 +93,12 @@ class OpenRouterGeminiAuditModel:
             "director.narrative_rules list. For code, return an exact unified diff that also adds a "
             "unittest regression.\n" + json.dumps(schema, ensure_ascii=False),
         ])
-        result, provenance = self.writer._request_json([
-            {"role": "system", "content": "Return one valid JSON object without markdown fences."},
-            {"role": "user", "content": prompt},
-        ], max_tokens=7_000)
+        transport = getattr(self.writer, "transport", None)
+        with transport.stage("nightly_self_audit") if transport is not None else nullcontext():
+            result, provenance = self.writer._request_json([
+                {"role": "system", "content": "Return one valid JSON object without markdown fences."},
+                {"role": "user", "content": prompt},
+            ], max_tokens=7_000)
         usage = provenance.get("usage") if isinstance(provenance.get("usage"), Mapping) else {}
         actual_cost = 0.0
         if isinstance(usage, Mapping):

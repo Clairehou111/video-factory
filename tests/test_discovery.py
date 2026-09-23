@@ -1919,7 +1919,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
                 {project.id, robotics.id},
             )
 
-    def test_adoption_retries_same_candidate_three_times(self) -> None:
+    def test_adoption_stops_after_non_retryable_generation_failure(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
             item = x_candidate("x-1", "Acme launches an agent SDK")
@@ -1939,9 +1939,13 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             result = service.run(config)
 
             adoption = result.channels["x"].adoption
-            self.assertEqual(adoption["status"], "generated")
-            self.assertEqual(len(adoption["attempts"]), 3)
-            self.assertEqual(len(factory.generate_calls), 3)
+            self.assertEqual(adoption["status"], "blocked")
+            self.assertEqual(len(adoption["attempts"]), 1)
+            self.assertEqual(len(factory.generate_calls), 1)
+            self.assertEqual(
+                adoption["attempts"][0]["recovery"],
+                "stop_non_retryable_generation_failure",
+            )
 
     def test_transient_youtube_failure_is_retried_after_cooldown_even_if_search_misses_it(self) -> None:
         with TemporaryDirectory() as temp:
@@ -2167,7 +2171,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(first.channels["x"].status, "blocked")
             self.assertEqual(cooldown.channels["x"].status, "blocked_retry_wait")
             self.assertEqual(exhausted.channels["x"].status, "needs_human")
-            self.assertEqual(len(factory.generate_calls), 6)
+            self.assertEqual(len(factory.generate_calls), 2)
             state = workspace.load_discovery_state()
             self.assertNotIn("blocked_candidate", state["channels"]["x"])
             self.assertEqual(state["needs_human_candidates"][-1]["candidate_id"], "x-cost")
@@ -2195,7 +2199,11 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
 
             adoption = result.channels["x"].adoption
             self.assertEqual(adoption["status"], "blocked")
-            self.assertEqual(len(adoption["attempts"]), 3)
+            self.assertEqual(len(adoption["attempts"]), 1)
+            self.assertEqual(
+                adoption["attempts"][0]["recovery"],
+                "stop_non_retryable_quality_failure",
+            )
 
     def test_youtube_adoption_reuses_complete_assets_from_failed_job(self) -> None:
         with TemporaryDirectory() as temp:
@@ -2350,7 +2358,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             item = x_candidate("x-1", "Acme launches an agent SDK")
             adapter = StaticAdapter([item])
             factory = FakeFactory([
-                RuntimeError("fail one"), RuntimeError("fail two"), RuntimeError("fail three"),
+                RuntimeError("fail one"),
                 {"status": "completed", "publishable": True, "video": "final.mp4"},
             ])
             service = ResourceDiscoveryService(
@@ -2367,7 +2375,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(first.channels["x"].status, "blocked")
             self.assertEqual(second.channels["x"].status, "generated")
             self.assertEqual(adapter.calls, 1)
-            self.assertEqual(len(factory.generate_calls), 4)
+            self.assertEqual(len(factory.generate_calls), 2)
 
 
 if __name__ == "__main__":

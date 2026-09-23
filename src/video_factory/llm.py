@@ -25,6 +25,7 @@ from .editorial import (
     canonicalize_editorial_brief, compile_evidence_shots, enforce_flash_time_budget,
 )
 from .translation import IT_TRANSLATION_CONTRACT, PLAIN_CHINESE_CONTRACT
+from .llm_transport import LLMTransport
 
 
 def _coerce_model_float(value: object, default: float) -> float:
@@ -231,16 +232,18 @@ class LLMSettings:
 class OpenAICompatibleStoryWriter:
     """Remote generation is optional and provider-neutral; no Codex runtime is involved."""
 
-    def __init__(self, settings: LLMSettings):
+    def __init__(self, settings: LLMSettings, transport: LLMTransport | None = None):
         if not settings.api_key:
             raise ValueError(f"missing API key for {settings.provider}")
         self.settings = settings
+        self.transport = transport or LLMTransport()
 
     def generate(self, packet: StoryWriterPacket) -> tuple[StoryboardRequest, dict[str, object], dict[str, object]]:
-        return self._generate_from_messages(packet, [
-            {"role": "system", "content": "Return a single valid JSON object. Never add markdown fences."},
-            {"role": "user", "content": packet.prompt()},
-        ])
+        with self.transport.stage("write"):
+            return self._generate_from_messages(packet, [
+                {"role": "system", "content": "Return a single valid JSON object. Never add markdown fences."},
+                {"role": "user", "content": packet.prompt()},
+            ])
 
     def review_visible_copy(
         self, packet: StoryWriterPacket, draft: dict[str, object],
@@ -451,7 +454,8 @@ class OpenAICompatibleStoryWriter:
         # reviewable fields. Reasoning-capable OpenRouter models count hidden
         # reasoning against max_tokens even when it is excluded from the
         # response, so 3.6K can end with finish_reason=length and no JSON.
-        review, provenance = self._request_json(review_messages, max_tokens=7200)
+        with self.transport.stage("semantic_review"):
+            review, provenance = self._request_json(review_messages, max_tokens=7200)
         story_review = review.get("story_review") if isinstance(review.get("story_review"), dict) else {}
         field_reviews = normalized_field_reviews(review)
         reviews_by_path = {
@@ -460,40 +464,18 @@ class OpenAICompatibleStoryWriter:
         }
         missing_paths = set(fields) - set(reviews_by_path)
         if missing_paths:
-            first_provenance = provenance
-            missing_fields = {path: fields[path] for path in fields if path in missing_paths}
-            retry_messages = deepcopy(review_messages)
-            original_fields = "Fields: " + json.dumps(fields, ensure_ascii=False)
-            retry_fields = "Fields: " + json.dumps(missing_fields, ensure_ascii=False)
-            retry_messages[-1]["content"] = retry_messages[-1]["content"].replace(
-                original_fields, retry_fields,
-            )
-            retry_messages[-1]["content"] += (
-                "\nCoverage retry: the previous audit omitted these exact viewer-facing fields. "
-                "Return exactly one field_reviews row for every key in Fields, using the key "
-                "verbatim as field_path. Review translations even when they repeat nearby copy; "
-                "do not substitute fact, target, or full_translation for translation."
-            )
-            review, provenance = self._request_json(retry_messages, max_tokens=3600)
-            provenance = {
-                **provenance,
-                "review_retried": True,
-                "missing_fields": sorted(missing_paths),
-                "first_attempt": first_provenance,
-            }
-            for item in normalized_field_reviews(review):
-                path = str(item.get("field_path") or "")
-                if path in missing_paths:
-                    reviews_by_path[path] = item
-            unresolved = sorted(set(fields) - set(reviews_by_path))
-            if unresolved:
-                raise StoryDraftError(
-                    review,
-                    ValueError(
-                        "copy critic omitted viewer-facing fields after one supplemental review; "
-                        f"missing={unresolved}"
-                    ),
-                )
+            # Missing coverage fails closed inside the same semantic pass. A
+            # second hidden reviewer request made the workflow-level call
+            # counter inaccurate and could spend half of the two-pass budget
+            # before the repaired draft was independently verified.
+            provenance = {**provenance, "missing_fields": sorted(missing_paths)}
+            for path in missing_paths:
+                reviews_by_path[path] = {
+                    "field_path": path, "verdict": "fail", "category": "review_coverage",
+                    "problem": "semantic critic omitted this viewer-facing field",
+                    "evidence_ids": [],
+                    "repair_instruction": "preserve the field and make its evidence support explicit",
+                }
         field_reviews = [reviews_by_path[path] for path in fields]
         issues = [{
             "field_path": item.get("field_path"), "category": item.get("category"),
@@ -516,7 +498,9 @@ class OpenAICompatibleStoryWriter:
                 value = 0
             if story_review and value < 4:
                 low_story_scores.append(f"{name}={value}")
-        model_reported_failure = bool(issues)
+        model_reported_failure = any(
+            str(item.get("category") or "") != "review_coverage" for item in issues
+        )
         if story_review and (
             str(story_review.get("verdict") or "").casefold() == "fail"
             or story_failures or low_story_scores
@@ -646,7 +630,8 @@ class OpenAICompatibleStoryWriter:
                 "Return JSON matching: " + json.dumps(schema, ensure_ascii=False),
             ])},
         ]
-        review, provenance = self._request_json(messages, max_tokens=4800)
+        with self.transport.stage("semantic_review"):
+            review, provenance = self._request_json(messages, max_tokens=4800)
         rows = [item for item in (review.get("field_reviews") or []) if isinstance(item, dict)]
         by_path = {
             str(item.get("field_path") or ""): item for item in rows
@@ -757,7 +742,8 @@ class OpenAICompatibleStoryWriter:
         ]
         # Reasoning-capable discount models account for hidden reasoning in
         # max_tokens; 1.8K can leave no room for the small JSON plan itself.
-        draft, provenance = self._request_json(messages, max_tokens=4000)
+        with self.transport.stage("plan"):
+            draft, provenance = self._request_json(messages, max_tokens=4000)
         try:
             plan = self._parse_plan(packet, draft)
         except (KeyError, TypeError, ValueError) as error:
@@ -854,12 +840,13 @@ class OpenAICompatibleStoryWriter:
                 " Replace every flagged quantity with the exact value and unit stated in its cited evidence, "
                 "including currency scale, or delete that quantity. Never approximate, round, or change 万/亿 scale."
             )
-        return self._generate_from_messages(packet, [
-            {"role": "system", "content": "Return a single corrected valid JSON object. Never add markdown fences."},
-            {"role": "user", "content": packet.prompt()},
-            {"role": "assistant", "content": json.dumps(invalid_draft, ensure_ascii=False)},
-            {"role": "user", "content": "Your JSON failed deterministic validation. Return the complete corrected JSON and fix EVERY semicolon-separated error simultaneously. Never return the same invalid target/role pair or the same overlong browser translation. Do not shorten a title or selected_hook by deleting an exact person, company, project, model, or product name: the renderer reduces title font size and adds lines. Rewrite an overlong browser-highlight translation to at most 36 total characters; root full_translation follows its separate 60–120-character rule. " + repair_contract + " Error: " + validation_error},
-        ])
+        with self.transport.stage("repair"):
+            return self._generate_from_messages(packet, [
+                {"role": "system", "content": "Return a single corrected valid JSON object. Never add markdown fences."},
+                {"role": "user", "content": packet.prompt()},
+                {"role": "assistant", "content": json.dumps(invalid_draft, ensure_ascii=False)},
+                {"role": "user", "content": "Your JSON failed deterministic validation. Return the complete corrected JSON and fix EVERY semicolon-separated error simultaneously. Never return the same invalid target/role pair or the same overlong browser translation. Do not shorten a title or selected_hook by deleting an exact person, company, project, model, or product name: the renderer reduces title font size and adds lines. Rewrite an overlong browser-highlight translation to at most 36 total characters; root full_translation follows its separate 60–120-character rule. " + repair_contract + " Error: " + validation_error},
+            ])
 
     def _repair_root_translation(
         self, packet: StoryWriterPacket, invalid_draft: dict[str, object], validation_error: str,
@@ -881,9 +868,10 @@ class OpenAICompatibleStoryWriter:
         evidence_excerpt = [
             {"id": item.id, "quote": item.quote[:1800]} for item in packet.evidence[:8]
         ]
-        patch, provenance = self._request_json([
-            {"role": "system", "content": "Return one JSON object containing only the requested visible-copy fields."},
-            {"role": "user", "content": "\n".join([
+        with self.transport.stage("repair"):
+            patch, provenance = self._request_json([
+                {"role": "system", "content": "Return one JSON object containing only the requested visible-copy fields."},
+                {"role": "user", "content": "\n".join([
                 "Repair only fields that overflow fixed rails in a BGM-only WeChat short video. Do not change evidence, order, shots, targets, visual families, or facts.",
                 "For full_translation, compress the complete root X post into 60–120 readable Chinese characters beside the original. Count every Chinese character, Latin letter, digit, space, and punctuation mark toward the 120-character maximum. Preserve only the decisive named actor, action, scope, result, and essential visible numbers. Remove secondary component details, handles, URL, emoji, greeting, and repeated wording. Do not say 翻译/译为.",
                 "For fixed_conclusion, preserve the existing evidence-backed payoff while compressing it to 28–62 Chinese-character-equivalents. It must be a complete assertive sentence, not a caveat, label, or truncated fragment.",
@@ -893,8 +881,8 @@ class OpenAICompatibleStoryWriter:
                 "Evidence excerpts: " + json.dumps(evidence_excerpt, ensure_ascii=False),
                 "Validation: " + validation_error,
                 "Return: {" + ",".join(requested_fields) + "}",
-            ])},
-        ], max_tokens=700)
+                ])},
+            ], max_tokens=700)
         translation = str(patch.get("full_translation") or "").strip()
         conclusion = str(patch.get("fixed_conclusion") or "").strip()
         if needs_translation and not 40 <= len(translation) <= 140:
@@ -965,9 +953,10 @@ class OpenAICompatibleStoryWriter:
             },
             "story_arc_updates": [{"role": "existing role", "claim": "verified replacement claim", "why_here": "correct progression"}],
         }
-        patch, provenance = self._request_json([
-            {"role": "system", "content": "Return one strict JSON patch only."},
-            {"role": "user", "content": "\n".join([
+        with self.transport.stage("repair"):
+            patch, provenance = self._request_json([
+                {"role": "system", "content": "Return one strict JSON patch only."},
+                {"role": "user", "content": "\n".join([
                 "Repair only the failing Chinese editorial copy for a BGM-only WeChat short video.",
                 "Change only the exact field paths named in Validation errors. Copy every other current viewer-facing field byte-for-byte; do not rewrite clean fields or move a rejected term into another field.",
                 "Keep every shot id, evidence id, URL, visual_family, and ordering unchanged. "
@@ -997,11 +986,11 @@ class OpenAICompatibleStoryWriter:
                 "Current editorial copy (preserve all non-failing fields exactly): " + json.dumps(editorial, ensure_ascii=False),
                 "Evidence: " + json.dumps(evidence_excerpt, ensure_ascii=False),
                 "Return JSON matching: " + json.dumps(patch_schema, ensure_ascii=False),
-            ])},
-        # This patch covers every shot plus the attention loop.  Once exact
-        # browser targets are included, reasoning-capable providers can spend
-        # more than 2.4K tokens before emitting the strict JSON payload.
-        ], max_tokens=4800)
+                ])},
+            # This patch covers every shot plus the attention loop. Once exact
+            # browser targets are included, reasoning-capable providers can spend
+            # more than 2.4K tokens before emitting the strict JSON payload.
+            ], max_tokens=4800)
         if issue_paths:
             required_patch_fields: set[str] = set()
             for path in issue_paths:
@@ -1163,9 +1152,10 @@ class OpenAICompatibleStoryWriter:
             "repo_description_translation": "concise technical Chinese, <=36 chars",
             "readme_claim_translation": "concise technical Chinese, <=36 chars",
         }
-        patch, provenance = self._request_json([
-            {"role": "system", "content": "Return one valid JSON object containing exactly six corrected strings."},
-            {"role": "user", "content": "\n".join([
+        with self.transport.stage("repair"):
+            patch, provenance = self._request_json([
+                {"role": "system", "content": "Return one valid JSON object containing exactly six corrected strings."},
+                {"role": "user", "content": "\n".join([
                 "Repair only six visible-copy fields in a Chinese WeChat Channels GitHub story. Do not change facts or add caveats.",
                 "The three screens must add different information: named event/action → concrete input/output or response → affirmative consequence/opinion.",
                 f"Repository name: {repo_name}. Across hook_opening and hook_reveal, name the repository at least once. If background_actor is non-empty, opening names that actor/action and reveal names the repository response. Otherwise opening or reveal names the repository directly.",
@@ -1175,8 +1165,8 @@ class OpenAICompatibleStoryWriter:
                 "Current structured facts: " + json.dumps(compact, ensure_ascii=False),
                 "Validation errors: " + validation_error,
                 "Return: " + json.dumps(schema, ensure_ascii=False),
-            ])},
-        ], max_tokens=700)
+                ])},
+            ], max_tokens=700)
         repaired = deepcopy(invalid_draft)
         repaired_brief = dict(repaired.get("github_brief") or {})
         for key in ("hook_opening", "hook_reveal", "hook_verdict"):
@@ -1246,16 +1236,22 @@ class OpenAICompatibleStoryWriter:
         retry_events: list[dict[str, object]] = []
         for attempt in range(max_attempts):
             try:
-                with urlopen(request, timeout=self.settings.timeout_seconds) as response:
-                    result = json.loads(response.read().decode("utf-8"))
-                content = result.get("choices", [{}])[0].get("message", {}).get("content")
-                finish_reason = result.get("choices", [{}])[0].get("finish_reason")
-                if not isinstance(content, str) or not content.strip():
-                    raise ValueError(f"empty provider content (finish_reason={finish_reason})")
-                decoded = self._decode_json_object(content)
-                if not isinstance(decoded, dict):
-                    raise ValueError("provider content is not a JSON object")
-                draft = decoded
+                def validate_response(response: dict[str, object]) -> dict[str, object]:
+                    content = response.get("choices", [{}])[0].get("message", {}).get("content")
+                    finish_reason = response.get("choices", [{}])[0].get("finish_reason")
+                    if not isinstance(content, str) or not content.strip():
+                        raise ValueError(f"empty provider content (finish_reason={finish_reason})")
+                    decoded = self._decode_json_object(content)
+                    if not isinstance(decoded, dict):
+                        raise ValueError("provider content is not a JSON object")
+                    return decoded
+
+                result, validated = self.transport.request_json(
+                    request, timeout=self.settings.timeout_seconds,
+                    provider=self.settings.provider, requested_model=self.settings.model,
+                    opener=urlopen, validator=validate_response,
+                )
+                draft = validated
                 break
             except HTTPError as error:
                 if error.code not in {408, 429, 500, 502, 503, 504}:

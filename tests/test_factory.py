@@ -420,7 +420,7 @@ class VideoFactoryTest(unittest.TestCase):
             self.assertEqual(failure["fallback"], "money_printer_turbo")
             self.assertEqual([stage["status"] for stage in result["stages"]], ["fallback", "ok"])
 
-    def test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted(self) -> None:
+    def test_editorial_agent_routes_failed_final_verification_to_human_review(self) -> None:
         with TemporaryDirectory() as temp:
             factory = VideoFactory(Workspace(Path(temp) / "workspace"))
             job = Path(temp) / "job"
@@ -428,40 +428,29 @@ class VideoFactoryTest(unittest.TestCase):
             primary_writer = MagicMock()
             primary_writer.settings.model = "z-ai/glm-5.3-flash"
             primary_reviewer = MagicMock()
-            fallback_writer = MagicMock()
-            fallback_reviewer = MagicMock()
             primary_agent = MagicMock()
-            fallback_agent = MagicMock()
             primary_agent.run.side_effect = ContentAgentError(
                 "critic rejected duplicate hook", [{"step": "copy_review", "status": "failed"}],
             )
-            expected_run = object()
-            fallback_agent.run.return_value = expected_run
             selection: dict[str, object] = {}
+            packet = MagicMock()
+            packet.candidate.id = "candidate-1"
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False),
                 patch.object(
-                    factory, "_editorial_agent", side_effect=[primary_agent, fallback_agent],
+                    factory, "_editorial_agent", return_value=primary_agent,
                 ) as editorial_agent,
-                patch("video_factory.factory.LLMSettings.from_environment", return_value=MagicMock()),
-                patch("video_factory.factory.OpenAICompatibleStoryWriter", return_value=fallback_writer),
-                patch.object(
-                    factory, "_copy_reviewer",
-                    return_value=(fallback_reviewer, {"provider": "openrouter", "model": "critic"}),
-                ),
             ):
-                run = factory._run_editorial_agent_with_fallback(
-                    object(), primary_writer, primary_reviewer,
-                    GenerateOptions(provider="deepseek"), job, selection,
-                )
+                with self.assertRaises(ContentAgentError):
+                    factory._run_editorial_agent(
+                        packet, primary_writer, primary_reviewer,
+                        GenerateOptions(provider="deepseek"), job, selection,
+                    )
 
-            self.assertIs(run, expected_run)
-            self.assertTrue((job / "content-agent-primary-error.json").is_file())
-            self.assertEqual(selection["fallback"]["model"], "google/gemini-3.7-flash")
-            self.assertIn("semantic-copy repairs", selection["fallback"]["reason"])
-            self.assertEqual(editorial_agent.call_args_list[0].kwargs["max_llm_calls"], 6)
-            self.assertEqual(editorial_agent.call_args_list[1].kwargs["max_llm_calls"], 14)
+            self.assertTrue((job / "content-agent-error.json").is_file())
+            self.assertEqual(selection["semantic_failure"]["action"], "human_review")
+            self.assertEqual(editorial_agent.call_args.kwargs["max_llm_calls"], 7)
 
     def test_openrouter_writer_uses_independent_gemini_critic(self) -> None:
         with TemporaryDirectory() as temp:

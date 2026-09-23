@@ -157,14 +157,14 @@
   },
   {
     "id": "VF-20260830-014",
-    "title": "Editorial agent stopped after a cheap model exhausted semantic repairs",
+    "title": "Editorial agent multiplied Gemini passes after failed verification",
     "stage": "content_agent",
-    "reproduction": "The primary low-cost writer produces three near-duplicate retention hooks and the independent copy critic rejects every bounded repair.",
-    "impact": "A valid source required Codex intervention even though a stronger qualified model was available through a configured fallback provider; an explicit primary-provider choice incorrectly disabled that route.",
+    "reproduction": "The primary low-cost writer produces a draft that exposes a different issue after each Gemini verification.",
+    "impact": "One candidate could consume four semantic review passes and then restart the whole pipeline with Gemini; the direct pipeline now stops after review and verification and routes the unresolved item to human review.",
     "status": "fixed",
     "tests": [
-      "tests/test_factory.py::VideoFactoryTest::test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted",
-      "tests/test_agent.py::ContentAgentTest::test_changed_critic_issue_gets_one_final_convergence_repair"
+      "tests/test_factory.py::VideoFactoryTest::test_editorial_agent_routes_failed_final_verification_to_human_review",
+      "tests/test_agent.py::ContentAgentTest::test_changed_critic_issue_stops_after_one_repair_and_verification"
     ]
   },
   {
@@ -176,7 +176,8 @@
     "status": "fixed",
     "tests": [
       "tests/test_llm_transport.py::LLMTransportTests::test_transport_stops_after_two_bounded_attempts",
-      "tests/test_factory.py::VideoFactoryTest::test_editorial_agent_escalates_after_primary_semantic_repairs_are_exhausted"
+      "tests/test_factory.py::VideoFactoryTest::test_editorial_agent_routes_failed_final_verification_to_human_review",
+      "tests/test_llm_transport.py::LLMTransportTests::test_transport_enforces_two_openrouter_semantic_review_posts"
     ]
   },
   {
@@ -478,13 +479,13 @@
   },
   {
     "id": "VF-20260831-042",
-    "title": "Copy critic re-reviewed the entire script when only a few fields were missing",
+    "title": "Copy critic spent a hidden second request when fields were missing",
     "stage": "content_agent",
-    "reproduction": "Have the critic omit several translation fields from an otherwise complete review, then repeat the same full review request.",
-    "impact": "The second call was slower, could omit the same fields again, and forced a grounded Radar draft into the expensive fallback writer instead of completing the missing checks.",
+    "reproduction": "Have the critic omit several translation fields from an otherwise complete review while the workflow counter records one logical review.",
+    "impact": "The hidden coverage request consumed another billable Gemini call and could leave no budget for final verification; missing coverage now fails closed inside the original pass.",
     "status": "fixed",
     "tests": [
-      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_retries_when_critic_omits_a_field"
+      "tests/test_llm_transport.py::LLMTransportTests::test_visible_copy_review_fails_closed_without_hidden_coverage_retry"
     ]
   },
   {

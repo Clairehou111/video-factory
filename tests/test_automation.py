@@ -39,6 +39,35 @@ class FakeWorkspace:
 
 
 class AutomationTest(unittest.TestCase):
+    def test_transport_ledger_is_cost_source_of_truth_without_provenance_double_count(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = FakeWorkspace(root)
+            ledger = root / "observability" / "llm-calls.jsonl"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(json.dumps({
+                "recorded_at": NOW.isoformat(), "provider": "openrouter",
+                "requested_model": "vendor/model", "actual_model": "vendor/model",
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+                "cost_usd": 0.012,
+            }) + "\n", encoding="utf-8")
+            duplicate_job = {
+                "translation_trace": [{"provenance": {
+                    "provider": "openrouter", "model": "vendor/model",
+                    "generated_at": NOW.isoformat(),
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20, "cost": 0.012},
+                }}],
+            }
+
+            usage = AutomationAuditService(workspace, AutomationPolicy(7))._llm_usage(
+                [duplicate_job], NOW,
+            )
+
+            self.assertEqual(usage["source"], "transport")
+            self.assertEqual(usage["calls"], 1)
+            self.assertEqual(usage["total_tokens"], 120)
+            self.assertEqual(usage["actual_cost_usd"], 0.012)
+
     def test_pipeline_lock_rejects_concurrent_run(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)

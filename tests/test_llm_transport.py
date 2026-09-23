@@ -1,13 +1,17 @@
 import json
 import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.error import HTTPError
+from urllib.request import Request
 from unittest.mock import patch
 
 from video_factory.llm import (
     LLMSettings, OpenAICompatibleStoryWriter, TransportFallbackStoryWriter,
     _coerce_model_float,
 )
+from video_factory.llm_transport import LLMBudgetExceeded, LLMTransport
 from video_factory.models import (
     Candidate, ContentType, EditorialOpportunity, Evidence, SelectionReason,
     SourceType, TopicType,
@@ -30,6 +34,70 @@ class _Response:
 
 
 class LLMTransportTests(unittest.TestCase):
+    def test_transport_ledgers_every_billable_retry_without_prompt_text(self) -> None:
+        with TemporaryDirectory() as temp:
+            transport = LLMTransport(Path(temp))
+            writer = OpenAICompatibleStoryWriter(LLMSettings(
+                "openrouter", "https://openrouter.example/api/v1", "test-key", "critic",
+            ), transport)
+            responses = [
+                _Response({
+                    "model": "critic", "choices": [{
+                        "message": {"content": ""}, "finish_reason": "error",
+                    }], "usage": {"total_tokens": 100, "cost": 0.01},
+                }),
+                _Response({
+                    "model": "critic", "choices": [{
+                        "message": {"content": '{"ok":true}'}, "finish_reason": "stop",
+                    }], "usage": {"total_tokens": 50, "cost": 0.005},
+                }),
+            ]
+            with (
+                transport.scope(
+                    job_id="job-1", candidate_id="candidate-1", max_requests=4,
+                    max_cost_usd=0.10, max_openrouter_semantic_reviews=2,
+                ),
+                patch("video_factory.llm.urlopen", side_effect=responses),
+            ):
+                draft, _ = writer._request_json([
+                    {"role": "user", "content": "SECRET PROMPT TEXT"},
+                ], 100)
+
+            self.assertEqual(draft, {"ok": True})
+            rows = [
+                json.loads(line) for line in transport.ledger_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual([row["status"] for row in rows], ["error", "ok"])
+            self.assertEqual(sum(row["cost_usd"] for row in rows), 0.015)
+            self.assertEqual(rows[0]["job_id"], "job-1")
+            self.assertNotIn("SECRET PROMPT TEXT", transport.ledger_path.read_text(encoding="utf-8"))
+
+    def test_transport_enforces_two_openrouter_semantic_review_posts(self) -> None:
+        transport = LLMTransport()
+        request = Request(
+            "https://openrouter.example/api/v1/chat/completions", data=b"{}", method="POST",
+        )
+        response = _Response({"model": "critic", "usage": {"cost": 0.001}})
+        with transport.scope(
+            job_id="job-1", max_requests=10, max_cost_usd=0.10,
+            max_openrouter_semantic_reviews=2,
+        ):
+            with transport.stage("semantic_review"):
+                transport.request_json(
+                    request, timeout=30, provider="openrouter", requested_model="critic",
+                    opener=lambda *_args, **_kwargs: response,
+                )
+                transport.request_json(
+                    request, timeout=30, provider="openrouter", requested_model="critic",
+                    opener=lambda *_args, **_kwargs: response,
+                )
+                with self.assertRaises(LLMBudgetExceeded):
+                    transport.request_json(
+                        request, timeout=30, provider="openrouter", requested_model="critic",
+                        opener=lambda *_args, **_kwargs: response,
+                    )
+
     def test_kimi3_alias_uses_monthly_coding_plan_endpoint(self) -> None:
         with patch.dict(os.environ, {"KIMI_CODE_API": "test-plan-key"}, clear=True):
             settings = LLMSettings.from_environment("kimi", "kimi/kimi3")
@@ -632,7 +700,7 @@ class LLMTransportTests(unittest.TestCase):
             "github_brief.focus_candidates[0].browser_translation",
         })
 
-    def test_visible_copy_review_retries_when_critic_omits_a_field(self) -> None:
+    def test_visible_copy_review_fails_closed_without_hidden_coverage_retry(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(
             "openrouter", "https://openrouter.example/api/v1", "test-key", "cheap-model",
         ))
@@ -655,25 +723,20 @@ class LLMTransportTests(unittest.TestCase):
         } for path in (
             "editorial_brief.headline", "editorial_brief.fixed_conclusion",
         )]
-        with patch.object(writer, "_request_json", side_effect=[
-            ({"approved": True, "field_reviews": complete[:1]}, {"model": "critic"}),
-            ({"approved": True, "field_reviews": complete}, {"model": "critic"}),
-        ]) as requested:
+        with patch.object(
+            writer, "_request_json",
+            return_value=({"approved": True, "field_reviews": complete[:1]}, {"model": "critic"}),
+        ) as requested:
             issues, provenance = writer.review_visible_copy(packet, {
                 "editorial_brief": {
                     "headline": "厂商交付具体更新",
                     "fixed_conclusion": "这项更新已经可以使用",
                 },
             })
-        self.assertEqual(issues, [])
-        self.assertEqual(requested.call_count, 2)
-        self.assertTrue(provenance["review_retried"])
-        retry_prompt = requested.call_args_list[1].args[0][-1]["content"]
-        fields_payload = retry_prompt.split("Fields: ", 1)[1].split("\nVisible copy:", 1)[0]
-        self.assertEqual(
-            set(json.loads(fields_payload)), {"editorial_brief.fixed_conclusion"},
-        )
-        self.assertIn("Return exactly one field_reviews row", retry_prompt)
+        self.assertEqual(requested.call_count, 1)
+        self.assertEqual(provenance["missing_fields"], ["editorial_brief.fixed_conclusion"])
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["category"], "review_coverage")
 
     def test_visible_copy_review_accepts_short_evidence_shot_field_aliases(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(

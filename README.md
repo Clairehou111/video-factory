@@ -125,6 +125,16 @@ open http://127.0.0.1:6006
 
 Phoenix 固定 `arizephoenix/phoenix:13.12.0`，只监听 `127.0.0.1:6006/4317`，数据在 `workspace/phoenix`；凭据字段统一脱敏。详见 `deploy/phoenix/README.md`。
 
+不需要再引入一套 LLM framework。所有文本、审稿、视觉、source-video 选段和 nightly self-audit 请求都经过同一个 transport：每次真实 HTTP POST（包括重试和模型返回错误）追加到 `workspace/observability/llm-calls.jsonl`，记录 job/candidate/stage、请求与实际模型、token、OpenRouter 返回的 cost、延迟和错误；只保存 prompt 哈希，不保存 prompt 或密钥。相同事件同时进入 Phoenix。
+
+Static/GitHub 生产路径直接使用低价模型 plan/write/repair + 最多两次 OpenRouter semantic-review POST（review、verification），不再从头启动 Gemini fallback。默认 transport 限额分别为 12 requests / $0.25 和 12 requests / $0.30，可用 `VIDEO_FACTORY_STATIC_LLM_MAX_REQUESTS`、`VIDEO_FACTORY_STATIC_LLM_MAX_COST_USD`、`VIDEO_FACTORY_GITHUB_LLM_MAX_REQUESTS`、`VIDEO_FACTORY_GITHUB_LLM_MAX_COST_USD` 调整。最终 verification 仍失败时进入人工审核，不降低发布门槛。上线前可完全离线复核最近的已发布 corpus：
+
+所有 job（包括 YouTube）另有 200 requests / $5 的外层紧急上限，通过 `VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS` / `VIDEO_FACTORY_JOB_LLM_MAX_COST_USD` 调整；Static/GitHub 仍由上面的更严格内层限额约束。
+
+```bash
+python tools/check_llm_pipeline_corpus.py --workspace workspace --limit 30
+```
+
 ## YouTube 中文精选合集
 
 YouTube 是一等来源：每 2 小时从科技人物、AI 工程、startup、机器人/自动驾驶池搜索，每轮最多选 1 条 ≥70 分候选，无合格候选只记 `no_selection`。来源权威分只看实际发布频道；二次搬运硬淘汰。翻译用 `translate / preserve / bilingual_once` 三态术语表，产品/API/代码词保留英文。

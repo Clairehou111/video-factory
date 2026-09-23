@@ -3496,6 +3496,9 @@ class ResourceDiscoveryService:
                     item.status = "generated"
                     self.workspace.save_discovery_candidate(item.to_dict())
                     return {"status": "generated", "candidate_id": item.id, "attempts": attempts, "result": result}
+                if manifest is None or not manifest.is_file():
+                    attempts[-1]["recovery"] = "stop_non_retryable_quality_failure"
+                    break
             except Exception as error:
                 discard_cached_manifest = (
                     retry_mode == "deterministic_rerender"
@@ -3521,6 +3524,11 @@ class ResourceDiscoveryService:
                     youtube_translation_plan = self._latest_youtube_translation_plan(item.url)
                 if isinstance(error, (NameError, UnboundLocalError, SyntaxError, ImportError)):
                     attempts[-1]["recovery"] = "stop_non_retryable_internal_error"
+                    break
+                if not retryable_error and not discard_cached_manifest and (
+                    manifest is None or not manifest.is_file()
+                ):
+                    attempts[-1]["recovery"] = "stop_non_retryable_generation_failure"
                     break
         item.status = "blocked"
         self.workspace.save_discovery_candidate(item.to_dict())
