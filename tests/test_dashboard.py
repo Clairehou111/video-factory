@@ -88,7 +88,47 @@ class DashboardTest(unittest.TestCase):
 
             self.assertEqual([row["item_id"] for row in rows], ["wechat-item"])
             self.assertTrue(rows[0]["can_publish"])
+            self.assertEqual(rows[0]["sequence"], 1)
+            self.assertEqual(rows[0]["sequence_total"], 1)
+            self.assertEqual(rows[0]["sequence_label"], "01/01")
+            self.assertEqual(rows[0]["display_title"], "01/01 · AI 写得越快，人越要会验")
             self.assertEqual(list(media.values())[0].name, "wechat.mp4")
+
+    def test_queue_exposes_collection_sequence_without_changing_publish_title(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace, batch = self.make_batch(root)
+            second_video = root / "wechat-second.mp4"
+            second_video.write_bytes(b"wechat-video-second")
+            second = CollectionPublishItem(
+                id="wechat-item-2", collection_item_id="wechat-item-2",
+                platform=PublishPlatform.TENCENT, account_name="main",
+                collection_title="AI 高光", order=2, video_path=str(second_video),
+                video_sha256=hashlib.sha256(second_video.read_bytes()).hexdigest(),
+                title="第二条原始发布标题", description="来源：访谈", tags=["AI"],
+                options={"collection": "AI 高光"},
+            )
+            batch.items.append(second)
+            workspace.save_publish_batch(batch)
+
+            rows, _ = PublishDashboard(workspace).queue()
+
+            self.assertEqual(
+                [
+                    (row["title"], row["display_title"], row["sequence_label"])
+                    for row in rows
+                ],
+                [
+                    ("AI 写得越快，人越要会验", "01/02 · AI 写得越快，人越要会验", "01/02"),
+                    ("第二条原始发布标题", "02/02 · 第二条原始发布标题", "02/02"),
+                ],
+            )
+
+            refreshed_rows, _ = PublishDashboard(workspace).queue()
+            self.assertEqual(
+                [row["display_title"] for row in refreshed_rows],
+                ["01/02 · AI 写得越快，人越要会验", "02/02 · 第二条原始发布标题"],
+            )
 
     def test_queue_shows_only_latest_rerender_for_same_youtube_source(self) -> None:
         with TemporaryDirectory() as temp:

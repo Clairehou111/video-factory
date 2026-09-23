@@ -54,14 +54,23 @@ class DashboardCard:
     last_error: str
     review_check: str
     action_label: str
+    sequence: int = 0
+    sequence_total: int = 0
     schedule_at: str = ""
 
     def to_dict(self, media_id: str) -> dict[str, Any]:
+        sequence_label = (
+            f"{self.sequence:02d}/{self.sequence_total:02d}"
+            if self.sequence > 0 and self.sequence_total > 0 else ""
+        )
         return {
             "batch_id": self.batch_id,
             "item_id": self.item_id,
             "manifest_id": self.manifest_id,
             "title": self.title,
+            "display_title": (
+                f"{sequence_label} · {self.title}" if sequence_label else self.title
+            ),
             "description": self.description,
             "video_path": self.video_path,
             "source_url": self.source_url,
@@ -77,6 +86,9 @@ class DashboardCard:
             "last_error": self.last_error,
             "review_check": self.review_check,
             "action_label": self.action_label,
+            "sequence": self.sequence,
+            "sequence_total": self.sequence_total,
+            "sequence_label": sequence_label,
             "video_available": Path(self.video_path).is_file(),
             "media_url": f"/media/{media_id}",
             "platform": "视频号",
@@ -130,7 +142,10 @@ class PublishDashboard:
                 cards.extend(self._collection_cards(payload))
             else:
                 cards.extend(self._ordinary_cards(payload))
-        cards.sort(key=lambda row: (row.created_at, row.batch_id, row.item_id), reverse=True)
+        # Keep each source collection in its authored sequence while still
+        # showing newer batches before older batches.
+        cards.sort(key=lambda row: (row.sequence, row.item_id))
+        cards.sort(key=lambda row: (row.created_at, row.batch_id), reverse=True)
 
         media: dict[str, Path] = {}
         rows: list[dict[str, Any]] = []
@@ -185,12 +200,22 @@ class PublishDashboard:
         failed_checks = self._failed_checks(payload)
         batch_state = str(payload.get("state") or "")
         cards: list[DashboardCard] = []
-        for item in payload.get("items") or []:
-            if not isinstance(item, dict) or item.get("platform") != PublishPlatform.TENCENT.value:
-                continue
+        tencent_items = [
+            item for item in payload.get("items") or []
+            if isinstance(item, dict)
+            and item.get("platform") == PublishPlatform.TENCENT.value
+        ]
+        sequence_total = len(tencent_items)
+        for fallback_sequence, item in enumerate(tencent_items, start=1):
             item_state = str(item.get("state") or "")
             if item_state == CollectionPublishItemState.SUBMITTED.value:
                 continue
+            try:
+                sequence = int(item.get("order") or fallback_sequence)
+            except (TypeError, ValueError):
+                sequence = fallback_sequence
+            if sequence < 1:
+                sequence = fallback_sequence
             can_publish = (
                 batch_state in {state.value for state in PUBLISHABLE_BATCH_STATES}
                 and item_state in {
@@ -221,6 +246,7 @@ class PublishDashboard:
                 action_label=("确认复用依据已审核" if can_review else self._action_label(
                     batch_state, item_state, can_publish, can_review, requires_login,
                 )),
+                sequence=sequence, sequence_total=sequence_total,
                 schedule_at=str(item.get("schedule_at") or ""),
             ))
         return cards
@@ -611,7 +637,7 @@ DASHBOARD_HTML = """<!doctype html>
 <script>
 let csrf='';const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(message){const el=document.querySelector('#toast');el.textContent=message;el.style.display='block';setTimeout(()=>el.style.display='none',5000)}
-async function load(){const r=await fetch('/api/queue',{cache:'no-store'});const data=await r.json();csrf=data.csrf_token;for(const k of ['total','ready','attention'])document.querySelector('#'+k).textContent=data.summary[k];const grid=document.querySelector('#grid');if(!data.items.length){grid.innerHTML='<div class="empty">队列已清空。下一轮发现与生成完成后，新成片会自动出现在这里。</div>';return}grid.innerHTML=data.items.map(x=>`<article class="card">${x.video_available?`<video controls preload="metadata" src="${esc(x.media_url)}"></video>`:'<div class="missing">成片文件已被清理，需重新生成后才能发布</div>'}<div class="meta"><span class="pill">${esc(x.editorial_mode||'news')}</span><span class="state">${esc(x.item_state)}</span></div><h2>${esc(x.title)}</h2><div class="source">${x.source_url?`来源：<a href="${esc(x.source_url)}" target="_blank" rel="noreferrer">${esc(x.source_title||x.source_url)}</a>`:'来源已归档'}</div>${x.failed_checks.length?`<div class="checks">未通过：${esc(x.failed_checks.join('、'))}</div>`:''}${x.last_error?`<div class="checks">上次错误：${esc(x.last_error)}</div>`:''}${x.can_publish?`<label class="schedule">定时发布（北京时间，至少提前 2 小时；留空则立即发布）<input type="datetime-local" value="${esc((x.schedule_at||'').replace(' ','T'))}"></label>`:''}<button ${(x.can_publish||x.can_review)?'':'disabled'} data-action="${x.can_review?'review':x.requires_login?'login':'publish'}" data-review-check="${esc(x.review_check)}" data-batch="${esc(x.batch_id)}" data-item="${esc(x.item_id)}">${esc(x.action_label)}</button></article>`).join('');grid.querySelectorAll('button:not(:disabled)').forEach(b=>b.addEventListener('click',handleAction))}
+async function load(){const r=await fetch('/api/queue',{cache:'no-store'});const data=await r.json();csrf=data.csrf_token;for(const k of ['total','ready','attention'])document.querySelector('#'+k).textContent=data.summary[k];const grid=document.querySelector('#grid');if(!data.items.length){grid.innerHTML='<div class="empty">队列已清空。下一轮发现与生成完成后，新成片会自动出现在这里。</div>';return}grid.innerHTML=data.items.map(x=>`<article class="card">${x.video_available?`<video controls preload="metadata" src="${esc(x.media_url)}"></video>`:'<div class="missing">成片文件已被清理，需重新生成后才能发布</div>'}<div class="meta"><span>${x.sequence_label?`<span class="pill">短片 ${esc(x.sequence_label)}</span> `:''}<span class="pill">${esc(x.editorial_mode||'news')}</span></span><span class="state">${esc(x.item_state)}</span></div><h2>${esc(x.display_title||x.title)}</h2><div class="source">${x.source_url?`来源：<a href="${esc(x.source_url)}" target="_blank" rel="noreferrer">${esc(x.source_title||x.source_url)}</a>`:'来源已归档'}</div>${x.failed_checks.length?`<div class="checks">未通过：${esc(x.failed_checks.join('、'))}</div>`:''}${x.last_error?`<div class="checks">上次错误：${esc(x.last_error)}</div>`:''}${x.can_publish?`<label class="schedule">定时发布（北京时间，至少提前 2 小时；留空则立即发布）<input type="datetime-local" value="${esc((x.schedule_at||'').replace(' ','T'))}"></label>`:''}<button ${(x.can_publish||x.can_review)?'':'disabled'} data-action="${x.can_review?'review':x.requires_login?'login':'publish'}" data-review-check="${esc(x.review_check)}" data-batch="${esc(x.batch_id)}" data-item="${esc(x.item_id)}">${esc(x.action_label)}</button></article>`).join('');grid.querySelectorAll('button:not(:disabled)').forEach(b=>b.addEventListener('click',handleAction))}
 async function handleAction(e){const b=e.currentTarget;if(b.dataset.action==='review')return reviewOne(b);if(b.dataset.action==='login')return loginOne(b);return publishOne(e)}
 async function reviewOne(b){const rights=b.dataset.reviewCheck==='rights_review';const message=rights?'确认你已完整观看这段访谈，并核对来源署名、片段范围与本次复用依据？此操作只解除 rights_review 门禁，不会发布。':'确认你已完整观看：内容仅从 AI 安全、可解释性与防御研究角度呈现，不提供滥用操作指导？此操作只解除安全人工审核门禁，不会发布。';if(!confirm(message))return;b.disabled=true;b.textContent='正在记录审核…';try{const r=await fetch('/api/review',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({batch_id:b.dataset.batch,item_id:b.dataset.item})});const data=await r.json();if(!r.ok)throw new Error(data.error||'审核记录失败');toast('人工审核已记录；请再次确认后发布');await load()}catch(err){toast(err.message);b.disabled=false;b.textContent='重试审核'}}
 async function loginOne(b){if(!confirm('视频号登录已失效。现在打开受管登录流程，登录成功后继续发布这一条视频？'))return;b.disabled=true;b.textContent='等待视频号登录…';try{const r=await fetch('/api/login-and-publish',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({batch_id:b.dataset.batch,item_id:b.dataset.item})});const data=await r.json();if(!r.ok)throw new Error(data.error||'登录恢复失败');toast(data.published?'登录已恢复，发布完成':'登录或发布未完成：'+(data.error||data.item_state));await load()}catch(err){toast(err.message);b.disabled=false;b.textContent='重试登录恢复'}}
