@@ -486,6 +486,36 @@ class DiscoveryTest(unittest.TestCase):
         self.assertTrue(any("autonomous driving" in query for query in config.channels[DiscoveryChannel.X].queries))
         self.assertTrue(any("embodied AI" in query for query in config.channels[DiscoveryChannel.PAPER].queries))
         self.assertIn("typesafe.ai", config.channels[DiscoveryChannel.OFFICIAL].seed_domains)
+        self.assertFalse(config.channels[DiscoveryChannel.OPENROUTER].enabled)
+
+    def test_sifted_vc_fund_story_cannot_inherit_ai_from_publisher_footer(self) -> None:
+        title = "The age of the scaleup fund"
+        article = (
+            "Investors predict more and bigger funds aimed at tackling the European "
+            "growth funding gap. A new fund of funds would back growth-stage VCs. "
+            "The investors discussed capital, returns, and later-stage financing. "
+        ) * 8
+        body = (
+            f"Title: {title} | Sifted\n\nURL Source: https://sifted.eu/example\n\n"
+            "Markdown Content:\nConsent\nThe intelligence layer for European tech\n"
+            f"{title}\nInvestors predict more funds\nAnne Sraders\n{article}\n"
+            "ADVERTISEMENT\nEDITOR'S PICKS\nOpenAI startup partnership\n"
+            "AI Code of Conduct\n"
+        )
+        item = DiscoveryCandidate(
+            id="sifted-vc-funds", channel=DiscoveryChannel.PROJECTS,
+            url="https://sifted.eu/articles/age-of-scaleup-funds", title=title,
+            publisher="Sifted", published_at=NOW.isoformat(),
+            summary="Investors predict more funds for Europe's growth funding gap.",
+            body_text=body,
+        )
+
+        evaluate_candidate(item, ChannelConfig.from_dict(DiscoveryChannel.PROJECTS, {}), NOW)
+
+        self.assertFalse(item.eligible)
+        self.assertEqual(item.metadata["it_scope_markers"], [])
+        self.assertIn("outside_it_software_ai_scope", item.rejection_reasons)
+        self.assertIn("finance_only_without_technology_consequence", item.rejection_reasons)
 
     def test_news_defaults_cover_reported_ai_hardware_procurement(self) -> None:
         news = ResourceDiscoveryConfig().channels[DiscoveryChannel.NEWS]

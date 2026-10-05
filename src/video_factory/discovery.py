@@ -375,6 +375,10 @@ class ChannelConfig:
         values.setdefault("cadence_hours", DEFAULT_CADENCE_HOURS[channel])
         values.setdefault("lookback_hours", DEFAULT_LOOKBACK_HOURS[channel])
         values.setdefault("queries", list(DEFAULT_QUERIES.get(channel, [])))
+        if channel == DiscoveryChannel.OPENROUTER:
+            # OpenRouter remains available as an inference provider, but price
+            # promotions are not an editorial discovery source by default.
+            values.setdefault("enabled", False)
         if channel == DiscoveryChannel.X:
             values.setdefault("seed_accounts", list(DEFAULT_X_ACCOUNTS))
         if channel == DiscoveryChannel.NEWS:
@@ -1964,18 +1968,23 @@ def _article_subject_body(item: DiscoveryCandidate) -> str:
     title = re.sub(r"\s+", " ", item.title).strip().rstrip("/")
     if not title:
         return body
-    heading = re.search(
-        rf"(?mi)^#\s+{re.escape(title)}\s*$",
-        body,
-    )
+    # Jina normally emits an H1, but paywalled pages sometimes flatten it to a
+    # plain line.  Start only after ``Markdown Content:`` so the ``Title:``
+    # metadata line cannot be mistaken for the article heading.
+    markdown_start = body.find("Markdown Content:") + len("Markdown Content:")
+    markdown = body[markdown_start:]
+    heading = re.search(rf"(?mi)^#?\s*{re.escape(title)}\s*$", markdown)
     if not heading:
-        return body
-    article = body[heading.end():].strip()
+        return markdown.strip()
+    article = markdown[heading.end():].strip()
     boundaries = [
         match.start() for pattern in (
             r"(?mi)^Topics\s*$",
             r"(?mi)^##\s+Related\s*$",
             r"(?mi)^###\s+Newsletters\s*$",
+            r"(?mi)^ADVERTISEMENT\s*$",
+            r"(?mi)^EDITOR'S PICKS\s*$",
+            r"(?mi)^RECOMMENDED\s*$",
             r"(?mi)^Do Not Sell or Share My Personal Information\s*$",
             r"(?m)^©\s+\d{4}\b",
         )
@@ -2030,7 +2039,8 @@ def _is_finance_only_business_story(item: DiscoveryCandidate) -> bool:
     text = _candidate_subject_text(item)
     finance_is_the_event = bool(re.search(
         r"\b(?:acquir(?:e[ds]?|ing|ed|er|ers|ition)|sell(?:s|ing)?|sold|sale|"
-        r"valuation|cash|funding|financing|revenue|profit|bank balance|shares?)\b|"
+        r"valuation|cash|fund(?:s|raising)?|funding|financing|invest(?:or|ors|ment|ments)|"
+        r"venture capital|private equity|revenue|profit|bank balance|shares?)\b|"
         r"\$\s*\d|收购|出售|卖给|估值|现金|融资|营收|利润|账面|股份",
         lead,
     ))

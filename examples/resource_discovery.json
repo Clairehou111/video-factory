@@ -229,6 +229,7 @@
       }
     },
     "openrouter": {
+      "enabled": false,
       "cadence_hours": 2,
       "lookback_hours": 24,
       "minimum_score": 70,
