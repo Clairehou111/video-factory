@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,6 +35,26 @@ class _Response:
 
 
 class LLMTransportTests(unittest.TestCase):
+    def test_transport_enforces_total_response_deadline(self) -> None:
+        transport = LLMTransport()
+        request = Request(
+            "https://openrouter.example/api/v1/chat/completions", data=b"{}", method="POST",
+        )
+
+        class _TricklingResponse(_Response):
+            def read(self):
+                time.sleep(0.25)
+                return super().read()
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "total response deadline"):
+            transport.request_json(
+                request, timeout=0.05, provider="openrouter", requested_model="critic",
+                opener=lambda *_args, **_kwargs: _TricklingResponse({"model": "critic"}),
+            )
+
+        self.assertLess(time.monotonic() - started, 0.20)
+
     def test_transport_ledgers_every_billable_retry_without_prompt_text(self) -> None:
         with TemporaryDirectory() as temp:
             transport = LLMTransport(Path(temp))
@@ -195,10 +216,6 @@ class LLMTransportTests(unittest.TestCase):
             "field_path": "editorial_brief.evidence_shots[0].fact", "verdict": "pass",
             "naturalness_score": 5, "attention_score": 0, "evidence_ids": [evidence.id],
             "category": "none", "problem": "", "repair_instruction": "",
-        }, {
-            "field_path": "editorial_brief.evidence_shots[0].target", "verdict": "pass",
-            "naturalness_score": 5, "attention_score": 0, "evidence_ids": [evidence.id],
-            "category": "none", "problem": "", "repair_instruction": "",
         }]
         with patch.object(writer, "_request_json", return_value=(
             {"approved": True, "field_reviews": reviews}, {"model": "critic"},
@@ -213,6 +230,7 @@ class LLMTransportTests(unittest.TestCase):
         self.assertEqual(issues, [])
         prompt = requested.call_args.args[0][-1]["content"]
         self.assertIn(target, prompt)
+        self.assertIn('"cited_targets": ["' + target, prompt)
         self.assertIn("cited target context", prompt)
 
     def test_spoken_chinese_reviewer_is_copy_only_not_a_second_director(self) -> None:
@@ -636,7 +654,7 @@ class LLMTransportTests(unittest.TestCase):
             })
 
         self.assertEqual(issues, [])
-        self.assertIn("editorial_brief.evidence_shots[0].target", observed_paths)
+        self.assertNotIn("editorial_brief.evidence_shots[0].target", observed_paths)
 
     def test_github_review_expands_every_rendered_hook_and_translation_field(self) -> None:
         writer = OpenAICompatibleStoryWriter(LLMSettings(

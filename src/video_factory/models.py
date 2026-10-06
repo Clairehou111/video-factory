@@ -171,10 +171,38 @@ class TranscriptCue:
     # Clip-local YouTube transcripts keep the source timeline for audit/rebuilds.
     original_start: float | None = None
     original_end: float | None = None
+    # Optional authoritative JSON3 word timing. Each row contains raw/start/end
+    # on the cue's current timeline and survives cue merging/rebasing.
+    source_tokens: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+
+@dataclass(slots=True)
+class SourceWord:
+    """One immutable YouTube transcript token plus optional audio timing."""
+
+    id: str
+    cue_id: str
+    ordinal: int
+    raw: str
+    normalized: str
+    youtube_start: float
+    youtube_end: float
+    aligned_start: float | None = None
+    aligned_end: float | None = None
+    alignment_status: str = "youtube"
+    confidence: float | None = None
+
+    @property
+    def start(self) -> float:
+        return self.aligned_start if self.aligned_start is not None else self.youtube_start
+
+    @property
+    def end(self) -> float:
+        return self.aligned_end if self.aligned_end is not None else self.youtube_end
 
 
 @dataclass(slots=True)
@@ -184,6 +212,8 @@ class TerminologyEntry:
     target: str = ""
     first_use_explanation: str = ""
     notes: str = ""
+    alternatives: list[str] = field(default_factory=list)
+    rationale: str = ""
 
 
 @dataclass(slots=True)

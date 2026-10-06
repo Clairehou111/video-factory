@@ -135,6 +135,18 @@ class ConvergingReviewModel(ValidPrimaryModel):
         return valid_request(packet), {"model": "writer"}, {"repair": self.repair_calls}
 
 
+class PersistentStyleReviewModel(ReviewingPrimaryModel):
+    def review_visible_copy(self, packet, draft):
+        self.review_calls += 1
+        return [{
+            "field_path": "editorial_brief.subheadline",
+            "category": "natural_chinese",
+            "problem": "could sound more conversational",
+            "evidence_ids": ["tweet-evidence"],
+            "repair_instruction": "rewrite without changing meaning",
+        }], {"model": "critic"}
+
+
 class ContentAgentTest(unittest.TestCase):
     def test_only_render_size_failures_receive_the_bounded_extra_cleanup(self) -> None:
         self.assertTrue(_visible_copy_only_failure(
@@ -208,6 +220,23 @@ class ContentAgentTest(unittest.TestCase):
 
         self.assertEqual(model.repair_calls, 1)
         self.assertEqual(model.review_calls, 2)
+
+    def test_style_only_issue_is_advisory_without_a_repair_cycle(self) -> None:
+        model = PersistentStyleReviewModel()
+
+        result = BoundedContentAgent(model, copy_reviewer=model).run(packet_with_link())
+
+        self.assertEqual(result.llm_calls, 3)
+        self.assertEqual(model.repair_calls, 0)
+        self.assertEqual(model.review_calls, 1)
+        trace = next(
+            check for check in result.manifest.quality_checks
+            if check["name"] == "content_agent"
+        )["detail"]["trace"]
+        review = next(item for item in trace if item["step"] == "copy_review")
+        self.assertEqual(review["status"], "approved_with_advisories")
+        self.assertEqual(review["blocking_issues"], [])
+        self.assertFalse(any(item["step"] == "copy_review_verify" for item in trace))
 
     def test_strong_model_is_only_used_after_primary_and_repair_fail(self) -> None:
         primary = RepairingModel(fail_repair=True)

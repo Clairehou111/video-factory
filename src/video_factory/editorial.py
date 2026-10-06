@@ -310,11 +310,22 @@ def _fit_rendered_shot_copy(shot: EvidenceShot) -> None:
 
     Each individual field can satisfy its own limit while fact, translation,
     and optional implication still overload one derived card. Allocate one
-    shared pixel-time budget after material selection, preserving the source
-    translation and a concise fact before trimming optional audience copy.
+    shared pixel-time budget after material selection, preserving complete
+    facts while removing optional or duplicated audience-facing lines.
     """
     budget = max(8.0, shot.duration * 11.5)
     family = shot.visual_family
+    shot.fact = re.sub(r"\s+", " ", shot.fact).strip()
+    shot.audience_copy = re.sub(r"\s+", " ", shot.audience_copy).strip()
+    if shot.full_translation:
+        shot.full_translation = re.sub(r"\s+", " ", shot.full_translation).strip()
+    if shot.translation:
+        shot.translation = re.sub(r"\s+", " ", shot.translation).strip()
+    if shot.audience_copy and visible_copy_units(shot) > budget:
+        audience_copy = shot.audience_copy
+        shot.audience_copy = ""
+        if visible_copy_units(shot) > budget:
+            shot.audience_copy = audience_copy
     if shot.kind == EvidenceShotKind.TWEET_CARD and family in {"tweet", "quoted_post"}:
         gloss_name = "full_translation" if shot.full_translation else "translation"
         setattr(shot, gloss_name, re.sub(r"\s+", " ", getattr(shot, gloss_name)).strip())
@@ -325,15 +336,20 @@ def _fit_rendered_shot_copy(shot: EvidenceShot) -> None:
         audience = shot.audience_copy.strip()
         if _looks_like_radar_fragment(audience):
             audience = ""
-        if (
-            audience
-            and copy_width(" ".join(filter(None, (fact, audience, gloss)))) > budget
-            and copy_width(" ".join(filter(None, (fact, gloss)))) <= budget
-        ):
-            # The second line is explicitly optional. Remove it only as a
-            # whole sentence when the complete fact + source translation fit;
-            # never shave characters from any field.
+        if audience and copy_width(" ".join(filter(None, (fact, audience, gloss)))) > budget:
+            # The second line is explicitly optional. Remove it as a whole
+            # sentence before spending more screen time; never shave prose.
             audience = ""
+        if (
+            fact and gloss
+            and copy_width(" ".join(filter(None, (fact, gloss)))) > budget
+            and re.search(r"[\u4e00-\u9fff]", fact)
+            and re.search(r"[\u4e00-\u9fff]", gloss)
+        ):
+            # A derived card does not display the foreign source excerpt, so
+            # a second Chinese translation repeats the already-visible fact.
+            # Keep the complete fact and drop only that redundant rendering.
+            gloss = ""
         shot.fact = fact
         shot.audience_copy = audience
         setattr(shot, gloss_name, gloss)
@@ -353,7 +369,7 @@ def apply_readable_radar_timing(brief: EditorialBrief) -> None:
     to four Flash shots receive a 3.5 second floor. Dense screens extend the
     cut instead of being squeezed back into an unreadable fifteen seconds.
     """
-    if not brief.opening_mode or not brief.evidence_shots or brief.duration_target > 30:
+    if not brief.evidence_shots or brief.duration_target > 30:
         return
     desired: list[float] = []
     for shot in brief.evidence_shots:
@@ -391,6 +407,12 @@ def apply_readable_radar_timing(brief: EditorialBrief) -> None:
     for shot, duration in zip(brief.evidence_shots, desired, strict=True):
         maximum = _shot_duration_limit(shot)
         shot.duration = round(min(maximum, max(1.3, duration)), 3)
+    # Rounding each hold independently can put a static cut one millisecond
+    # over its ceiling even when the unrounded schedule fits exactly.
+    scheduled = round(sum(shot.duration for shot in brief.evidence_shots), 3)
+    if scheduled > maximum_total:
+        longest = max(brief.evidence_shots, key=lambda shot: shot.duration)
+        longest.duration = round(longest.duration - (scheduled - maximum_total), 3)
     brief.duration_target = max(
         brief.duration_target,
         round(sum(shot.duration for shot in brief.evidence_shots), 3),
@@ -812,6 +834,26 @@ def canonicalize_editorial_brief(brief: EditorialBrief, evidence: list[Evidence]
         if pattern_index is not None and pattern_index != 1:
             brief.evidence_shots.insert(1, brief.evidence_shots.pop(pattern_index))
 
+    if brief.context_graph:
+        discarded_context = (
+            set(brief.context_graph.discarded_context_ids)
+            - set(brief.context_graph.required_context_ids)
+        )
+        if discarded_context:
+            for shot in brief.evidence_shots:
+                shot.context_event_ids = [
+                    item for item in shot.context_event_ids if item not in discarded_context
+                ]
+            if brief.director_brief:
+                brief.director_brief.selected_context_ids = [
+                    item for item in brief.director_brief.selected_context_ids
+                    if item not in discarded_context
+                ]
+                for beat in brief.director_brief.story_arc:
+                    beat.context_event_ids = [
+                        item for item in beat.context_event_ids if item not in discarded_context
+                    ]
+
     _promote_relevant_source_images(brief, evidence)
     _resolve_external_evidence_pages(brief, evidence)
     _compile_flash_presentation(brief, evidence)
@@ -1110,6 +1152,7 @@ def _compile_flash_presentation(brief: EditorialBrief, evidence: list[Evidence])
     # and translation together while browser holds do not.
     for shot in brief.evidence_shots:
         _fit_rendered_shot_copy(shot)
+    apply_readable_radar_timing(brief)
 
     if brief.duration_target > 15:
         # A long source post needs a longer first hold, but still remains one

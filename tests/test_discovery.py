@@ -18,6 +18,7 @@ from video_factory.discovery import (
     assign_event_clusters, atomize_robotics_roundup, evaluate_adoption_candidate,
     evaluate_candidate, extract_source_video_url, select_adoption_candidates, select_parallel_candidates,
     XDiscoveryAdapter, _roundup_primary_source,
+    _retryable_adoption_error,
 )
 from video_factory.openrouter import DISCOUNTS_READER, ENDPOINTS_API, MODELS_API, parse_discounted_models
 from video_factory.models import ContentType, TopicType
@@ -318,7 +319,7 @@ class DiscoveryTest(unittest.TestCase):
             self.assertEqual(len(entry.adoptions), 2)
             self.assertEqual(len(factory.generate_calls), 2)
 
-    def test_higher_adoption_score_keeps_the_bounded_retry_slot(self) -> None:
+    def test_deterministic_failures_are_independent_human_review_entries(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
             service = ResourceDiscoveryService(workspace, clock=lambda: NOW)
@@ -332,7 +333,7 @@ class DiscoveryTest(unittest.TestCase):
                 service._record_blocked_candidate(
                     state, stronger, ResourceDiscoveryConfig(), NOW,
                 ),
-                "blocked",
+                "needs_human",
             )
             self.assertEqual(
                 service._record_blocked_candidate(
@@ -342,8 +343,11 @@ class DiscoveryTest(unittest.TestCase):
             )
 
             channel_state = state["channels"]["x"]
-            self.assertEqual(channel_state["blocked_candidate"]["id"], stronger.id)
-            self.assertEqual(state["needs_human_candidates"][0]["candidate_id"], weaker.id)
+            self.assertNotIn("blocked_candidate", channel_state)
+            self.assertEqual(
+                {row["candidate_id"] for row in state["needs_human_candidates"]},
+                {stronger.id, weaker.id},
+            )
 
     def test_transient_failures_use_independent_retry_entries(self) -> None:
         with TemporaryDirectory() as temp:
@@ -369,13 +373,22 @@ class DiscoveryTest(unittest.TestCase):
                         state, item, ResourceDiscoveryConfig(), NOW,
                         retryable=True, last_error="YouTubeAcquisitionError: SSL EOF",
                     ),
-                    "retry_pending",
+                    "retry_wait",
                 )
 
-            retries = state["channels"]["youtube"]["transient_retries"]
+            retries = state["channels"]["youtube"]["pending_candidates"]
             self.assertEqual(set(retries), {first.id, second.id})
             self.assertFalse(state.get("needs_human_candidates"))
             self.assertNotIn("blocked_candidate", state["channels"]["youtube"])
+
+    def test_nested_provider_ssl_failure_is_retryable(self) -> None:
+        try:
+            try:
+                raise YouTubeAcquisitionError("SSL unexpected EOF")
+            except YouTubeAcquisitionError as cause:
+                raise RuntimeError("OpenRouter provider request failed") from cause
+        except RuntimeError as error:
+            self.assertTrue(_retryable_adoption_error(error))
 
     def test_x_adapter_retries_ok_false_then_uses_opencli(self) -> None:
         commands = []
@@ -1976,6 +1989,15 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
                 adoption["attempts"][0]["recovery"],
                 "stop_non_retryable_generation_failure",
             )
+            problems = json.loads(
+                (workspace.root / "automation" / "self-audit" / "problems.json")
+                .read_text(encoding="utf-8")
+            )["problems"]
+            recorded = list(problems.values())
+            self.assertEqual(len(recorded), 1)
+            self.assertEqual(recorded[0]["reporter"], "discovery-generation")
+            self.assertEqual(recorded[0]["metadata"]["candidate_id"], "x-1")
+            self.assertIn("browser failed", recorded[0]["observed"])
 
     def test_transient_youtube_failure_is_retried_after_cooldown_even_if_search_misses_it(self) -> None:
         with TemporaryDirectory() as temp:
@@ -2015,7 +2037,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
                     state, item, config, NOW, retryable=adoption["retryable"],
                     last_error=adoption["last_error"],
                 ),
-                "retry_pending",
+                "retry_wait",
             )
             workspace.save_discovery_state(state)
 
@@ -2174,7 +2196,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             factory.rerender.assert_called_once_with(manifest)
             self.assertEqual(result["attempts"][0]["mode"], "deterministic_rerender")
 
-    def test_scheduled_blocked_candidate_uses_cost_cooldown_then_needs_human(self) -> None:
+    def test_deterministic_candidate_goes_directly_to_human_review(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
             item = x_candidate("x-cost", "Acme launches an agent SDK")
@@ -2198,10 +2220,10 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             current[0] = NOW + timedelta(hours=7)
             exhausted = service.run(config)
 
-            self.assertEqual(first.channels["x"].status, "blocked")
-            self.assertEqual(cooldown.channels["x"].status, "blocked_retry_wait")
-            self.assertEqual(exhausted.channels["x"].status, "needs_human")
-            self.assertEqual(len(factory.generate_calls), 2)
+            self.assertEqual(first.channels["x"].status, "needs_human")
+            self.assertIn(cooldown.channels["x"].status, {"not_due", "no_selection"})
+            self.assertIn(exhausted.channels["x"].status, {"not_due", "no_selection"})
+            self.assertEqual(len(factory.generate_calls), 1)
             state = workspace.load_discovery_state()
             self.assertNotIn("blocked_candidate", state["channels"]["x"])
             self.assertEqual(state["needs_human_candidates"][-1]["candidate_id"], "x-cost")
@@ -2361,7 +2383,7 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(repair["kind"], "silent_or_truncated_audio")
             renderer.repair_silent_audio.assert_called_once_with(collection)
 
-    def test_three_failures_block_channel_until_skip(self) -> None:
+    def test_deterministic_failure_is_active_until_skip(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
             item = x_candidate("x-1", "Acme launches an agent SDK")
@@ -2378,11 +2400,11 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             skipped = service.skip("x-1", "source cannot be rendered")
             state = workspace.load_discovery_state()
 
-            self.assertEqual(result.channels["x"].status, "blocked")
+            self.assertEqual(result.channels["x"].status, "needs_human")
             self.assertEqual(skipped["status"], "skipped")
             self.assertNotIn("blocked_candidate", state["channels"]["x"])
 
-    def test_forced_blocked_retry_skips_a_redundant_channel_search(self) -> None:
+    def test_forced_run_does_not_repeat_deterministic_human_failure(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
             item = x_candidate("x-1", "Acme launches an agent SDK")
@@ -2402,10 +2424,10 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             first = service.run(config, scheduled=False)
             second = service.run(config, scheduled=False)
 
-            self.assertEqual(first.channels["x"].status, "blocked")
-            self.assertEqual(second.channels["x"].status, "generated")
-            self.assertEqual(adapter.calls, 1)
-            self.assertEqual(len(factory.generate_calls), 2)
+            self.assertEqual(first.channels["x"].status, "needs_human")
+            self.assertEqual(second.channels["x"].status, "no_selection")
+            self.assertEqual(adapter.calls, 2)
+            self.assertEqual(len(factory.generate_calls), 1)
 
 
 if __name__ == "__main__":

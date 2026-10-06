@@ -178,6 +178,7 @@ class StoryWriterPacket:
                     "context_event_ids": ["context event id this shot explains"],
                     "full_translation": "for a non-Chinese root post: 40–120 Chinese characters covering decisive actor/action/scope/numbers without handles/URL; empty otherwise",
                     "narrative_beat": "opening|proof|takeaway",
+                    "duration": "3–10 seconds; choose enough time for all visible copy to stay at or below 10 Chinese-character-equivalents per second",
                 }],
                 "director_brief": {
                     "editorial_thesis": "the specific evidence-backed point of this story",
@@ -203,8 +204,9 @@ class StoryWriterPacket:
                 for shot in schema["editorial_brief"]["evidence_shots"]:
                     shot.pop("narrative_beat", None)
             github_contract = (
-                "Non-GitHub editorial contract: return editorial_brief, never scenes, kind, material_role, visual_action, recording_cues, selectors, pointer tracks, zoom tracks, duration schedules, trial as a material, or boundary as a material. The execution layer compiles cited evidence plus visual_family into browser/render scenes and schedules flash timing deterministically. "
+                "Non-GitHub editorial contract: return editorial_brief, never scenes, kind, material_role, visual_action, recording_cues, selectors, pointer tracks, zoom tracks, low-level timeline schedules, trial as a material, or boundary as a material. The execution layer compiles cited evidence plus visual_family and per-shot reading-time hints into browser/render scenes, then schedules final flash timing deterministically. "
                 + opening_contract +
+                "Visible-copy budget is a combined screen budget, not a per-field allowance. For quote_card, timeline, impact_card, and stat_card, fact + audience_copy + translation/full_translation together must fit duration × 10 Chinese-character-equivalents; use one complete Chinese sentence and leave audience_copy empty unless it adds a distinct supported fact. For official_page, product_ui, chart, code, and paper captures, the source target is already visible, so keep only one compact adjacent Chinese translation and do not repeat it in audience_copy. Never put both a long Chinese fact and a second full translation on the same derived card. "
                 "Return exactly three materially different hook_candidates and select one verbatim. The chosen hook, headline, and subheadline must name the actor/product/company/paper and say what happened. Do not merely add emotional adjectives to a summary. Write the hook like a technically informed friend posting the one angle that would make a developer pause and reply ‘really?’: lead with the most recognizable actor, reversal, contradiction, practical consequence, or concrete question, then reveal the sourced fact. It should feel conversational and eyebrow-raising when the evidence earns that reaction, not like a company announcement, paper title, or newsroom abstract. The payoff must answer the opening with a distinct judgment. Optimize the selected hook aggressively for first-1.5-second retention: use the strongest source-backed lever available inside the chosen story—an exact number or contrast, a named consequential actor, concrete developer pain/ROI, or an honest open question. A neutral announcement label is not enough when the same evidence supports a sharper lever; never fabricate shock when it does not. The first EditorialOpportunity.selection_reason is the locked primary story promise. A hook may intensify curiosity, conflict, surprise, consequence, or audience relevance inside that promise, but must never promote a secondary capability, metric, or side character into a different story. Keep the primary actor/change visible in the selected hook, fixed conclusion, and final payoff. If the strongest evidence-backed hook is close to the descriptive headline, that is acceptable; semantic fidelity outranks artificial novelty. "
                 + radar_copy_contract +
                 "The audience includes vibe coders, not only AI researchers. When the hook or a visible metric uses a specialist term, its first evidence shot must immediately add a short plain-Chinese explanation of what the term measures or means in practice. For example, a refusal rate means the share of prompts the model declines to answer; explain the concept without assuming familiarity, while keeping the exact sourced number. Do not waste space defining common words such as API or model. "
@@ -290,7 +292,6 @@ class StoryWriterPacket:
             topic_contract,
             IT_TRANSLATION_CONTRACT,
             PLAIN_CHINESE_CONTRACT,
-            self.visual_policy,
             "Editorial direction from the bounded research pass:\n" + (self.editorial_direction or "Use only the evidence to choose the strongest concrete angle."),
             "Editorial opportunity (why this was selected):\n" + json.dumps(asdict(self.opportunity), ensure_ascii=False) if self.opportunity else "Editorial opportunity: not provided; infer cautiously from evidence.",
             "Context graph (investigated background):\n" + json.dumps(asdict(self.context_graph), ensure_ascii=False) if self.context_graph else "Context graph: not provided; do not invent background.",

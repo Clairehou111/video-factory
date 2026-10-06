@@ -375,6 +375,34 @@ class DashboardTest(unittest.TestCase):
             attempts = list((workspace.publish_dir / batch.id / "attempts").glob("*.json"))
             self.assertTrue(any("login_recovery" in path.name for path in attempts))
 
+    def test_discovery_failures_show_only_active_candidates(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            active = {
+                "id": "youtube-active", "channel": "youtube",
+                "url": "https://youtube.com/watch?v=active", "title": "Active failure",
+                "eligible": True, "status": "needs_human", "metadata": {},
+            }
+            resolved = {
+                "id": "youtube-resolved", "channel": "youtube",
+                "url": "https://youtube.com/watch?v=resolved", "title": "Resolved failure",
+                "eligible": True, "status": "generated", "metadata": {},
+            }
+            workspace.save_discovery_candidate(active)
+            workspace.save_discovery_candidate(resolved)
+            workspace.save_discovery_state({
+                "channels": {}, "generated_events": [], "history": [], "skipped_ids": [],
+                "needs_human_candidates": [
+                    {"candidate_id": "youtube-active", "title": "Active failure", "status": "needs_human"},
+                    {"candidate_id": "youtube-resolved", "title": "Resolved failure", "status": "needs_human"},
+                ],
+            })
+
+            rows = PublishDashboard(workspace).discovery_failures()
+
+            self.assertEqual([row["candidate_id"] for row in rows], ["youtube-active"])
+
 
 if __name__ == "__main__":
     unittest.main()

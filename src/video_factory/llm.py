@@ -298,7 +298,7 @@ class OpenAICompatibleStoryWriter:
             }
         fields = {path: value for path, value in fields.items() if value}
         for index, shot in enumerate(visible["evidence_shots"]):
-            for name in ("fact", "audience_copy", "target", "translation", "full_translation"):
+            for name in ("fact", "audience_copy", "translation", "full_translation"):
                 if shot.get(name):
                     fields[f"editorial_brief.evidence_shots[{index}].{name}"] = shot[name]
         referenced = {
@@ -340,6 +340,7 @@ class OpenAICompatibleStoryWriter:
         evidence = [{
             "id": item.id, "kind": item.source_kind, "url": item.url,
             "quote": critic_excerpt(item),
+            "cited_targets": list(dict.fromkeys(targets_by_evidence.get(item.id, []))),
         } for item in packet.evidence if item.id in referenced or len(referenced) == 0]
         selection_promise = asdict(packet.opportunity) if packet.opportunity else {}
         schema = {
@@ -383,6 +384,7 @@ class OpenAICompatibleStoryWriter:
                 "When the cited page itself gives a familiar incumbent's concrete action and a challenger making the opposite bet, fail retention_hook if the draft replaces that named reversal with generic market language. For quantified research, the strongest compact pattern is recognizable institution/system + sample + exact surprising result; a sample count followed by '发现' without the finding is incomplete. The result clause should say concretely what the papers, systems, or agents did or failed to report, rather than replacing that action with an abstract editorial diagnosis. When two parallel, familiar assumptions are explicitly rejected by the source, score a hook lower if it expands only one and silently drops the other.",
                 "Review every field listed in fields against its cited evidence and the story as a whole. Return exactly one field_reviews item for every field path; do not omit easy fields.",
                 "A field path ending in .target is the exact source-language proof the browser will highlight, not Chinese copy. Ignore Chinese naturalness for targets. Pass it only when it is an exact contiguous substring of its cited evidence and directly supports that same shot's fact; topical proximity elsewhere on the page is insufficient. If the page supports the fact but this target points at a different claim, fail source_support and instruct replacement with the smallest exact supporting excerpt from the same cited evidence.",
+                "Evidence.cited_targets are exact source substrings already selected by the draft. Treat every concept stated inside a cited target as source-supported for that shot. Never call a named system, metric, process, or actor unsupported merely because it appears later than the opening excerpt; check cited_targets before issuing source_support or causal_certainty failures.",
                 "Reject when an actor, action, object, recipient, chronology, causal strength, or certainty differs from the evidence; when a concrete technical name is replaced by a vague category that makes the event harder to understand; when Chinese reads like literal translation, a report, or abstract consultant language; or when a screen cannot explain itself without narration. For a model/product story, reject a selected hook that omits the exact model/product name and names only its vendor, publisher, host, or benchmark.",
                 "For each field, first extract actor-action-object-recipient and certainty, then compare them with evidence. A naturalness score below 4 is fail. Unexplained English technical nouns inside Chinese prose are fail when the evidence lets you explain the concrete action. Keeping an official English feature name does not exempt it: the first audience-facing occurrence must immediately explain what the feature concretely gives or does in natural Chinese. The same rule applies to specialist Chinese metrics: if a hook/fact says 拒绝率、幻觉率、激活参数、上下文窗口 or a similarly non-obvious metric, the first relevant evidence shot must say in plain Chinese what it measures or means in practice; numbers alone are not an explanation. Preserve quantity, duration, recurrence, permission, and guarantee strength exactly: a one-time credit, reset, trial, exception, or temporary rollout cannot become permanent freedom from recurring limits or costs; free availability or free use does not prove commercial-use permission; support does not prove a guarantee; and an open-source repository does not transfer third-party asset licenses. Unsupported mechanisms, policies, risks, permissions, or advice are fail.",
                 "Every decision-critical specialist term or unfamiliar abbreviation needs an adjacent plain-Chinese explanation at its first relevant evidence shot. Prefer replacing academic jargon with the concrete action it describes instead of stacking dictionary definitions. If the first shot explains a term, do not require repetition in every persistent rail and later field. Fail literal phrases such as 超竞争价格、默契合谋、Nash均衡 or LMP when a general technical viewer still cannot tell who did what or what the price means.",
@@ -839,6 +841,14 @@ class OpenAICompatibleStoryWriter:
             repair_contract += (
                 " Replace every flagged quantity with the exact value and unit stated in its cited evidence, "
                 "including currency scale, or delete that quantity. Never approximate, round, or change 万/亿 scale."
+            )
+        if packet.topic_type != TopicType.GITHUB_PROJECT and "visible reading rate" in validation_error:
+            repair_contract += (
+                " Fix the combined visible-copy budget, not each field separately. First delete optional audience_copy "
+                "that repeats the fact or translation. On a derived quote/timeline/impact/stat card, keep one complete "
+                "Chinese fact and use an empty translation when that fact already conveys the cited target. On a browser "
+                "or paper capture, keep one compact translation and do not repeat it in audience_copy. Preserve exact "
+                "names, numbers, scope, and meaning; never clip a sentence or add a new concept."
             )
         with self.transport.stage("repair"):
             return self._generate_from_messages(packet, [

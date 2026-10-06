@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import threading
 import time
 import uuid
@@ -26,6 +27,41 @@ from .observability import NoopObservability, Observability, redact
 
 
 T = TypeVar("T")
+
+
+def _run_with_deadline(operation: Callable[[], T], timeout: float) -> T:
+    """Return an operation's result within one wall-clock deadline.
+
+    ``urllib`` applies ``timeout`` to individual socket operations.  A server
+    can therefore keep a chunked response alive forever by sending a small
+    amount of data before each socket timeout.  Run the complete open/read
+    operation in a daemon thread so the calling pipeline still has a hard
+    wall-clock bound.  The worker owns and closes its response context; a
+    timed-out worker cannot hold up interpreter shutdown.
+    """
+    deadline = max(0.001, float(timeout))
+    outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            outcome.put((True, operation()))
+        except BaseException as error:
+            outcome.put((False, error))
+
+    worker = threading.Thread(
+        target=invoke, name="video-factory-llm-request", daemon=True,
+    )
+    worker.start()
+    worker.join(deadline)
+    if worker.is_alive():
+        raise TimeoutError(
+            f"LLM request exceeded the {deadline:g}s total response deadline"
+        )
+    succeeded, value = outcome.get_nowait()
+    if not succeeded:
+        assert isinstance(value, BaseException)
+        raise value
+    return value  # type: ignore[return-value]
 
 
 class LLMBudgetExceeded(RuntimeError):
@@ -106,7 +142,7 @@ class LLMTransport:
             _ACTIVE_STAGE.reset(token)
 
     def request_json(
-        self, request: Request, *, timeout: int, provider: str, requested_model: str,
+        self, request: Request, *, timeout: float, provider: str, requested_model: str,
         opener: Callable[..., Any], validator: Callable[[dict[str, object]], T] | None = None,
     ) -> tuple[dict[str, object], T | None]:
         """Run one physical POST and record it even when validation fails."""
@@ -119,8 +155,11 @@ class LLMTransport:
         error: BaseException | None = None
         validated: T | None = None
         try:
-            with opener(request, timeout=timeout) as response:
-                decoded = json.loads(response.read().decode("utf-8"))
+            def open_and_read() -> bytes:
+                with opener(request, timeout=timeout) as response:
+                    return response.read()
+
+            decoded = json.loads(_run_with_deadline(open_and_read, timeout).decode("utf-8"))
             if not isinstance(decoded, dict):
                 raise ValueError("LLM response body is not a JSON object")
             result = decoded

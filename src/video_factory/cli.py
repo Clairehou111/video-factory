@@ -261,6 +261,7 @@ def main() -> None:
     dashboard.add_argument("--host", default="127.0.0.1", help="仅允许 loopback 地址")
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--actor", default="claire", help="写入审批记录的审核人")
+    dashboard.add_argument("--discovery-config", help="失败来源重试使用的多渠道发现配置 JSON")
     discover_youtube = subcommands.add_parser("discover-youtube", help="按 2 小时节奏发现并最多生产一个高价值 YouTube 源视频")
     discover_youtube.add_argument("--config", help="YouTube 搜索池和质量门配置 JSON")
     discover_youtube.add_argument("--force", action="store_true", help="忽略 next_run_at，立即执行一次搜索")
@@ -310,7 +311,10 @@ def main() -> None:
     )
     generate.add_argument(
         "--youtube-editorial-mode",
-        choices=["auto", "technical_coverage", "known_tech_interview_clip", "study"],
+        choices=[
+            "auto", "technical_coverage", "known_tech_interview_clip",
+            "conference_highlights", "study",
+        ],
         default="auto",
         help="覆盖 YouTube 自动分类；正常自动工厂保持 auto",
     )
@@ -339,7 +343,13 @@ def main() -> None:
     elif args.command == "init":
         print(f"initialized {workspace.root}")
     elif args.command == "dashboard":
-        serve_dashboard(workspace, args.host, args.port, args.actor)
+        dashboard_discovery_config = ResourceDiscoveryConfig.from_path(
+            Path(args.discovery_config).resolve() if args.discovery_config else None
+        )
+        serve_dashboard(
+            workspace, args.host, args.port, args.actor,
+            discovery_config=dashboard_discovery_config,
+        )
     elif args.command == "discover":
         config = ResourceDiscoveryConfig.from_path(Path(args.config).resolve() if args.config else None)
         channels = [DiscoveryChannel(item) for item in args.channel] if args.channel else None

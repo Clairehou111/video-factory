@@ -235,9 +235,13 @@ class VideoFactory:
                 subtitle_reviewer, subtitle_review_selection = self._youtube_subtitle_reviewer(
                     writer, directing_writer,
                 )
+                runtime_guidance = str(
+                    self._active_agent_policy().get("narrative_guidance") or ""
+                ).strip()
                 with self.llm_transport.stage("youtube_pipeline"):
                     generated = YouTubeCollectionFactory(
                         self.workspace, writer, directing_writer, subtitle_reviewer,
+                        runtime_guidance=runtime_guidance,
                     ).generate(
                         url, job, render=options.render,
                         local_media=Path(options.youtube_media).resolve() if options.youtube_media else None,
@@ -740,9 +744,10 @@ class VideoFactory:
             shot.full_translation = ""
             if physical_motion_first:
                 # The persistent footer carries interpretation. These brief
-                # cards retain only source-backed facts between action beats.
+                # cards render only source-backed facts between action beats.
+                # Keep the internal interpretation for structural validation
+                # and editorial traceability; it is not visible card copy.
                 shot.audience_copy = ""
-                shot.interpretation = ""
             card_index += 1
         if physical_motion_first and brief.fixed_conclusion.strip():
             manifest.fixed_footer = brief.fixed_conclusion.strip()
@@ -2072,10 +2077,24 @@ class VideoFactory:
             }
         if provider == "auto" and os.environ.get("OPENROUTER_API_KEY"):
             try:
+                configured_model = (
+                    options.model
+                    if options.model is not None
+                    else os.environ.get(
+                        "VIDEO_FACTORY_STORY_MODEL", "google/gemini-3.7-flash",
+                    ).strip()
+                )
+                if configured_model:
+                    settings = LLMSettings.from_environment("openrouter", configured_model)
+                    return self._new_writer(settings), None, {
+                        "provider": "openrouter", "model": settings.model,
+                        "daily_catalog": False,
+                        "reason": "configured low-cost production story model",
+                    }
                 quote = OpenRouterCatalog(self.cache_dir / "openrouter").select(
                     ModelRequirements("story", ("text",)), options.refresh_prices,
                 )
-                settings = LLMSettings.from_environment("openrouter", options.model or quote.model_id)
+                settings = LLMSettings.from_environment("openrouter", quote.model_id)
                 return self._new_writer(settings), quote, {
                     "provider": "openrouter", "quote": quote.to_dict(), "daily_catalog": True,
                 }

@@ -38,6 +38,35 @@ def basic_manifest() -> RenderManifest:
 
 
 class VideoFactoryTest(unittest.TestCase):
+    def test_auto_story_writer_defaults_to_low_cost_gemini_flash(self) -> None:
+        with TemporaryDirectory() as temp:
+            factory = VideoFactory(Workspace(Path(temp) / "workspace"))
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=True),
+                patch("video_factory.factory.OpenRouterCatalog.select") as select,
+            ):
+                writer, quote, selection = factory._story_writer(GenerateOptions())
+
+        self.assertEqual(writer.settings.provider, "openrouter")
+        self.assertEqual(writer.settings.model, "google/gemini-3.7-flash")
+        self.assertIsNone(quote)
+        self.assertEqual(selection["model"], "google/gemini-3.7-flash")
+        self.assertFalse(selection["daily_catalog"])
+        select.assert_not_called()
+
+    def test_auto_story_writer_allows_configured_model_override(self) -> None:
+        with TemporaryDirectory() as temp:
+            factory = VideoFactory(Workspace(Path(temp) / "workspace"))
+            with patch.dict(os.environ, {
+                "OPENROUTER_API_KEY": "test-key",
+                "VIDEO_FACTORY_STORY_MODEL": "z-ai/glm-5.3-flash",
+            }, clear=True):
+                writer, quote, selection = factory._story_writer(GenerateOptions())
+
+        self.assertEqual(writer.settings.model, "z-ai/glm-5.3-flash")
+        self.assertIsNone(quote)
+        self.assertEqual(selection["reason"], "configured low-cost production story model")
+
     def test_github_visual_analysis_failure_is_optional(self) -> None:
         with TemporaryDirectory() as temp:
             factory = VideoFactory(Workspace(Path(temp) / "workspace"))
@@ -349,6 +378,7 @@ class VideoFactoryTest(unittest.TestCase):
         self.assertEqual([shot.duration for shot in brief.evidence_shots], [12.0, 3.5, 3.5])
         self.assertEqual(sum(scene.end - scene.start for scene in manifest.scenes), 19.0)
         self.assertTrue(all(not shot.audience_copy for shot in brief.evidence_shots[1:]))
+        self.assertTrue(all(shot.interpretation for shot in brief.evidence_shots[1:]))
         self.assertEqual(manifest.fixed_footer, brief.fixed_conclusion)
         replaced = next(item for item in manifest.evidence if item.id == source_video.id)
         self.assertEqual(replaced.metadata["clip_end"], 24.0)

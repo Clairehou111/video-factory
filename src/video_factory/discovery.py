@@ -332,24 +332,38 @@ def _retryable_adoption_error(error: BaseException) -> bool:
     are operational outages, not evidence that the candidate itself needs a
     human decision.  Permanent source-contract failures still fail closed.
     """
-    if not isinstance(error, YouTubeAcquisitionError):
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    if any(isinstance(value, (SourceBelow1080Error, YouTubeWebAuthRequired)) for value in chain):
         return False
-    if isinstance(error, (SourceBelow1080Error, YouTubeWebAuthRequired)):
-        return False
-    detail = f"{type(error).__name__}: {error}".casefold()
+    detail = " | ".join(
+        f"{type(value).__name__}: {value}" for value in chain
+    ).casefold()
     permanent_markers = (
         "metadata has no video id", "transcript is empty", "must use yt-dlp json3",
         "has no audio track", "below 1080", "source quality",
     )
     if any(marker in detail for marker in permanent_markers):
         return False
-    return any(marker in detail for marker in (
+    transient = any(marker in detail for marker in (
         "ssl", "unexpected_eof", "timed out", "timeout", "temporary failure",
         "connection reset", "connection aborted", "remote end closed",
         "network lookup", "name resolution", "http error 429", "too many requests",
         "http error 500", "http error 502", "http error 503", "http error 504",
         "unable to download webpage", "unable to download api page",
     ))
+    return transient and (
+        any(isinstance(value, YouTubeAcquisitionError) for value in chain)
+        or any(marker in detail for marker in (
+            "openrouter", "provider", "api request", "http error", "connection",
+            "ssl", "timeout", "rate limit",
+        ))
+    )
 
 
 @dataclass(slots=True)
@@ -450,7 +464,7 @@ class ResourceDiscoveryConfig:
     timezone: str = "Asia/Tokyo"
     retry_backoff_seconds: list[int] = field(default_factory=lambda: [0, 30, 120])
     blocked_retry_delay_hours: int = 6
-    max_blocked_retry_runs: int = 2
+    max_blocked_retry_runs: int = 3
     event_dedupe_days: int = 30
     adoption_policy: AdoptionPolicy = field(default_factory=AdoptionPolicy)
     channels: dict[DiscoveryChannel, ChannelConfig] = field(default_factory=dict)
@@ -489,7 +503,7 @@ class ResourceDiscoveryConfig:
             timezone=str(data.get("timezone") or "Asia/Tokyo"),
             retry_backoff_seconds=[int(item) for item in data.get("retry_backoff_seconds", [0, 30, 120])],
             blocked_retry_delay_hours=int(data.get("blocked_retry_delay_hours", 6)),
-            max_blocked_retry_runs=int(data.get("max_blocked_retry_runs", 2)),
+            max_blocked_retry_runs=int(data.get("max_blocked_retry_runs", 3)),
             event_dedupe_days=int(data.get("event_dedupe_days", 30)),
             adoption_policy=AdoptionPolicy.from_dict(dict(data.get("adoption_policy") or {})),
             channels=channels,
@@ -2205,17 +2219,22 @@ def evaluate_candidate(item: DiscoveryCandidate, config: ChannelConfig, now: dat
             if str(reason).strip():
                 reasons.append(str(reason).strip())
         duration = float(item.metadata.get("duration_seconds") or 0)
-        if not 900 <= duration <= 7200:
+        mode = str(item.metadata.get("youtube_editorial_mode") or "")
+        if mode == "conference_highlights":
+            if duration <= 7200:
+                reasons.append("conference_highlights_requires_multi_hour_source")
+        elif not 900 <= duration <= 7200:
             reasons.append("duration_out_of_range")
         if not item.metadata.get("transcript_available"):
             reasons.append("transcript_unavailable")
-        mode = str(item.metadata.get("youtube_editorial_mode") or "")
         source_text = f"{item.title} {item.summary} {item.body_text}"
         if mode != "known_tech_interview_clip" and (
             item.metadata.get("political_signals") or political_markers(source_text)
         ):
             reasons.append("political_content_forbidden")
-        if mode not in {"technical_coverage", "known_tech_interview_clip"}:
+        if mode not in {
+            "technical_coverage", "known_tech_interview_clip", "conference_highlights",
+        }:
             reasons.append("not_technical_share_or_known_tech_interview")
     else:
         visual = bool(item.metadata.get("visual_path"))
@@ -2718,6 +2737,22 @@ class ResourceDiscoveryService:
 
     def status(self, channel: DiscoveryChannel | None = None) -> dict[str, Any]:
         state = self.workspace.load_discovery_state()
+        # Migrate the legacy one-candidate-per-channel slot into independent
+        # candidate records. This is intentionally idempotent.
+        for raw_channel_state in (state.get("channels") or {}).values():
+            if not isinstance(raw_channel_state, dict):
+                continue
+            legacy = raw_channel_state.pop("blocked_candidate", None)
+            if isinstance(legacy, dict) and legacy.get("id"):
+                pending = dict(raw_channel_state.get("pending_candidates") or {})
+                candidate_id = str(legacy["id"])
+                pending.setdefault(candidate_id, {
+                    "candidate": legacy,
+                    "retry_runs": max(1, int(raw_channel_state.pop("blocked_retry_runs", 1) or 1)),
+                    "retry_at": str(raw_channel_state.pop("blocked_retry_at", "") or ""),
+                    "last_error": "legacy blocked candidate migrated to per-candidate queue",
+                })
+                raw_channel_state["pending_candidates"] = pending
         if channel is None:
             return state
         return dict((state.get("channels") or {}).get(channel.value) or {})
@@ -2756,6 +2791,22 @@ class ResourceDiscoveryService:
         now = self.clock().astimezone(UTC)
         requested = set(channels or DiscoveryChannel)
         state = self.workspace.load_discovery_state()
+        for raw_channel_state in (state.get("channels") or {}).values():
+            if not isinstance(raw_channel_state, dict):
+                continue
+            legacy = raw_channel_state.pop("blocked_candidate", None)
+            if isinstance(legacy, dict) and legacy.get("id"):
+                pending = dict(raw_channel_state.get("pending_candidates") or {})
+                candidate_id = str(legacy["id"])
+                pending.setdefault(candidate_id, {
+                    "candidate": legacy,
+                    "retry_runs": max(
+                        1, int(raw_channel_state.pop("blocked_retry_runs", 1) or 1),
+                    ),
+                    "retry_at": str(raw_channel_state.pop("blocked_retry_at", "") or ""),
+                    "last_error": "legacy blocked candidate migrated to per-candidate queue",
+                })
+                raw_channel_state["pending_candidates"] = pending
         # Generated-event state is recoverable/cache-like and may be reset.
         # Remote publication is the durable truth for YouTube source reuse.
         state["published_youtube_source_ids"] = sorted(self._published_youtube_source_ids())
@@ -2845,6 +2896,11 @@ class ResourceDiscoveryService:
                     ).items()
                     if isinstance(payload, dict)
                 }
+                for candidate_id, payload in dict(
+                    channel_state.get("pending_candidates") or {}
+                ).items():
+                    if isinstance(payload, dict):
+                        transient_retries[str(candidate_id)] = dict(payload)
                 present_ids = {item.id for item in items}
                 injected_retry_ids: list[str] = []
                 for candidate_id, retry in transient_retries.items():
@@ -3076,6 +3132,16 @@ class ResourceDiscoveryService:
                     channel_state["transient_retries"] = transient_retries
                 else:
                     channel_state.pop("transient_retries", None)
+                pending_candidates = dict(channel_state.get("pending_candidates") or {})
+                pending_candidates.pop(item.id, None)
+                if pending_candidates:
+                    channel_state["pending_candidates"] = pending_candidates
+                else:
+                    channel_state.pop("pending_candidates", None)
+                state["needs_human_candidates"] = [
+                    value for value in (state.get("needs_human_candidates") or [])
+                    if not isinstance(value, dict) or value.get("candidate_id") != item.id
+                ]
                 state.setdefault("generated_events", []).append({
                     "event_key": item.event_key, "title": item.title, "published_at": item.published_at,
                     "topic_type": item.topic_type.value if item.topic_type else "", "url": item.url,
@@ -3092,7 +3158,8 @@ class ResourceDiscoveryService:
                     retryable=bool(adoption.get("retryable")),
                     last_error=str(adoption.get("last_error") or ""),
                 )
-                if queue_status in {"needs_human", "retry_pending"}:
+                adoption["queue_status"] = queue_status
+                if queue_status in {"needs_human", "retry_wait"}:
                     adoption_statuses[channel][-1] = queue_status
         for channel, statuses_for_channel in adoption_statuses.items():
             entry = run.channels[channel.value]
@@ -3215,6 +3282,12 @@ class ResourceDiscoveryService:
                 channel_state["transient_retries"] = transient_retries
             else:
                 channel_state.pop("transient_retries", None)
+            pending_candidates = dict(channel_state.get("pending_candidates") or {})
+            pending_candidates.pop(item.id, None)
+            if pending_candidates:
+                channel_state["pending_candidates"] = pending_candidates
+            else:
+                channel_state.pop("pending_candidates", None)
             state.setdefault("generated_events", []).append({
                 "event_key": item.event_key, "title": item.title, "published_at": item.published_at,
                 "topic_type": item.topic_type.value if item.topic_type else "", "url": item.url,
@@ -3244,83 +3317,137 @@ class ResourceDiscoveryService:
         last_error: str = "",
     ) -> str:
         channel_state = state.setdefault("channels", {}).setdefault(item.channel.value, {})
-        previous = channel_state.get("blocked_candidate")
+        pending = dict(channel_state.get("pending_candidates") or {})
 
-        def move_to_human(candidate: DiscoveryCandidate, reason: str) -> None:
+        def failure_record(
+            candidate: DiscoveryCandidate, reason: str, attempts: int,
+            status: str, retry_at: str = "",
+        ) -> dict[str, Any]:
+            detail = last_error[:2000]
+            cue_match = re.search(r"\b(cue-[A-Za-z0-9_-]+)\b", detail)
+            range_match = re.search(
+                r"start=([0-9.]+).*?end=([0-9.]+).*?duration=([0-9.]+)s",
+                detail,
+            )
+            category = "transient_transport" if retryable else (
+                "subtitle_validation" if cue_match else
+                "range_validation" if range_match or "highlight" in detail.casefold() else
+                "generation_validation"
+            )
+            return {
+                "candidate_id": candidate.id,
+                "channel": candidate.channel.value,
+                "title": candidate.title,
+                "url": candidate.url,
+                "status": status,
+                "category": category,
+                "stage": "generation",
+                "reason": reason,
+                "last_error": detail,
+                "attempts": attempts,
+                "last_failed_at": _iso(now),
+                "next_retry_at": retry_at,
+                "retry_eligible": retryable,
+                "cue_id": cue_match.group(1) if cue_match else "",
+                "source_range": ({
+                    "start": float(range_match.group(1)),
+                    "end": float(range_match.group(2)),
+                    "duration": float(range_match.group(3)),
+                } if range_match else None),
+                "score": float(
+                    (candidate.metadata.get("adoption_decision") or {}).get("score")
+                    or candidate.score or 0
+                ),
+                "artifact_refs": list(candidate.metadata.get("failure_artifacts") or []),
+                "recorded_at": _iso(now),
+            }
+
+        def move_to_human(
+            candidate: DiscoveryCandidate, reason: str, attempts: int,
+        ) -> None:
             candidate.status = "needs_human"
+            record = failure_record(candidate, reason, attempts, "needs_human")
+            candidate.metadata["generation_failure"] = record
             self.workspace.save_discovery_candidate(candidate.to_dict())
             rows = state.setdefault("needs_human_candidates", [])
-            if not any(
-                isinstance(value, dict) and value.get("candidate_id") == candidate.id
-                for value in rows
-            ):
-                rows.append({
-                    "candidate_id": candidate.id, "channel": candidate.channel.value,
-                    "title": candidate.title, "url": candidate.url,
-                    "recorded_at": _iso(now), "reason": reason,
-                })
+            rows = [
+                value for value in rows
+                if not isinstance(value, dict) or value.get("candidate_id") != candidate.id
+            ]
+            rows.append(record)
             state["needs_human_candidates"] = rows[-100:]
+            # A deterministic generation failure is actionable evidence for
+            # the asynchronous self-healer, not merely a dashboard row.  Keep
+            # the queue transition non-blocking, but archive every existing
+            # failure artifact so the auditor can reproduce the exact cue or
+            # range failure without making a fresh network request.
+            try:
+                artifact_refs = [
+                    str(reference) for reference in record["artifact_refs"]
+                    if (self.workspace.root / str(reference)).is_file()
+                ]
+                self.problem_ledger.record(ProblemObservation(
+                    stage=f"{candidate.channel.value}:generation",
+                    category=str(record["category"]),
+                    severity="high",
+                    reporter="discovery-generation",
+                    expected=(
+                        "candidate generation completes after bounded targeted repair"
+                    ),
+                    observed=str(record["last_error"] or reason),
+                    artifact_refs=artifact_refs,
+                    metadata={
+                        "candidate_id": candidate.id,
+                        "channel": candidate.channel.value,
+                        "queue_status": "needs_human",
+                    },
+                ))
+            except Exception:
+                # Human review must remain available even if audit storage is
+                # temporarily unavailable; the discovery record still keeps
+                # the complete diagnostic.
+                pass
 
-        transient_retries = dict(channel_state.get("transient_retries") or {})
+        previous = dict(pending.get(item.id) or {})
+        retry_runs = int(previous.get("retry_runs") or 0) + 1
         if retryable:
-            previous_retry = dict(transient_retries.get(item.id) or {})
-            retry_runs = int(previous_retry.get("retry_runs") or 0) + 1
-            retry_at = now.astimezone(UTC) + timedelta(hours=config.blocked_retry_delay_hours)
-            item.status = "retry_pending"
-            item.metadata["transient_retry"] = {
-                "retry_runs": retry_runs, "retry_at": _iso(retry_at),
-                "last_error": last_error[:1000],
-            }
-            self.workspace.save_discovery_candidate(item.to_dict())
-            transient_retries[item.id] = {
-                "candidate": item.to_dict(), "retry_runs": retry_runs,
-                "retry_at": _iso(retry_at), "last_error": last_error[:1000],
-            }
-            channel_state["transient_retries"] = transient_retries
-            return "retry_pending"
-
-        if item.id in transient_retries:
-            transient_retries.pop(item.id, None)
-            if transient_retries:
-                channel_state["transient_retries"] = transient_retries
-            else:
-                channel_state.pop("transient_retries", None)
-
-        if isinstance(previous, dict) and previous.get("id") != item.id:
-            previous_item = DiscoveryCandidate.from_dict(previous)
-            previous_score = float(
-                (previous_item.metadata.get("adoption_decision") or {}).get("score") or 0
-            )
-            current_score = float(
-                (item.metadata.get("adoption_decision") or {}).get("score") or 0
-            )
-            if previous_score >= current_score:
+            if retry_runs >= config.max_blocked_retry_runs:
                 move_to_human(
                     item,
-                    "another higher-scoring candidate already occupies the bounded automatic retry slot",
+                    "retry_exhausted: transient generation retry budget exhausted",
+                    retry_runs,
                 )
+                pending.pop(item.id, None)
+                channel_state["pending_candidates"] = pending
                 return "needs_human"
-            move_to_human(
-                previous_item,
-                "a higher-scoring candidate replaced it in the bounded automatic retry slot",
+            retry_at = now.astimezone(UTC) + timedelta(hours=config.blocked_retry_delay_hours)
+            retry_at_text = _iso(retry_at)
+            item.status = "retry_wait"
+            record = failure_record(
+                item, "transient failure scheduled for retry", retry_runs,
+                "retry_wait", retry_at_text,
             )
-            channel_state.pop("blocked_retry_at", None)
-            channel_state.pop("blocked_retry_runs", None)
-            previous = None
-        previous_runs = int(channel_state.get("blocked_retry_runs") or 0)
-        retry_runs = previous_runs + 1 if isinstance(previous, dict) and previous.get("id") == item.id else 1
-        if retry_runs >= config.max_blocked_retry_runs:
-            move_to_human(item, "bounded automatic generation retries exhausted")
-            channel_state.pop("blocked_candidate", None)
-            channel_state.pop("blocked_retry_at", None)
-            channel_state.pop("blocked_retry_runs", None)
-            return "needs_human"
-        channel_state["blocked_candidate"] = item.to_dict()
-        channel_state["blocked_retry_runs"] = retry_runs
-        channel_state["blocked_retry_at"] = _iso(
-            now.astimezone(UTC) + timedelta(hours=config.blocked_retry_delay_hours)
+            item.metadata["generation_failure"] = record
+            self.workspace.save_discovery_candidate(item.to_dict())
+            pending[item.id] = {
+                "candidate": item.to_dict(), "retry_runs": retry_runs,
+                "retry_at": retry_at_text, "last_error": last_error[:2000],
+                "failure": record,
+            }
+            channel_state["pending_candidates"] = pending
+            return "retry_wait"
+
+        # Deterministic subtitle/editorial validators already perform their
+        # bounded cue/range repair attempts inside generation. Re-running the
+        # whole job hours later is wasteful and cannot change the result.
+        pending.pop(item.id, None)
+        channel_state["pending_candidates"] = pending
+        move_to_human(
+            item,
+            "deterministic targeted repair exhausted; human review required",
+            max(1, len(item.metadata.get("targeted_repairs") or [])),
         )
-        return "blocked"
+        return "needs_human"
 
     def skip(self, candidate_id: str, reason: str) -> dict[str, Any]:
         if not reason.strip():
@@ -3343,6 +3470,12 @@ class ResourceDiscoveryService:
             channel_state["transient_retries"] = transient_retries
         else:
             channel_state.pop("transient_retries", None)
+        pending_candidates = dict(channel_state.get("pending_candidates") or {})
+        pending_candidates.pop(item.id, None)
+        if pending_candidates:
+            channel_state["pending_candidates"] = pending_candidates
+        else:
+            channel_state.pop("pending_candidates", None)
         state.setdefault("skipped_ids", []).append(item.id)
         state["needs_human_candidates"] = [
             value for value in (state.get("needs_human_candidates") or [])
@@ -3547,9 +3680,47 @@ class ResourceDiscoveryService:
             bool(attempt.get("retryable")) for attempt in failed_attempts
         )
         last_error = str((failed_attempts[-1] if failed_attempts else {}).get("error") or "")
+        if not last_error and attempts:
+            final_result = attempts[-1].get("result")
+            if isinstance(final_result, dict):
+                failed_quality = [
+                    check for check in [
+                        *(final_result.get("checks") or []),
+                        *(final_result.get("video_checks") or []),
+                    ]
+                    if isinstance(check, dict) and not check.get("passed", False)
+                ]
+                last_error = "; ".join(
+                    f"{check.get('name')}: {check.get('detail') or check.get('message') or 'failed'}"
+                    for check in failed_quality
+                )[:2000]
+        failure_dir = self.workspace.root / "discovery" / "failures"
+        failure_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = failure_dir / f"{item.id}.json"
+        failure_payload = {
+            "candidate_id": item.id,
+            "channel": item.channel.value,
+            "title": item.title,
+            "url": item.url,
+            "recorded_at": _iso(self.clock()),
+            "failure_kind": (
+                "transient_source_acquisition" if retryable else "generation_or_quality"
+            ),
+            "last_error": last_error,
+            "attempts": attempts,
+        }
+        failure_path.write_text(
+            json.dumps(failure_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        artifact_ref = str(failure_path.relative_to(self.workspace.root))
+        item.metadata["failure_artifacts"] = [artifact_ref]
+        item.metadata["generation_attempts"] = attempts
+        self.workspace.save_discovery_candidate(item.to_dict())
         return {
             "status": "blocked", "candidate_id": item.id, "attempts": attempts,
             "retryable": retryable, "last_error": last_error,
+            "failure_artifacts": [artifact_ref],
             "failure_kind": "transient_source_acquisition" if retryable else "generation_or_quality",
         }
 

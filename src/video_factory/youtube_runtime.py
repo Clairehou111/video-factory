@@ -13,6 +13,11 @@ YTDLP_VERSION = "2026.08.19"
 YTDLP_EJS_VERSION = "0.8.0"
 BGUTIL_VERSION = "1.3.2"
 BGUTIL_REPOSITORY = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
+STABLE_TS_COMMIT = "e312072cc024ae9fceb25b057d7d18524873a02b"
+STABLE_TS_REQUIREMENT = (
+    "stable-ts @ git+https://github.com/jianfch/stable-ts.git@"
+    + STABLE_TS_COMMIT
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +79,7 @@ class ManagedYouTubeRuntime:
         self._checked([
             uv, "pip", "install", "--python", str(self.settings.python),
             f"yt-dlp=={YTDLP_VERSION}", f"yt-dlp-ejs=={YTDLP_EJS_VERSION}",
-            f"bgutil-ytdlp-pot-provider=={BGUTIL_VERSION}",
+            f"bgutil-ytdlp-pot-provider=={BGUTIL_VERSION}", STABLE_TS_REQUIREMENT,
         ])
         source = self.settings.provider_source
         if not source.exists():
@@ -92,6 +97,7 @@ class ManagedYouTubeRuntime:
             "yt_dlp": YTDLP_VERSION,
             "yt_dlp_ejs": YTDLP_EJS_VERSION,
             "bgutil_provider": BGUTIL_VERSION,
+            "stable_ts_commit": STABLE_TS_COMMIT,
             "provider_mode": "script",
             "provider_server": str(self.settings.provider_server),
             "deno": self._version([deno, "--version"]),
@@ -120,6 +126,7 @@ class ManagedYouTubeRuntime:
             metadata.get("yt_dlp") == YTDLP_VERSION,
             metadata.get("yt_dlp_ejs") == YTDLP_EJS_VERSION,
             metadata.get("bgutil_provider") == BGUTIL_VERSION,
+            metadata.get("stable_ts_commit") == STABLE_TS_COMMIT,
             metadata.get("provider_mode") == "script",
         ))
         return metadata
@@ -176,7 +183,10 @@ class ManagedYouTubeRuntime:
         status = self.status()
         return {
             key: status.get(key)
-            for key in ("yt_dlp", "yt_dlp_ejs", "bgutil_provider", "provider_mode")
+            for key in (
+                "yt_dlp", "yt_dlp_ejs", "bgutil_provider", "stable_ts_commit",
+                "provider_mode",
+            )
             if status.get(key) is not None
         }
 

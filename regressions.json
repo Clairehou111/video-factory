@@ -1946,10 +1946,8 @@
     "impact": "A fully rendered video remained blocked even though one concise, meaning-preserving subtitle repair could make it readable.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_shortens_only_overfast_cues",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_retries_with_exact_limit_feedback",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_retries_when_required_term_is_dropped",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_density_repair_keeps_bilingual_first_use_explanation"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_repair_requires_an_extra_card_after_hard_duration_failure",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -1960,7 +1958,7 @@
     "impact": "The agent discarded its two remaining bounded attempts and stopped the entire video before media acquisition.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_translation_retries_when_model_drops_cue_id_prefix"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_retries_invalid_initial_structure"
     ]
   },
   {
@@ -2074,7 +2072,7 @@
     "impact": "A long interview failed after several minutes even though every caption could be repaired independently in bounded batches.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_merged_caption_repair_batches_large_interview_without_dropping_ids"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_partitions_large_initial_request"
     ]
   },
   {
@@ -2119,9 +2117,8 @@
     "status": "fixed",
     "tests": [
       "tests/test_youtube_collection.py::YouTubeCollectionTest::test_renderer_never_invents_alignment_by_splitting_two_languages",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_gemini_semantic_cards_are_shorter_and_losslessly_timed",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_card_review_retries_dependent_translated_chinese",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_independent_fidelity_review_corrects_temporal_meaning",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_chooses_boundaries_and_translates_once",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window",
       "tests/test_youtube_collection.py::YouTubeCollectionTest::test_interview_caption_does_not_slice_one_source_thought_into_cards"
     ]
   },
@@ -2157,10 +2154,9 @@
     "status": "fixed",
     "tests": [
       "tests/test_youtube_collection.py::YouTubeCollectionTest::test_reviewed_semantic_card_is_not_partitioned_again_by_renderer",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_uses_dependent_boundaries_to_avoid_overlong_cards",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_relative_payoff_uses_three_publishable_cards",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_repair_requires_an_extra_card_after_hard_duration_failure",
       "tests/test_youtube_collection.py::YouTubeCollectionTest::test_hedge_maybe_stays_with_the_claim_that_follows",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_long_merged_thought_splits_before_maybe_not_after_it"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_chooses_boundaries_and_translates_once"
     ]
   },
   {
@@ -2171,7 +2167,7 @@
     "impact": "Natural translations were flattened into more literal Chinese and changed again on every cached rerun.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_final_chinese_style_gate_does_not_rewrite_without_specific_error"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -2182,7 +2178,7 @@
     "impact": "The card remained fluent and readable but changed the speaker's uncertainty into a frequency claim.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_fidelity_reviewer_cannot_turn_maybe_into_frequency"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -2193,15 +2189,12 @@
     "impact": "Viewers had to connect adjacent shots to finish one sentence, and one otherwise fluent card stated a conceptually contradictory industry-layer relationship.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_may_create_so_that_card_for_translation_to_localize",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_fallback_keeps_parent_when_clause_terms_are_misaligned",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_split_never_leaves_nonfinal_card_on_connector",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_chooses_boundaries_and_translates_once",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window",
       "tests/test_youtube_collection.py::YouTubeCollectionTest::test_unsplit_interview_parent_fails_closed_before_renderer",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_tiny_supplier_fragment_coalesces_before_translation",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_cards_retry_when_uppercase_entity_moves_between_rows",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_cards_retry_translation_that_exceeds_its_time_budget",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_semantic_fallback_rejects_entity_shifted_chinese_partition",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_failed_batch_recovers_each_semantic_card_in_isolation"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_deterministically_coalesces_short_entity_card",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_repair_requires_an_extra_card_after_hard_duration_failure",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_repair_window_expands_to_distant_entity_owner"
     ]
   },
   {
@@ -2212,7 +2205,7 @@
     "impact": "The agent aborted before semantic caption review even though its normal translation writer and deterministic exact-term enforcement were both available.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_terminology_repair_falls_back_after_directing_provider_failure"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_preserve_decision_is_reviewed_and_revised_before_translation"
     ]
   },
   {
@@ -2235,8 +2228,8 @@
     "status": "fixed",
     "tests": [
       "tests/test_youtube_collection.py::YouTubeCollectionTest::test_caption_timing_gate_rejects_avoidable_seventeen_second_card",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_uses_dependent_boundaries_to_avoid_overlong_cards",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_clause_split_may_create_so_that_card_for_translation_to_localize"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_repair_requires_an_extra_card_after_hard_duration_failure",
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_chooses_boundaries_and_translates_once"
     ]
   },
   {
@@ -2247,8 +2240,7 @@
     "impact": "The review stage introduced literal wording and made model provenance impossible to interpret as a clean translation-versus-verdict separation.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_independent_fidelity_review_corrects_temporal_meaning",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_fidelity_reviewer_cannot_turn_maybe_into_frequency"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -2273,7 +2265,7 @@
     "status": "fixed",
     "tests": [
       "tests/test_factory.py::VideoFactoryTest::test_youtube_subtitle_review_uses_independent_deepseek_for_kimi_translation",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_reviewer_cannot_approve_merely_understandable_chinese_at_score_three"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -2284,7 +2276,7 @@
     "impact": "A single interview could trigger roughly twenty extra translation calls, increasing cost and latency while discarding already approved captions.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_independent_fidelity_review_corrects_temporal_meaning"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -2295,7 +2287,7 @@
     "impact": "The agent treated deterministic length and terminology checks as a substitute for bilingual review and could publish naturalness or fidelity errors.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_configured_fidelity_reviewer_failure_never_publishes_unreviewed_cards"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_interview_translation_repairs_only_failed_window"
     ]
   },
   {
@@ -2331,8 +2323,7 @@
     "impact": "The translator received fragments such as 'constraints constraints' without their governing predicate and produced unnatural Chinese that viewers could not understand on first read.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_noisy_asr_condition_keeps_bottleneck_predicate_in_same_card",
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_corrupt_compet_cycle_fragment_is_not_stranded_before_its_payoff"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_translation_uses_audio_hypothesis_only_as_conflict_evidence"
     ]
   },
   {
@@ -2354,7 +2345,7 @@
     "impact": "Generation became unnecessarily slow and expensive even though only a few visibly corrupted ASR spans needed audio verification.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_targeted_whisper_audit_runs_once_then_uses_its_cache"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_cached_semantic_cards_are_immutable_during_rerender"
     ]
   },
   {
@@ -2400,7 +2391,7 @@
     "impact": "The viewer saw a weak sentence such as '这个周期往往如此。' before the real payoff, making the argument harder rather than easier to follow.",
     "status": "fixed",
     "tests": [
-      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_audio_verified_dangling_fragment_merges_into_accepted_payoff"
+      "tests/test_youtube_collection.py::YouTubeCollectionTest::test_joint_translation_uses_audio_hypothesis_only_as_conflict_evidence"
     ]
   },
   {

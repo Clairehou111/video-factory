@@ -18,6 +18,7 @@ from video_factory.models import (
 from video_factory.media import AudioLoudness, VideoProbe, probe_audio_loudness, probe_video
 from video_factory.serde import collection_manifest_from_dict
 from video_factory.storage import Workspace
+from video_factory.youtube_alignment import ALIGNMENT_POLICY_VERSION, source_words_from_cues
 from video_factory.youtube import (
     DiscoveryConfig, NaturalSubtitleTranslator, YouTubeAcquirer, YouTubeCandidate,
     YouTubeCollectionFactory, YouTubeCollectionRenderer, YouTubeDiscoveryService,
@@ -49,21 +50,27 @@ from video_factory.youtube import (
     fast_translation_cues,
     _resolve_chinese_subtitle_font_path,
     _resolve_headline_font_path,
-    _semantic_english_parts,
     _semantic_card_translation_errors,
-    _coalesce_short_semantic_parts,
-    _split_overlong_semantic_parts,
+    _caption_entity_alignment_errors,
+    _caption_numeric_alignment_errors,
+    _interview_caption_content_fingerprint,
+    _numeric_audio_conflict_pairs,
+    _compact_translation_trace,
+    _write_translation_audit,
+    _translation_trace_from_plan,
+    _snapshot_plan_hooks,
+    _remap_hook_snapshot,
+    _terminology_decision_fingerprint,
+    _strict_interview_source_fingerprint,
     cached_interview_caption_pipeline_complete,
+    cached_joint_caption_pipeline_complete,
     interview_caption_duration_errors,
     INTERVIEW_CAPTION_POLICY_VERSION,
     INTERVIEW_CAPTION_POLICY_FINGERPRINT,
     INTERVIEW_CAPTION_HARD_MAX_SECONDS,
     INTERVIEW_CAPTION_MAX_ENGLISH_WORDS,
-    INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS,
-    interview_asr_suspicions,
+    INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND,
     interview_chinese_style_errors,
-    targeted_whisper_caption_audit,
-    _whisper_text_for_range,
 )
 
 
@@ -194,34 +201,7 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(selected, successor)
         self.assertEqual(trace["step"], "caption_incumbent_verified_successor_reused")
 
-    def test_asr_suspicion_gate_is_text_only_and_targets_noisy_spans(self) -> None:
-        cues = [
-            TranscriptCue(
-                "repeat", 10, 15,
-                "constraints constraints extraordinary companies being built", "",
-            ),
-            TranscriptCue(
-                "truncated", 20, 26,
-                "The compet cycle moves earnings toward applications", "",
-            ),
-            TranscriptCue(
-                "clean", 30, 36,
-                "The compute cycle moves earnings toward applications", "",
-            ),
-        ]
 
-        findings = interview_asr_suspicions(cues)
-
-        self.assertEqual([row["cue_id"] for row in findings], ["repeat", "truncated"])
-        self.assertIn("repeated_content_word:constraints", findings[0]["reasons"])
-        self.assertIn("unknown_cycle_modifier:compet", findings[1]["reasons"])
-
-    def test_asr_suspicion_gate_ignores_repeated_spoken_contractions(self) -> None:
-        cues = [TranscriptCue(
-            "stutter", 10, 12, "And it's it's so good at that.", "",
-        )]
-
-        self.assertEqual(interview_asr_suspicions(cues), [])
 
     def test_bilingual_enforcement_does_not_duplicate_existing_explanation(self) -> None:
         cues = [TranscriptCue(
@@ -259,129 +239,9 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertIn("legacy infrastructure", cues[0].translation)
         self.assertEqual(terminology_contract_errors(cues, terms), [])
 
-    def test_whisper_words_are_sliced_to_only_the_suspicious_card_range(self) -> None:
-        payload = {"segments": [{"words": [
-            {"start": 0.0, "end": 1.0, "word": " outside"},
-            {"start": 2.0, "end": 2.5, "word": " The"},
-            {"start": 2.5, "end": 3.0, "word": " compute"},
-            {"start": 3.0, "end": 3.6, "word": " cycle."},
-            {"start": 5.0, "end": 6.0, "word": " later"},
-        ]}]}
 
-        self.assertEqual(
-            _whisper_text_for_range(payload, 1.8, 3.8), "The compute cycle.",
-        )
 
-    def test_targeted_whisper_audit_runs_once_then_uses_its_cache(self) -> None:
-        calls: list[list[str]] = []
 
-        def fake_runner(command, **kwargs):
-            calls.append(command)
-            output_dir = Path(command[command.index("--output_dir") + 1])
-            media = Path(command[1])
-            (output_dir / f"{media.stem}.json").write_text(json.dumps({
-                "segments": [{"words": [
-                    {"start": 1.0, "end": 1.5, "word": " constraints"},
-                    {"start": 1.5, "end": 2.0, "word": ","},
-                    {"start": 2.0, "end": 2.5, "word": " extraordinary"},
-                    {"start": 2.5, "end": 3.0, "word": " companies."},
-                ]}],
-            }), encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            media = root / "clip.mkv"
-            media.write_bytes(b"media")
-            cues = [TranscriptCue(
-                "card", 1, 3, "constraints constraints extraordinary companies", "",
-            )]
-            with patch("video_factory.youtube.shutil.which", return_value="/usr/bin/whisper"):
-                first = targeted_whisper_caption_audit(
-                    media, cues, root / "job", runner=fake_runner,
-                )
-                second = targeted_whisper_caption_audit(
-                    media, cues, root / "job", runner=fake_runner,
-                )
-
-        self.assertEqual(len(calls), 1)
-        self.assertFalse(first["cache_hit"])
-        self.assertTrue(second["cache_hit"])
-        self.assertEqual(
-            first["corrections"][0]["verified_source"],
-            "constraints, extraordinary companies.",
-        )
-
-    def test_targeted_whisper_keeps_context_for_proportionally_timed_cards(self) -> None:
-        calls: list[list[str]] = []
-
-        def fake_runner(command, **kwargs):
-            calls.append(command)
-            output_dir = Path(command[command.index("--output_dir") + 1])
-            media = Path(command[1])
-            words = "like like all obviously an insane amount of value went into the text".split()
-            (output_dir / f"{media.stem}.json").write_text(json.dumps({
-                "segments": [{"words": [
-                    {"start": 21.8 + index * 0.28,
-                     "end": 22.05 + index * 0.28,
-                     "word": " " + word}
-                    for index, word in enumerate(words)
-                ]}],
-            }), encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            media = root / "clip.mkv"
-            media.write_bytes(b"media")
-            cues = [TranscriptCue(
-                "card", 13.867, 16.061,
-                "like like all obviously an insane amount of value went into the text", "",
-            )]
-            with patch("video_factory.youtube.shutil.which", return_value="/usr/bin/whisper"):
-                audit = targeted_whisper_caption_audit(
-                    media, cues, root / "job", runner=fake_runner,
-                )
-
-        timestamps = calls[0][calls[0].index("--clip_timestamps") + 1]
-        self.assertEqual(timestamps, "0.000,31.061")
-        self.assertEqual(
-            audit["corrections"][0]["verified_source"],
-            "like like all obviously an insane amount of value went into the text",
-        )
-
-    def test_targeted_whisper_context_can_be_bounded_for_slow_local_cpu(self) -> None:
-        calls: list[list[str]] = []
-
-        def fake_runner(command, **kwargs):
-            calls.append(command)
-            output_dir = Path(command[command.index("--output_dir") + 1])
-            media = Path(command[1])
-            (output_dir / f"{media.stem}.json").write_text(json.dumps({
-                "segments": [{"words": [
-                    {"start": 10.0, "end": 10.5, "word": " constraints"},
-                    {"start": 10.5, "end": 11.0, "word": " constraints"},
-                ]}],
-            }), encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            media = root / "clip.mkv"
-            media.write_bytes(b"media")
-            cues = [TranscriptCue(
-                "card", 10, 11, "constraints constraints", "",
-            )]
-            with (
-                patch("video_factory.youtube.shutil.which", return_value="/usr/bin/whisper"),
-                patch.dict(os.environ, {"VIDEO_FACTORY_WHISPER_CONTEXT_SECONDS": "3"}),
-            ):
-                targeted_whisper_caption_audit(
-                    media, cues, root / "job", runner=fake_runner,
-                )
-
-        timestamps = calls[0][calls[0].index("--clip_timestamps") + 1]
-        self.assertEqual(timestamps, "7.000,14.000")
 
     def test_default_discovery_tracks_selected_investor_and_operator_channels(self) -> None:
         config = DiscoveryConfig()
@@ -629,9 +489,61 @@ class YouTubeCollectionTest(unittest.TestCase):
                 ("open-source", TerminologyStrategy.TRANSLATE, "开源"),
                 ("infrastructure", TerminologyStrategy.TRANSLATE, "基础设施"),
                 ("application layer", TerminologyStrategy.TRANSLATE, "应用层"),
-                ("KV cache", TerminologyStrategy.PRESERVE, ""),
             ],
         )
+
+    def test_preserve_row_with_chinese_target_normalizes_to_translate(self) -> None:
+        cues = [TranscriptCue(
+            "cue-1", 0, 4, "The request includes an IP address.",
+        )]
+
+        entries = NaturalSubtitleTranslator._parse_terminology([{
+            "source": "IP address", "strategy": "preserve",
+            "target": "IP 地址",
+            "rationale": "The acronym stays in English while the compound has a settled Chinese form.",
+        }], cues)
+
+        entry = next(item for item in entries if item.source == "IP address")
+        self.assertEqual(entry.strategy, TerminologyStrategy.TRANSLATE)
+        self.assertEqual(entry.target, "IP 地址")
+
+    def test_contextual_terminology_is_video_scoped_and_survives_cache_parse(self) -> None:
+        cues = [TranscriptCue(
+            "cue-1", 0, 6,
+            "The recommendation agent ranks products from customer signals.",
+            "推荐智能体会根据客户信号给产品排序。",
+        )]
+
+        entries = NaturalSubtitleTranslator._parse_terminology([{
+            "source": "recommendation agent", "strategy": "translate",
+            "target": "推荐智能体", "alternatives": [
+                "推荐代理", "推荐智能体", "recommendation agent", "第三个备选",
+            ],
+            "rationale": (
+                "It ranks products from customer signals, so agent denotes an "
+                "AI task performer rather than a proxy."
+            ),
+        }, {
+            "source": "absent agent", "strategy": "translate",
+            "target": "不存在的智能体", "rationale": "The source does not contain it.",
+        }], cues)
+
+        contextual = next(
+            entry for entry in entries if entry.source == "recommendation agent"
+        )
+        self.assertEqual(contextual.alternatives, ["推荐代理", "第三个备选"])
+        self.assertIn("ranks products", contextual.rationale)
+        self.assertNotIn("absent agent", {entry.source for entry in entries})
+
+        restored = NaturalSubtitleTranslator._parse_terminology(
+            [asdict(contextual)], cues,
+        )
+        cached = next(
+            entry for entry in restored if entry.source == "recommendation agent"
+        )
+        self.assertEqual(cached.target, "推荐智能体")
+        self.assertEqual(cached.alternatives, ["推荐代理", "第三个备选"])
+        self.assertEqual(cached.rationale, contextual.rationale)
 
     def test_ordinary_interview_terms_cannot_be_marked_english_preserving(self) -> None:
         cues = [
@@ -1372,7 +1284,7 @@ class YouTubeCollectionTest(unittest.TestCase):
                     "download_start": 98, "download_end": 192,
                 }
 
-        def select(self, acquired_metadata, acquired_cues, editorial_mode):
+        def select(self, acquired_metadata, acquired_cues, editorial_mode, **kwargs):
             events.append("highlight_selected")
             acquired_cues[:] = [cue for cue in acquired_cues if cue.end > 100 and cue.start < 190]
             return [], dict(plan), []
@@ -1381,12 +1293,34 @@ class YouTubeCollectionTest(unittest.TestCase):
             events.append("directing_audited")
             return {"step": "interview_directing_audit", "provenance": {"provider": "test"}}
 
+        def discover(self, acquired_cues, terminology):
+            events.append("terminology_discovered")
+            return {"step": "selected_subtitle_terminology_discovery", "added_sources": []}
+
+        def joint_translate(
+            self, acquired_cues, terminology, source_words,
+            alignment_fingerprint="", audio_hypothesis="",
+        ):
+            events.append("joint_translated")
+            for cue in acquired_cues:
+                cue.translation = "工程系统改变团队工作流。"
+            return {
+                "step": "interview_joint_boundary_translation",
+                "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
+                "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+                "reviewed_cue_ids": [cue.id for cue in acquired_cues],
+            }
+
         with TemporaryDirectory() as temp, patch(
             "video_factory.youtube.YouTubeAcquirer", FakeAcquirer,
         ), patch.object(
             NaturalSubtitleTranslator, "translate", select,
         ), patch.object(
             NaturalSubtitleTranslator, "audit_interview_directing", audit,
+        ), patch.object(
+            NaturalSubtitleTranslator, "discover_missing_terminology", discover,
+        ), patch.object(
+            NaturalSubtitleTranslator, "translate_interview_clip_once", joint_translate,
         ), patch.object(
             YouTubeCollectionRenderer, "render", return_value=[],
         ):
@@ -1400,7 +1334,8 @@ class YouTubeCollectionTest(unittest.TestCase):
             generated = json.loads(Path(result["collection_manifest"]).read_text(encoding="utf-8"))
 
         self.assertEqual(events, [
-            "metadata_transcript", "highlight_selected", "directing_audited", "partial_download",
+            "metadata_transcript", "highlight_selected", "terminology_discovered", "partial_download",
+            "joint_translated", "directing_audited",
         ])
         self.assertEqual(download_flags, [False])
         self.assertEqual(result["editorial_mode"], "known_tech_interview_clip")
@@ -1411,6 +1346,61 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertTrue(0 <= hook_range["start"] < hook_range["end"] <= 94)
         self.assertIsNotNone(hook_range["original_start"])
         self.assertTrue(all(0 <= cue["start"] < cue["end"] <= 94 for cue in generated["transcript"]))
+
+    def test_bounded_local_interview_media_requires_source_clip_provenance(self) -> None:
+        metadata = {
+            "id": "interview123", "title": "Known engineer interview",
+            "channel": "AI Engineer", "description": "AI engineering interview",
+            "duration": 600, "creators": ["Engineer", "Host"],
+        }
+        cues = [TranscriptCue(
+            "c1", 100, 190,
+            "A concrete engineering system changes the team workflow.",
+        )]
+        plan = {
+            "editorial_mode": "known_tech_interview_clip", "collection_title": "人物高光",
+            "story_start": 100, "story_end": 190, "bilibili_chapters": [],
+            "wechat_lessons": [{
+                "speaker_label": "Engineer", "title": "工程系统改变协作",
+                "thesis": "一个完整工程判断。", "start": 100, "end": 190,
+                "framing": "speaker", "hook_headlines": [
+                    "工程系统改变协作", "完整判断来自上下文", "团队工作流发生变化",
+                ],
+            }],
+        }
+
+        class FakeAcquirer:
+            def __init__(self, workspace):
+                self.workspace = workspace
+
+            def acquire(self, url, job, **kwargs):
+                candidate = Candidate(
+                    "youtube-interview123", SourceType.YOUTUBE, url, metadata["title"],
+                    author=metadata["channel"], metadata={"video_id": metadata["id"]},
+                )
+                info = SourceMediaInfo(1920, 1080, 94, "h264", "aac")
+                return candidate, [], dict(metadata), list(cues), "clip.mkv", "subtitles.json3", info
+
+        def select(self, acquired_metadata, acquired_cues, editorial_mode, **kwargs):
+            return [], dict(plan), []
+
+        with TemporaryDirectory() as temp, patch(
+            "video_factory.youtube.YouTubeAcquirer", FakeAcquirer,
+        ), patch.object(
+            NaturalSubtitleTranslator, "translate", select,
+        ), patch.object(
+            NaturalSubtitleTranslator, "discover_missing_terminology",
+            return_value={"step": "selected_subtitle_terminology_discovery", "added_sources": []},
+        ):
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            job = Path(temp) / "job"
+            job.mkdir()
+            with self.assertRaisesRegex(ValueError, "source_clip provenance"):
+                YouTubeCollectionFactory(workspace, object()).generate(
+                    "https://youtube.com/watch?v=interview123", job,
+                    render=True, editorial_mode="known_tech_interview_clip",
+                )
 
     def test_technical_coverage_factory_requests_complete_source(self) -> None:
         requested_ranges: list[SourceRange | None] = []
@@ -1449,13 +1439,23 @@ class YouTubeCollectionTest(unittest.TestCase):
                 evidence = Evidence("video", candidate.id, url, "complete source", "youtube:video")
                 return "complete.mkv", info, evidence, None
 
-        def select(self, acquired_metadata, acquired_cues, editorial_mode):
+        def select(self, acquired_metadata, acquired_cues, editorial_mode, **kwargs):
             return [], dict(plan), []
 
         with TemporaryDirectory() as temp, patch(
             "video_factory.youtube.YouTubeAcquirer", FakeAcquirer,
         ), patch.object(
             NaturalSubtitleTranslator, "translate", select,
+        ), patch.object(
+            NaturalSubtitleTranslator, "discover_missing_terminology",
+            return_value={"step": "terminology_discovered", "additions": []},
+        ), patch.object(
+            NaturalSubtitleTranslator, "review_terminology_decisions", return_value=None,
+        ), patch.object(
+            NaturalSubtitleTranslator, "translate_caption_scopes",
+            return_value={"step": "joint_caption_scopes_translation"},
+        ), patch(
+            "video_factory.youtube.interview_caption_duration_errors", return_value=[],
         ), patch.object(
             YouTubeCollectionRenderer, "render", return_value=[],
         ):
@@ -1700,72 +1700,9 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertEqual(parts, [(english, chinese)])
 
-    def test_clause_split_uses_dependent_boundaries_to_avoid_overlong_cards(self) -> None:
-        ecosystem = (
-            "And so I look across the entire ecosystem and look for bottlenecks "
-            "and if there are places where extraordinary companies are being built"
-        )
-        causal = (
-            "I think about the long-term supply chain more than most because our "
-            "company is really large and in order for us to succeed many companies support me."
-        )
 
-        ecosystem_parts = _semantic_english_parts(ecosystem, 3)
-        causal_parts = _semantic_english_parts(causal, 3)
 
-        self.assertEqual(" ".join(ecosystem_parts), ecosystem)
-        self.assertEqual(" ".join(causal_parts), causal)
-        self.assertEqual(len(ecosystem_parts), 3)
-        self.assertEqual(len(causal_parts), 3)
-        self.assertTrue(any(part.casefold().startswith("because ") for part in causal_parts))
 
-    def test_noisy_asr_condition_keeps_bottleneck_predicate_in_same_card(self) -> None:
-        source = (
-            "And so I look across the entire ecosystem and look for bottlenecks "
-            "and if there are places where extraordinary companies are being built "
-            "constraints constraints extraordinary companies being built uh maybe "
-            "it's uh uh uh supply chain that has to uh get scaled up so that when "
-            "we're ready to deploy compute that they'll be ready for us land power "
-            "shell and so this is no different than looking at the supply chain upstream."
-        )
-
-        parts = _semantic_english_parts(source, 5)
-
-        self.assertEqual(" ".join(parts), source)
-        self.assertEqual(parts[0], "And so I look across the entire ecosystem")
-        self.assertTrue(parts[1].startswith("and look for bottlenecks and if "))
-        self.assertFalse(any(part.startswith("and if ") for part in parts))
-
-    def test_corrupt_compet_cycle_fragment_is_not_stranded_before_its_payoff(self) -> None:
-        source = (
-            "The compet cycle tends to be though that the earnings over time over "
-            "long stretches of time tends to move up the stack right towards the "
-            "application layer where you can over earn for larger periods of time."
-        )
-
-        parts = _semantic_english_parts(source, 3)
-
-        self.assertEqual(" ".join(parts), source)
-        self.assertFalse(any(part.rstrip().endswith("though") for part in parts[:-1]))
-        self.assertIn("application layer", parts[0])
-        self.assertTrue(parts[-1].startswith("where you can over earn"))
-
-    def test_semantic_split_does_not_create_short_asr_or_idiom_fragments(self) -> None:
-        coding = (
-            "Um so in coding essenti and this is back to the kind of utility point "
-            "like the utility of code is represented by the text you can generate"
-        )
-        legal = (
-            "And it's like okay well lo and behold legal is interesting because "
-            "reviewing and writing legal documents creates a lot of value"
-        )
-
-        coding_parts = _semantic_english_parts(coding, 4)
-        legal_parts = _semantic_english_parts(legal, 4)
-
-        self.assertFalse(any(part.endswith("coding essenti") for part in coding_parts))
-        self.assertFalse(any(part.endswith("well lo") for part in legal_parts))
-        self.assertTrue(any("lo and behold" in part for part in legal_parts))
 
     def test_business_model_uses_contextual_chinese_term(self) -> None:
         cues = [TranscriptCue(
@@ -1774,9 +1711,13 @@ class YouTubeCollectionTest(unittest.TestCase):
             "作为 CEO，什么才是正确的商业模式？",
         )]
 
-        errors = terminology_contract_errors(cues, [TerminologyEntry(
-            "model", TerminologyStrategy.TRANSLATE, target="模型",
-        )])
+        errors = terminology_contract_errors(cues, [
+            TerminologyEntry("model", TerminologyStrategy.TRANSLATE, target="模型"),
+            TerminologyEntry(
+                "business model", TerminologyStrategy.TRANSLATE,
+                target="商业模式", rationale="CEO asks how the company makes money.",
+            ),
+        ])
 
         self.assertEqual(errors, [])
 
@@ -1793,63 +1734,6 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(slop.target, "低质内容")
         self.assertEqual(terminology_contract_errors(cues, terminology), [])
 
-    def test_asr_topic_setup_becomes_complete_card_without_borrowing_next_claim(self) -> None:
-        class Translator:
-            def _request_json(self, messages, max_tokens):
-                prompt = messages[-1]["content"]
-                self.assert_topic_rule(prompt)
-                rows = json.loads(prompt.split("Cards: ", 1)[1].split(
-                    "\nPrevious validation error:", 1,
-                )[0])
-                copy = [
-                    "说回低质内容的效用问题，编程领域情况特殊。",
-                    "代码效用几乎完全取决于可生成的文本量。",
-                    "这些文本本身凝结了巨大价值。",
-                ]
-                return ({"translations": [
-                    {"id": row["id"], "text": copy[index]}
-                    for index, row in enumerate(rows)
-                ]}, {"model": "topic-translator"})
-
-            @staticmethod
-            def assert_topic_rule(prompt):
-                if "complete topic-setting Chinese sentence" not in prompt:
-                    raise AssertionError(prompt)
-
-        class Reviewer:
-            def _request_json(self, messages, max_tokens):
-                prompt = messages[-1]["content"]
-                if "complete topic-setting Chinese sentence" not in prompt:
-                    raise AssertionError(prompt)
-                rows = json.loads(prompt.split("Rows: ", 1)[1])
-                return ({"reviews": [{
-                    "id": row["id"], "pass": True,
-                    "fidelity_score": 5, "naturalness_score": 5,
-                    "errors": [],
-                } for row in rows]}, {"model": "topic-reviewer"})
-
-        source = (
-            "um so in coding essentially and this is back to the kind of utility point "
-            "on on you know slop like the utility of code is almost 100 represented by "
-            "the amount of text that you can generate like like all obviously an insane "
-            "amount of value went into the text"
-        )
-        cues = [TranscriptCue(
-            "cue-1-card-1", 0, 16.414, source,
-            "旧字幕。",
-        )]
-        terminology = [TerminologyEntry(
-            "slop", TerminologyStrategy.TRANSLATE, target="低质内容",
-        )]
-
-        trace = NaturalSubtitleTranslator(
-            Translator(), None, Reviewer(),
-        ).segment_interview_subtitle_cards(cues, terminology)
-
-        self.assertFalse(trace["fallback_used"])
-        self.assertEqual(len(cues), 3)
-        self.assertIn("低质内容", cues[0].translation)
-        self.assertTrue(all(not cue.translation.endswith("——") for cue in cues))
 
     def test_open_source_check_accepts_natural_contextual_chinese(self) -> None:
         cues = [TranscriptCue(
@@ -1859,141 +1743,23 @@ class YouTubeCollectionTest(unittest.TestCase):
         )]
 
         errors = terminology_contract_errors(cues, [TerminologyEntry(
-            "open-source check", TerminologyStrategy.TRANSLATE, target="开源制衡",
+            "open-source check", TerminologyStrategy.TRANSLATE,
+            target="开源对闭源的制衡",
+            rationale="The source explicitly contrasts open and closed source.",
         )])
 
         self.assertEqual(errors, [])
 
-    def test_clause_split_may_create_so_that_card_for_translation_to_localize(self) -> None:
-        source = (
-            "so we started working with all of these companies long before the growth came "
-            "so that the growth could happen."
-        )
 
-        parts = _semantic_english_parts(source, 4)
 
-        self.assertTrue(any(part.casefold().startswith("so that ") for part in parts[1:]))
 
-    def test_semantic_split_keeps_leading_condition_with_its_consequence(self) -> None:
-        source = (
-            "If we don't obsolete our own products and services, someone's "
-            "going to find a way to obsolete them for us."
-        )
 
-        parts = _semantic_english_parts(source, 2)
 
-        self.assertEqual(parts, [source])
 
-    def test_semantic_split_does_not_strand_coordinated_predicate(self) -> None:
-        source = (
-            "Give each model tests to see if it will build bioweapons or nuclear "
-            "bombs or be deliberately deceptive and report the result."
-        )
 
-        parts = _semantic_english_parts(source, 3)
 
-        self.assertFalse(any(
-            re.match(r"^(?:and|or)\s+(?:be|have|do)\b", part, re.IGNORECASE)
-            for part in parts[1:]
-        ), parts)
 
-    def test_semantic_split_keeps_complement_after_figure_out(self) -> None:
-        source = (
-            "Have the smartest humans try their best to figure out if this model "
-            "is going to be a bad actor."
-        )
 
-        parts = _semantic_english_parts(source, 2)
-
-        self.assertFalse(any(part.casefold().endswith("figure out") for part in parts))
-
-    def test_semantic_split_does_not_end_on_relative_subject(self) -> None:
-        source = (
-            "Use a series of safety tests that you give to any model to see "
-            "whether it behaves deceptively."
-        )
-
-        parts = _semantic_english_parts(source, 2)
-
-        self.assertFalse(any(re.search(
-            r"\b(?:that|which|where)\s+(?:you|we|they|he|she|it)$",
-            part, re.IGNORECASE,
-        ) for part in parts[:-1]), parts)
-
-    def test_semantic_split_uses_repeated_pronoun_as_asr_restart(self) -> None:
-        source = (
-            "I think everyone applying everyone else's test harness to each other "
-            "is probably the best way we we best thing we can do to ensure safety."
-        )
-
-        parts = _semantic_english_parts(source, 2)
-
-        self.assertEqual(len(parts), 2)
-        self.assertTrue(parts[1].casefold().startswith("we we "), parts)
-
-    def test_semantic_split_does_not_isolate_short_discourse_fragment(self) -> None:
-        source = (
-            "Um and um, yeah, I mean there's a reason, you know, students like "
-            "like why why do writers have someone else proofread their book?"
-        )
-
-        parts = _semantic_english_parts(source, 3)
-
-        self.assertNotIn("you know, students", parts)
-
-    def test_semantic_split_keeps_contracted_predicate_with_complement(self) -> None:
-        source = (
-            "And this is the problem with all these evals right now is they're "
-            "so massively overfit."
-        )
-
-        parts = _semantic_english_parts(source, 2)
-
-        self.assertFalse(any(part.casefold().endswith("they're") for part in parts))
-        self.assertEqual(" ".join(parts), source)
-
-    def test_semantic_split_never_leaves_nonfinal_card_on_connector(self) -> None:
-        source = (
-            "Corning has to support us and Lumentum and TSMC and memory companies "
-            "and and so we started working with them before demand arrived."
-        )
-
-        parts = _semantic_english_parts(source, 5)
-
-        self.assertEqual(" ".join(parts), source)
-        self.assertTrue(all(
-            not part.casefold().rstrip(" ,.;").endswith((" and", " so", " uh", " um"))
-            for part in parts[:-1]
-        ))
-
-    def test_satya_legacy_asr_keeps_to_your_point_with_its_object(self) -> None:
-        source = (
-            "because otherwise we'll be back to some mainframe lock-in that's not a thing "
-            "to your point about if anything given that we will hopefully continue "
-            "to have a richer choice in every layer."
-        )
-
-        parts = _semantic_english_parts(source, 4)
-
-        self.assertEqual(" ".join(parts), source)
-        self.assertFalse(any(part.rstrip(" ,.;").endswith("about") for part in parts))
-        self.assertTrue(any(
-            "to your point about if anything given that" in part for part in parts
-        ))
-
-    def test_tiny_supplier_fragment_coalesces_before_translation(self) -> None:
-        parts = [
-            "Corning and Lumentum have to support our very large long-term infrastructure expansion plans",
-            "and TSMC of course",
-            "and memory companies",
-            "and so we started working early",
-        ]
-
-        merged = _coalesce_short_semantic_parts(parts, 9)
-
-        self.assertEqual(len(merged), 3)
-        self.assertIn("TSMC", merged[1])
-        self.assertIn("memory companies", merged[1])
 
     def test_caption_timing_gate_rejects_avoidable_seventeen_second_card(self) -> None:
         cues = [
@@ -2026,23 +1792,6 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertTrue(any("hard maximum" in error for error in errors), errors)
 
-    def test_semantic_segmentation_trims_only_small_unsplittable_display_overrun(self) -> None:
-        cue = TranscriptCue(
-            "short-clause", 10, 17.68,
-            "Infrastructure economics remain difficult.",
-            "基础设施经济性仍然很难。",
-            original_start=110, original_end=117.68,
-        )
-
-        trace = NaturalSubtitleTranslator(object()).segment_interview_subtitle_cards(
-            [cue], [],
-        )
-
-        self.assertAlmostEqual(cue.end, 17.5)
-        self.assertAlmostEqual(cue.original_end, 117.68)
-        self.assertFalse(interview_caption_duration_errors([cue]))
-        self.assertEqual(trace["timing_adjustments"][0]["cue_id"], cue.id)
-        self.assertAlmostEqual(trace["timing_adjustments"][0]["trimmed_seconds"], 0.18)
 
     def test_exact_editorial_range_preserves_millisecond_boundaries(self) -> None:
         exact = _requested_exact_range_from_editorial_guidance(
@@ -2062,7 +1811,16 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertTrue(any("minimum" in error for error in errors), errors)
         self.assertTrue(any("English words" in error for error in errors), errors)
-        self.assertTrue(any("Chinese characters" in error for error in errors), errors)
+        self.assertTrue(any("reading units per second" in error for error in errors), errors)
+
+    def test_caption_reading_speed_counts_latin_names_as_words(self) -> None:
+        cue = TranscriptCue(
+            "named-entity", 84.44, 86.64,
+            "And so I think you know companies like PaloAlto Networks",
+            "所以我认为像 Palo Alto Networks 这样的公司",
+        )
+
+        self.assertEqual(interview_caption_duration_errors([cue]), [])
 
     def test_caption_policy_allows_brief_acknowledgement_under_standard_minimum(self) -> None:
         cue = TranscriptCue("ack", 0, 1.04, "Yeah.", "对。")
@@ -2074,18 +1832,43 @@ class YouTubeCollectionTest(unittest.TestCase):
             "cue-1-card-1", 0, 4.5, "The application layer matters.", "应用层很重要。",
         )]
         trace = [{
-            "step": "interview_semantic_subtitle_cards",
+            "step": "interview_source_word_alignment",
+            "fingerprint": "aligned-media-and-transcript",
+            "policy_version": ALIGNMENT_POLICY_VERSION,
+            "source_ledger_fingerprint": "source-ledger",
+            "media_sha256": "media-sha",
+            "status": "aligned",
+        }, {
+            "step": "interview_joint_boundary_translation",
             "cue_ids": [cues[0].id],
             "reviewed_cue_ids": [cues[0].id],
             "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
             "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+            "caption_content_fingerprint": _interview_caption_content_fingerprint(cues),
+            "terminology_decision_fingerprint": _terminology_decision_fingerprint([]),
+            "strict_source_fingerprint": _strict_interview_source_fingerprint(cues),
+            "alignment_fingerprint": "aligned-media-and-transcript",
+            "source_ledger_fingerprint": "source-ledger",
         }]
 
-        self.assertTrue(cached_interview_caption_pipeline_complete(cues, trace))
+        self.assertTrue(cached_interview_caption_pipeline_complete(
+            cues, trace, "media-sha",
+        ))
         self.assertFalse(cached_interview_caption_pipeline_complete(cues, []))
 
-        stale = [{**trace[0], "policy_version": "legacy"}]
+        stale = [trace[0], {**trace[1], "policy_version": "legacy"}]
         self.assertFalse(cached_interview_caption_pipeline_complete(cues, stale))
+
+        edited = [TranscriptCue(
+            cues[0].id, cues[0].start, cues[0].end,
+            cues[0].source_text, "应用层很关键。",
+        )]
+        self.assertFalse(cached_interview_caption_pipeline_complete(
+            edited, trace, "media-sha",
+        ))
+        self.assertFalse(cached_interview_caption_pipeline_complete(
+            cues, trace, "different-media",
+        ))
 
         mixed = [*cues, TranscriptCue(
             "cue-2", 4.5, 14.5,
@@ -2094,179 +1877,81 @@ class YouTubeCollectionTest(unittest.TestCase):
         )]
         self.assertFalse(cached_interview_caption_pipeline_complete(mixed, trace))
 
-    def test_stale_semantic_siblings_are_retimed_without_realigning_text(self) -> None:
-        cues = [
-            TranscriptCue(
-                "cue-1-card-1", 0, 7.4,
-                "The developer creates value at the computer.",
-                "开发者在电脑前创造价值。",
-                original_start=100, original_end=107.4,
+    def test_cached_semantic_cards_are_bound_to_reviewed_terminology_decisions(self) -> None:
+        cues = [TranscriptCue(
+            "cue-1-card-1", 0, 4.5,
+            "Open weights improve auditability.", "开放权重提高了可审计性。",
+        )]
+        reviewed_terms = [TerminologyEntry(
+            "open weights", TerminologyStrategy.TRANSLATE,
+            target="开放权重", alternatives=["公开权重"],
+            rationale="The speaker means downloadable model weights.",
+        )]
+        alignment = {
+            "step": "interview_source_word_alignment",
+            "fingerprint": "aligned-media-and-transcript",
+            "policy_version": ALIGNMENT_POLICY_VERSION,
+            "source_ledger_fingerprint": "source-ledger",
+            "media_sha256": "media-sha",
+            "status": "aligned",
+        }
+        review = {
+            "step": "interview_joint_boundary_translation",
+            "reviewed_cue_ids": [cues[0].id],
+            "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
+            "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+            "caption_content_fingerprint": _interview_caption_content_fingerprint(cues),
+            "terminology_decision_fingerprint": _terminology_decision_fingerprint(
+                reviewed_terms,
             ),
-            TranscriptCue(
-                "cue-1-card-2", 7.4, 8.2,
-                "and types code.", "并敲下代码。",
-                original_start=107.4, original_end=108.2,
-            ),
-        ]
-        bilingual_before = [
-            (cue.source_text, cue.translation) for cue in cues
-        ]
+            "strict_source_fingerprint": _strict_interview_source_fingerprint(cues),
+            "alignment_fingerprint": "aligned-media-and-transcript",
+            "source_ledger_fingerprint": "source-ledger",
+        }
 
-        trace = NaturalSubtitleTranslator(object()).segment_interview_subtitle_cards(
-            cues, [],
-        )
+        self.assertTrue(cached_interview_caption_pipeline_complete(
+            cues, [alignment, review], "media-sha", reviewed_terms,
+        ))
 
-        self.assertEqual(
-            [(cue.source_text, cue.translation) for cue in cues], bilingual_before,
-        )
-        self.assertAlmostEqual(cues[0].start, 0)
-        self.assertAlmostEqual(cues[-1].end, 8.2)
-        self.assertAlmostEqual(cues[0].original_start, 100)
-        self.assertAlmostEqual(cues[-1].original_end, 108.2)
-        self.assertAlmostEqual(cues[0].original_end, cues[1].original_start)
-        self.assertLessEqual(cues[0].original_end - cues[0].original_start, 7.5)
-        self.assertTrue(all(cue.duration >= 1.2 for cue in cues))
-        self.assertEqual(trace["policy_version"], INTERVIEW_CAPTION_POLICY_VERSION)
-
-    def test_hard_compliant_stale_card_is_not_resplit_to_chase_target(self) -> None:
-        class MustNotTranslate:
-            def _request_json(self, *args, **kwargs):
-                raise AssertionError("hard-compliant reviewed card must remain immutable")
-
-        cue = TranscriptCue(
-            "cue-1-card-2", 0, 5.6,
-            "so that when we're ready to deploy compute that they'll be ready for us land power shell",
-            "我们部署算力时，土地、电力和厂房才能准备就绪。",
-        )
-        before = asdict(cue)
-
-        trace = NaturalSubtitleTranslator(
-            MustNotTranslate(),
-        ).segment_interview_subtitle_cards([cue], [])
-
-        self.assertEqual(asdict(cue), before)
-        self.assertEqual(trace["cue_ids"], [])
-
-    def test_semantic_cards_retry_when_uppercase_entity_moves_between_rows(self) -> None:
-        class GeminiCritic:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, *args, **kwargs):
-                self.calls += 1
-                if self.calls == 1:
-                    rows = [
-                        {"id": "cue-1-card-1", "text": "Corning 和台积电都支持我们"},
-                        {"id": "cue-1-card-2", "text": "这家公司也支持我们"},
-                    ]
-                else:
-                    rows = [
-                        {"id": "cue-1-card-1", "text": "Corning 支持我们"},
-                        {"id": "cue-1-card-2", "text": "台积电也支持我们"},
-                    ]
-                return ({"translations": rows}, {"model": "gemini-review"})
-
-        critic = GeminiCritic()
-        cues = [TranscriptCue(
-            "cue-1", 0, 8,
-            "Corning strongly supports our work and TSMC also strongly supports our work.",
-            "Corning 和 TSMC 都支持我们。",
+        changed_terms = [TerminologyEntry(
+            "open weights", TerminologyStrategy.TRANSLATE,
+            target="开放权重", alternatives=["公开参数"],
+            rationale="A different decision the reviewer did not inspect.",
         )]
+        self.assertFalse(cached_interview_caption_pipeline_complete(
+            cues, [alignment, review], "media-sha", changed_terms,
+        ))
 
-        trace = NaturalSubtitleTranslator(
-            object(), critic,
-        ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertFalse(trace["fallback_used"])
-        self.assertEqual(critic.calls, 2)
-        self.assertEqual([cue.translation for cue in cues], [
-            "Corning 支持我们。", "台积电也支持我们。",
-        ])
-
-    def test_semantic_fallback_rejects_entity_shifted_chinese_partition(self) -> None:
-        class InvalidCritic:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": []}, {"model": "unavailable-copy"})
-
-        source = (
-            "Corning strongly supports our work and TSMC also strongly supports our work."
-        )
+    def test_non_interview_joint_cache_is_bound_to_cards_and_terminology(self) -> None:
         cues = [TranscriptCue(
-            "cue-1", 0, 8, source,
-            "Corning 和台积电都支持我们，所以合作才能继续。",
-        )]
-
-        trace = NaturalSubtitleTranslator(
-            object(), InvalidCritic(),
-        ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertTrue(trace["fallback_used"])
-        self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0].id, "cue-1")
-
-    def test_failed_batch_recovers_each_semantic_card_in_isolation(self) -> None:
-        class ParagraphProneCritic:
-            def _request_json(self, messages, max_tokens):
-                prompt = messages[-1]["content"]
-                if "Translate exactly one fixed English interview caption" not in prompt:
-                    return ({"translations": []}, {"mode": "bad-batch"})
-                if "Source: Corning" in prompt:
-                    text = "Corning 支持我们。"
-                elif "Source: and TSMC" in prompt:
-                    text = "台积电也支持我们。"
-                else:
-                    raise AssertionError(prompt)
-                return ({"text": text}, {"mode": "isolated"})
-
-        cues = [TranscriptCue(
-            "cue-1", 0, 8,
-            "Corning strongly supports our work and TSMC also strongly supports our work.",
-            "Corning 和台积电都支持我们。",
-        )]
-
-        trace = NaturalSubtitleTranslator(
-            object(), ParagraphProneCritic(),
-        ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertFalse(trace["fallback_used"])
-        self.assertEqual(trace["provenance"]["mode"], "isolated_card_recovery")
-        self.assertEqual([cue.translation for cue in cues], [
-            "Corning 支持我们。", "台积电也支持我们。",
-        ])
-
-    def test_semantic_cards_retry_translation_that_exceeds_its_time_budget(self) -> None:
-        class GeminiCritic:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, *args, **kwargs):
-                self.calls += 1
-                first = (
-                    "我会非常仔细并且全面系统地审视整个生态系统中的全部情况和每一个潜在问题"
-                    if self.calls == 1 else "我会审视生态。"
-                )
-                return ({"translations": [
-                    {"id": "cue-1-card-1", "text": first},
-                    {"id": "cue-1-card-2", "text": "再逐一检查所有基础设施瓶颈"},
-                ]}, {"model": "gemini-review"})
-
-        critic = GeminiCritic()
-        cues = [TranscriptCue(
-            "cue-1", 0, 8,
-            "I scan the ecosystem and then I carefully inspect every infrastructure bottleneck across the system.",
-            "我会审视整个生态，再逐一检查所有基础设施瓶颈。",
+            "caption-scope-001-card-0001", 0, 4,
+            "Open weights improve audits.", "开放权重让审计更容易。",
         )]
         terms = [TerminologyEntry(
-            "infrastructure", TerminologyStrategy.TRANSLATE, target="基础设施",
+            "Open weights", TerminologyStrategy.TRANSLATE,
+            target="开放权重", rationale="The source discusses downloadable weights.",
         )]
+        trace = [{
+            "step": "joint_caption_scopes_translation",
+            "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
+            "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+            "reviewed_cue_ids": [cues[0].id],
+            "caption_content_fingerprint": _interview_caption_content_fingerprint(cues),
+            "terminology_decision_fingerprint": _terminology_decision_fingerprint(terms),
+            "strict_source_fingerprint": _strict_interview_source_fingerprint(cues),
+        }]
 
-        trace = NaturalSubtitleTranslator(
-            object(), critic,
-        ).segment_interview_subtitle_cards(cues, terms)
+        self.assertTrue(cached_joint_caption_pipeline_complete(cues, trace, terms))
+        changed = [TranscriptCue(
+            cues[0].id, 0, 4, cues[0].source_text, "开放参数让审计更容易。",
+        )]
+        self.assertFalse(cached_joint_caption_pipeline_complete(changed, trace, terms))
 
-        self.assertFalse(trace["fallback_used"])
-        self.assertEqual(critic.calls, 2)
-        self.assertEqual(cues[0].translation, "我会审视生态。")
+
+
+
+
+
 
     def test_unsplit_interview_parent_fails_closed_before_renderer(self) -> None:
         cue = TranscriptCue(
@@ -2292,530 +1977,1102 @@ class YouTubeCollectionTest(unittest.TestCase):
                 manifest, item, render, Path(temp) / "locked",
             )
 
-    def test_long_relative_payoff_uses_three_publishable_cards(self) -> None:
-        source = (
-            "The competitive cycle tends to be that earnings over long stretches "
-            "move up the stack towards the application layer where you can over earn "
-            "for larger periods of time."
+
+
+
+
+
+
+
+    def test_modality_wording_is_left_to_independent_semantic_review(self) -> None:
+        errors = _semantic_card_translation_errors({
+            "id": "card",
+            "source": "maybe three or four leading companies were doing it.",
+            "duration_seconds": 4.0,
+        }, "三四家头部公司都在这样做。", [])
+
+        self.assertNotIn("modality", errors)
+
+    def test_semantic_card_reports_which_translation_term_rule_failed(self) -> None:
+        term = TerminologyEntry(
+            "retrieval agent", TerminologyStrategy.TRANSLATE, target="检索代理",
+        )
+        row = {
+            "id": "card", "source": "A retrieval agent answers the request.",
+            "duration_seconds": 5.0,
+        }
+
+        self.assertIn(
+            "term:retrieval agent:missing_target:检索代理",
+            _semantic_card_translation_errors(row, "它会回答请求。", [term]),
+        )
+        self.assertIn(
+            "term:retrieval agent:remove_english:retrieval agent",
+            _semantic_card_translation_errors(
+                row, "检索代理 retrieval agent 会回答请求。", [term],
+            ),
         )
 
-        parts = _semantic_english_parts(source, 3)
 
-        self.assertEqual(len(parts), 3)
-        self.assertIn("competitive cycle", parts[0])
-        self.assertIn("application layer", parts[1])
-        self.assertTrue(parts[2].startswith("where you can over earn"))
 
-    def test_gemini_semantic_cards_are_shorter_and_losslessly_timed(self) -> None:
-        class GeminiCritic:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": [
-                    {"id": "cue-1-card-1", "text": "供应链需要提前扩容。"},
-                    {"id": "cue-1-card-2", "text": "部署算力时，土地、电力和厂房都要就绪。"},
-                    {"id": "cue-1-card-3", "text": "这与考察上游供应链的逻辑一致。"},
-                ]}, {"model": "gemini-review"})
 
-        source = (
-            "it's the supply chain that has to get scaled up so that when we're ready "
-            "to deploy compute they'll be ready for us land power shell and so this is "
-            "no different than looking at the supply chain upstream."
+
+    def test_card_term_does_not_enforce_agent_inside_retrieval_agent(self) -> None:
+        terms = [
+            TerminologyEntry("agent", TerminologyStrategy.TRANSLATE, target="智能体"),
+            TerminologyEntry(
+                "retrieval agent", TerminologyStrategy.TRANSLATE, target="检索代理",
+                alternatives=["检索智能体"],
+                rationale="It retrieves information as an AI workflow component.",
+            ),
+        ]
+        row = {
+            "id": "card", "source": "The retrieval agent reads the request.",
+            "duration_seconds": 5,
+        }
+        self.assertEqual(
+            _semantic_card_translation_errors(row, "检索代理会读取请求。", terms),
+            [],
         )
-        cues = [TranscriptCue(
-            "cue-1", 0, 14.2, source,
-            "供应链需要扩大规模，部署计算前要准备好土地、电力和机房。这和审视上游供应链一样。",
+        self.assertEqual(
+            _semantic_card_translation_errors(row, "检索智能体会读取请求。", terms),
+            [],
+        )
+
+
+
+    def test_contextual_candidates_are_not_a_deterministic_publication_whitelist(self) -> None:
+        cues = [
+            TranscriptCue(
+                "c1", 0, 4, "A recommendation agent ranks products.",
+                "推荐智能体会给产品排序。",
+            ),
+            TranscriptCue(
+                "c2", 4, 8, "The recommendation agent updates the list.",
+                "推荐代理会更新列表。",
+            ),
+        ]
+        terminology = [TerminologyEntry(
+            "recommendation agent", TerminologyStrategy.TRANSLATE,
+            target="推荐智能体", alternatives=["推荐代理"],
+            rationale="Both sentences describe one ranking component.",
         )]
-        translator = NaturalSubtitleTranslator(object(), GeminiCritic())
 
-        trace = translator.segment_interview_subtitle_cards(cues, [])
+        before = [cue.translation for cue in cues]
+        enforced = NaturalSubtitleTranslator._enforce_terminology_contract(
+            cues, terminology,
+        )
+        errors = terminology_contract_errors(cues, terminology)
 
-        self.assertEqual(trace["step"], "interview_semantic_subtitle_cards")
-        self.assertFalse(trace["fallback_used"])
-        self.assertEqual(len(cues), 3)
+        self.assertEqual(enforced, [])
+        self.assertEqual([cue.translation for cue in cues], before)
+        self.assertTrue(any("recommendation agent:c2" in error for error in errors))
+
+
+    def test_preserve_decision_is_reviewed_and_revised_before_translation(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, max_tokens):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                self.assert_prompt(prompt)
+                return ({"terminology": [{
+                    "source": "openweight",
+                    "strategy": "translate",
+                    "target": "开放权重",
+                    "alternatives": [],
+                    "rationale": "此处与开源并列，特指权重公开。",
+                }]}, {"model": "translation-writer"})
+
+            @staticmethod
+            def assert_prompt(prompt):
+                if "Recent or emerging terminology does not automatically stay in English" not in prompt:
+                    raise AssertionError("revision prompt retained the planner's preserve bias")
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, max_tokens):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                terms, _ = json.JSONDecoder().raw_decode(
+                    prompt.split("Terms: ", 1)[1]
+                )
+                term = terms[0]
+                preserved = term["strategy"] == "preserve"
+                return ({"reviews": [{
+                    "source": "openweight",
+                    "pass": not preserved,
+                    "fidelity_score": 2 if preserved else 5,
+                    "naturalness_score": 2 if preserved else 5,
+                    "errors": (
+                        ["开放权重 is clear here; emerging is insufficient to preserve English"]
+                        if preserved else []
+                    ),
+                }]}, {"model": "independent-reviewer", "call": self.calls})
+
+        cues = [TranscriptCue(
+            "cue-1", 0, 5,
+            "Open-source openweight models can run locally.", "",
+        )]
+        terminology = [TerminologyEntry(
+            "openweight", TerminologyStrategy.PRESERVE,
+            target="openweight",
+            rationale="An emerging term without stable Chinese wording.",
+        )]
+        writer = Writer()
+        reviewer = Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, None, reviewer,
+        ).review_terminology_decisions(cues, terminology)
+
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(reviewer.calls, 2)
+        self.assertEqual(trace["attempt"], 2)
+        self.assertEqual(terminology[0].strategy, TerminologyStrategy.TRANSLATE)
+        self.assertEqual(terminology[0].target, "开放权重")
+        self.assertEqual(trace["decisions"][0]["target"], "开放权重")
+
+    def test_selected_subtitle_discovery_adds_unseen_contextual_term_only(self) -> None:
+        class Writer:
+            def _request_json(self, messages, max_tokens):
+                prompt = messages[-1]["content"]
+                self.prompt = prompt
+                return {"terminology": [{
+                    "source": "recommendation agent",
+                    "strategy": "translate",
+                    "target": "推荐智能体",
+                    "alternatives": ["推荐代理"],
+                    "rationale": "It ranks products from user signals as an AI task performer.",
+                }]}, {"model": "writer"}
+
+        cues = [TranscriptCue(
+            "cue-1", 0, 5,
+            "The recommendation agent ranks products from user signals.", "",
+        )]
+        terminology = [TerminologyEntry(
+            "agent", TerminologyStrategy.TRANSLATE, target="智能体",
+        )]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(writer).discover_missing_terminology(
+            cues, terminology,
+        )
+
+        self.assertEqual(trace["added_sources"], ["recommendation agent"])
+        self.assertEqual(terminology[-1].target, "推荐智能体")
+        self.assertIn("Do not select a clip", writer.prompt)
+
+    def test_selected_subtitle_discovery_retries_sources_outside_fixed_passage(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, max_tokens):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"terminology": [{
+                        "source": "missing phrase", "strategy": "preserve",
+                        "target": "", "alternatives": [], "rationale": "not present",
+                    }]}, {"call": 1}
+                return {"terminology": []}, {"call": 2}
+
+        writer = Writer()
+        terminology: list[TerminologyEntry] = []
+        trace = NaturalSubtitleTranslator(writer).discover_missing_terminology(
+            [TranscriptCue("cue-1", 0, 4, "The model runs locally.", "")],
+            terminology,
+        )
+
+        self.assertEqual(writer.calls, 2)
+        self.assertEqual(trace["added_sources"], [])
+        self.assertEqual(terminology, [])
+
+    def test_malformed_terminology_review_retries_without_revising_decision(self) -> None:
+        class MustNotRevise:
+            def _request_json(self, *args, **kwargs):
+                raise AssertionError("review schema failure must not revise terminology")
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+
+            def _request_json(self, messages, max_tokens):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                self.prompts.append(prompt)
+                if self.calls == 1:
+                    return {"reviews": []}, {"model": "reviewer", "call": 1}
+                return {"reviews": [{
+                    "source": "recommendation agent", "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                }]}, {"model": "reviewer", "call": 2}
+
+        cues = [TranscriptCue(
+            "cue-1", 0, 5,
+            "The recommendation agent ranks products from user signals.", "",
+        )]
+        terminology = [TerminologyEntry(
+            "recommendation agent", TerminologyStrategy.TRANSLATE,
+            target="推荐智能体",
+            rationale="It ranks products from signals as an AI task performer.",
+        )]
+        reviewer = Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            MustNotRevise(), None, reviewer,
+        ).review_terminology_decisions(cues, terminology)
+
+        self.assertEqual(reviewer.calls, 2)
+        self.assertEqual(terminology[0].target, "推荐智能体")
+        self.assertEqual(len(trace["review_structure_failures"]), 1)
+        self.assertIn(
+            "previous reviewer response failed deterministic structure validation",
+            reviewer.prompts[1],
+        )
+
+
+
+
+
+
+
+    def test_joint_interview_translation_chooses_boundaries_and_translates_once(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, *args, **kwargs):
+                self.calls += 1
+                return {"cards": [
+                    {"end_word": 10, "text": "这条中文字幕虽然已经超过旧的三十二字限制但在当前显示时间里仍然完全可以读完。"},
+                    {"end_word": 20, "text": "第二张卡继续表达后半段意思。"},
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = (
+            "one two three four five six seven eight nine ten eleven twelve "
+            "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+        )
+        cues = [TranscriptCue("cue-1", 0, 12, source)]
+        words = source_words_from_cues(cues)
+        writer, reviewer = Writer(), Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(cues, [], words)
+
+        self.assertEqual(trace["translation_passes"], 1)
+        self.assertEqual(trace["repair_rounds"], 0)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(reviewer.calls, 1)
         self.assertEqual(" ".join(cue.source_text for cue in cues), source)
-        self.assertAlmostEqual(cues[0].start, 0)
-        self.assertAlmostEqual(cues[-1].end, 14.2)
-        self.assertTrue(all(
-            cue.duration <= INTERVIEW_CAPTION_HARD_MAX_SECONDS for cue in cues
-        ))
-        self.assertTrue(all(
-            len(cue.source_text.split()) <= INTERVIEW_CAPTION_MAX_ENGLISH_WORDS
-            for cue in cues
-        ))
-        self.assertTrue(all(
-            len(re.sub(r"\s+", "", cue.translation))
-            <= INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS
-            for cue in cues
-        ))
+        self.assertEqual(sum(len(cue.source_tokens) for cue in cues), 20)
+        self.assertGreater(len(re.sub(r"\s+", "", cues[0].translation)), 32)
 
-    def test_semantic_card_review_retries_dependent_translated_chinese(self) -> None:
-        class ChineseTranslator:
-            def __init__(self):
+    def test_joint_interview_translation_repairs_only_failed_window(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
                 self.calls = 0
 
             def _request_json(self, *args, **kwargs):
                 self.calls += 1
                 if self.calls == 1:
-                    rows = [
-                        {"id": "cue-1-card-1", "text": "这可能是需要扩大规模的芯片供应链"},
-                        {"id": "cue-1-card-2", "text": "以便应用可以上线"},
+                    cards = [
+                        {"end_word": 10, "text": "这" * 80 + "。"},
+                        {"end_word": 20, "text": "后半段保持事实并顺畅收尾。"},
                     ]
                 else:
-                    rows = [
-                        {"id": "cue-1-card-1", "text": "芯片供应链需要提前扩容"},
-                        {"id": "cue-1-card-2", "text": "扩容完成后，应用才能上线"},
+                    cards = [
+                        {"end_word": 7, "text": "前段经过局部修复。"},
+                        {"end_word": 14, "text": "中段可以正常阅读。"},
+                        {"end_word": 20, "text": "后段顺畅收尾。"},
                     ]
-                return ({"translations": rows}, {"model": "chinese-translator"})
-
-        class FidelityReviewer:
-            def _request_json(self, messages, max_tokens):
-                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
-                reviews = []
-                for row in rows:
-                    text = row["chinese"]
-                    reviews.append({
-                        "id": row["id"],
-                        "pass": not text.startswith("这可能是") and not text.startswith("以便"),
-                        "fidelity_score": 5,
-                        "naturalness_score": (
-                            5 if not text.startswith(("这可能是", "以便")) else 2
-                        ),
-                        "errors": [] if not text.startswith(("这可能是", "以便")) else ["not standalone"],
-                    })
-                return ({"reviews": reviews}, {"model": "fidelity-reviewer"})
-
-        translator = ChineseTranslator()
-        cues = [TranscriptCue(
-            "cue-1", 0, 10,
-            "the chips supply chain has to scale up and then applications can launch.",
-            "芯片供应链要扩容，应用才能上线。",
-        )]
-        terms = [
-            TerminologyEntry("chips", TerminologyStrategy.TRANSLATE, target="芯片"),
-            TerminologyEntry("applications", TerminologyStrategy.TRANSLATE, target="应用"),
-        ]
-
-        trace = NaturalSubtitleTranslator(
-            translator, FidelityReviewer(),
-        ).segment_interview_subtitle_cards(cues, terms)
-
-        self.assertEqual(translator.calls, 2)
-        self.assertFalse(trace["fallback_used"])
-        self.assertEqual([cue.translation for cue in cues], [
-            "芯片供应链需要提前扩容。", "扩容完成后，应用才能上线。",
-        ])
-
-    def test_semantic_fallback_keeps_parent_when_clause_terms_are_misaligned(self) -> None:
-        class InvalidCritic:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": []}, {"model": "unavailable-copy"})
-
-        source = (
-            "infrastructure capacity must scale and supply chain capacity must grow."
-        )
-        cues = [TranscriptCue(
-            "cue-1", 0, 12, source,
-            "供应链必须扩容，基础设施容量也必须增长。",
-        )]
-        terms = [
-            TerminologyEntry(
-                "infrastructure", TerminologyStrategy.TRANSLATE, target="基础设施",
-            ),
-            TerminologyEntry(
-                "supply chain", TerminologyStrategy.TRANSLATE, target="供应链",
-            ),
-        ]
-
-        trace = NaturalSubtitleTranslator(
-            object(), InvalidCritic(),
-        ).segment_interview_subtitle_cards(cues, terms)
-
-        self.assertTrue(trace["fallback_used"])
-        self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0].id, "cue-1")
-        self.assertEqual(cues[0].source_text, source)
-
-    def test_independent_fidelity_review_corrects_temporal_meaning(self) -> None:
-        class ChineseTranslator:
-            def __init__(self):
-                self.calls = 0
-                self.requested_ids = []
-
-            def _request_json(self, messages, max_tokens):
-                self.calls += 1
-                second = (
-                    "我们需要随时部署算力"
-                    if self.calls == 1 else "准备部署算力时，配套资源必须就绪"
-                )
-                prompt = messages[-1]["content"]
-                requested, _ = json.JSONDecoder().raw_decode(prompt.split("Cards: ", 1)[1])
-                requested_ids = {row["id"] for row in requested}
-                self.requested_ids.append(requested_ids)
-                rows = [
-                    {"id": "cue-1-card-1", "text": "供应链需要提前扩容"},
-                    {"id": "cue-1-card-2", "text": second},
-                ]
-                return ({"translations": [
-                    row for row in rows if row["id"] in requested_ids
-                ]}, {"model": "chinese-translator"})
-
-        class FidelityReviewer:
-            def _request_json(self, messages, max_tokens):
-                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
-                return ({"reviews": [{
-                    "id": row["id"],
-                    "pass": "随时" not in row["chinese"],
-                    "fidelity_score": 2 if "随时" in row["chinese"] else 5,
-                    "naturalness_score": 5,
-                    "errors": ["temporal meaning changed"] if "随时" in row["chinese"] else [],
-                } for row in rows]}, {"model": "native-fidelity"})
-
-        class DirectingMustNotReview:
-            def _request_json(self, *args, **kwargs):
-                raise AssertionError("directing critic must not audit subtitle copy")
-
-        cues = [TranscriptCue(
-            "cue-1", 0, 10,
-            "the supply chain has to scale up so when we're ready to deploy compute resources are ready.",
-            "供应链要扩容，部署算力时配套资源要就绪。",
-        )]
-
-        translator = ChineseTranslator()
-        trace = NaturalSubtitleTranslator(
-            translator, DirectingMustNotReview(), FidelityReviewer(),
-        ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertEqual(cues[1].translation, "准备部署算力时，配套资源必须就绪。")
-        self.assertNotIn("随时", cues[1].translation)
-        self.assertEqual(translator.requested_ids, [
-            {"cue-1-card-1", "cue-1-card-2"}, {"cue-1-card-2"},
-        ])
-        self.assertEqual(
-            trace["fidelity_review_provenance"]["model"], "native-fidelity",
-        )
-
-    def test_reviewer_cannot_approve_merely_understandable_chinese_at_score_three(self) -> None:
-        class ChineseTranslator:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, messages, max_tokens):
-                self.calls += 1
-                first = "利润沿技术栈向上移动" if self.calls == 1 else "利润会向应用层转移"
-                prompt = messages[-1]["content"]
-                requested, _ = json.JSONDecoder().raw_decode(prompt.split("Cards: ", 1)[1])
-                requested_ids = {row["id"] for row in requested}
-                rows = [
-                    {"id": "cue-1-card-1", "text": first},
-                    {"id": "cue-1-card-2", "text": "企业能长期获得超额利润"},
-                ]
-                return ({"translations": [
-                    row for row in rows if row["id"] in requested_ids
-                ]}, {"model": "chinese-translator"})
-
-        class StrictReviewer:
-            def _request_json(self, messages, max_tokens):
-                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
-                return ({"reviews": [{
-                    "id": row["id"], "pass": True, "fidelity_score": 5,
-                    "naturalness_score": 3 if "技术栈" in row["chinese"] else 5,
-                    "errors": ["literal metaphor"] if "技术栈" in row["chinese"] else [],
-                } for row in rows]}, {"model": "strict-reviewer"})
-
-        translator = ChineseTranslator()
-        cues = [TranscriptCue(
-            "cue-1", 0, 10,
-            "earnings move up the stack toward applications and companies can over earn for longer.",
-            "利润向应用层转移，企业能长期获得超额利润。",
-        )]
-
-        NaturalSubtitleTranslator(
-            translator, StrictReviewer(),
-        ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertEqual(translator.calls, 2)
-        self.assertEqual(cues[0].translation, "利润会向应用层转移。")
-
-    def test_fidelity_reviewer_cannot_turn_maybe_into_frequency(self) -> None:
-        class ChineseTranslator:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": [
-                    {"id": "cue-1-card-1", "text": "我会寻找产业瓶颈"},
-                    {"id": "cue-1-card-2", "text": "供应链可能需要扩容"},
-                ]}, {"model": "chinese-translator"})
-
-        class RegressingReviewer:
-            def _request_json(self, messages, max_tokens):
-                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
-                return ({"reviews": [{
-                    "id": row["id"], "pass": True,
-                    "fidelity_score": 5, "naturalness_score": 5,
-                    "errors": [],
-                    # Even if an auditor suggests replacement copy, the
-                    # verdict-only contract must ignore it.
-                    "text": (
-                        "供应链往往需要扩容"
-                        if row["id"] == "cue-1-card-2" else row["chinese"]
-                    ),
-                } for row in rows]}, {"model": "native-fidelity"})
-
-        cues = [TranscriptCue(
-            "cue-1", 0, 10,
-            "I look for bottlenecks and maybe the supply chain needs to scale up.",
-            "我会寻找瓶颈，供应链可能需要扩容。",
-        )]
-
-        NaturalSubtitleTranslator(
-            ChineseTranslator(), None, RegressingReviewer(),
-        ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertIn("可能", cues[1].translation)
-        self.assertNotIn("往往", cues[1].translation)
-
-    def test_numeric_maybe_accepts_natural_approximation_wording(self) -> None:
-        errors = _semantic_card_translation_errors({
-            "id": "card",
-            "source": "maybe three or four leading companies were doing it.",
-            "duration_seconds": 4.0,
-        }, "大约三四家头部公司都在这样做。", [])
-
-        self.assertNotIn("modality", errors)
-
-    def test_configured_fidelity_reviewer_failure_never_publishes_unreviewed_cards(self) -> None:
-        class ChineseTranslator:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, *args, **kwargs):
-                self.calls += 1
-                return ({"translations": [
-                    {"id": "cue-1-card-1", "text": "我会寻找产业瓶颈"},
-                    {"id": "cue-1-card-2", "text": "供应链可能需要扩容"},
-                ]}, {"model": "chinese-translator"})
-
-        class UnavailableReviewer:
-            def _request_json(self, *args, **kwargs):
-                raise RuntimeError("review service unavailable")
-
-        cues = [TranscriptCue(
-            "cue-1", 0, 10,
-            "I look for bottlenecks and maybe the supply chain needs to scale up.",
-            "我会寻找瓶颈，供应链可能需要扩容。",
-        )]
-        translator = ChineseTranslator()
-
-        with self.assertRaisesRegex(
-            ValueError, "reviewed subtitle translation exhausted",
-        ):
-            NaturalSubtitleTranslator(
-                translator, None, UnavailableReviewer(),
-            ).segment_interview_subtitle_cards(cues, [])
-
-        self.assertEqual(translator.calls, 3)
-        self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0].id, "cue-1")
-
-    def test_audio_verified_card_is_retranslated_and_independently_reviewed(self) -> None:
-        class Translator:
-            def _request_json(self, messages, max_tokens):
-                self.assert_audio_source(messages[-1]["content"])
-                return ({"translations": [{
-                    "id": "cycle-card", "text": "算力产业的利润会逐渐向应用层转移",
-                }]}, {"provider": "kimi", "model": "k3"})
-
-            @staticmethod
-            def assert_audio_source(prompt):
-                if "The compute cycle" not in prompt:
-                    raise AssertionError(prompt)
+                return {"cards": cards}, {"model": "writer", "call": self.calls}
 
         class Reviewer:
-            def _request_json(self, messages, max_tokens):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
                 rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
-                return ({"reviews": [{
+                return {"reviews": [{
                     "id": row["id"], "pass": True,
-                    "fidelity_score": 0.9, "naturalness_score": 0.9, "errors": [],
-                } for row in rows]}, {"provider": "deepseek", "model": "deepseek-chat"})
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
 
-        cues = [TranscriptCue(
-            "cycle-card", 0, 8,
-            "The compet cycle moves earnings toward the application layer",
-            "计算周期把利润推向应用层。",
-        )]
-        audit = {"corrections": [{
-            "cue_id": "cycle-card",
-            "source": cues[0].source_text,
-            "verified_source": (
-                "The compute cycle moves earnings toward the application layer"
-            ),
-            "reasons": ["unknown_cycle_modifier:compet"],
-        }]}
+        source = " ".join(f"word{index}" for index in range(1, 21))
+        cues = [TranscriptCue("cue-1", 0, 12, source)]
+        words = source_words_from_cues(cues)
+        writer = Writer()
+        reviewer = Reviewer()
 
         trace = NaturalSubtitleTranslator(
-            Translator(), None, Reviewer(),
-        ).repair_audio_verified_cards(cues, [], audit)
+            writer, subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(cues, [], words)
 
-        self.assertEqual(
-            cues[0].source_text,
-            "The compute cycle moves earnings toward the application layer",
+        self.assertEqual(writer.calls, 2)
+        self.assertEqual(reviewer.calls, 1)
+        self.assertEqual(trace["repair_rounds"], 1)
+        self.assertEqual(len(cues), 3)
+        self.assertNotIn("这" * 40, cues[0].translation)
+
+    def test_joint_translation_retries_malformed_review_without_retranslating(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, *args, **kwargs):
+                self.calls += 1
+                return {"cards": [
+                    {"end_word": 10, "text": "前半段忠实表达原意。"},
+                    {"end_word": 20, "text": "后半段继续完整表达。"},
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                self.prompts.append(prompt)
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                if self.calls == 1:
+                    rows = rows[:1]
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer", "call": self.calls}
+
+        source = " ".join(f"word{index}" for index in range(1, 21))
+        cues = [TranscriptCue("cue-1", 0, 12, source)]
+        writer, reviewer = Writer(), Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(
+            cues, [], source_words_from_cues(cues),
         )
-        self.assertEqual(cues[0].translation, "算力产业的利润会逐渐向应用层转移。")
-        self.assertEqual(trace["cue_ids"], ["cycle-card"])
 
-    def test_audio_verified_unchanged_card_keeps_reviewed_translation(self) -> None:
-        class MustNotCall:
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(reviewer.calls, 2)
+        self.assertEqual(trace["repair_rounds"], 0)
+        self.assertIn(
+            "previous reviewer response failed deterministic structure validation",
+            reviewer.prompts[1],
+        )
+
+    def test_joint_repair_requires_an_extra_card_after_hard_duration_failure(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                self.prompts.append(prompt)
+                ends = (
+                    [8, 25, 33] if len(self.prompts) == 1
+                    else [8, 25, 29, 33] if len(self.prompts) == 2
+                    else [8, 16, 24, 33]
+                )
+                return {"cards": [
+                    {"end_word": end, "text": "这段内容。"}
+                    for index, end in enumerate(ends, start=1)
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.local_ids: list[str] = []
+                self.global_calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    self.global_calls += 1
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                self.local_ids.extend(row["id"] for row in rows)
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 34))
+        cues = [TranscriptCue("cue-1", 0, 18, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(len(writer.prompts), 3)
+        self.assertIn("Return 4–", writer.prompts[1])
+        self.assertIn("Deterministic boundary failure", writer.prompts[2])
+        self.assertEqual(len(cues), 4)
+        self.assertEqual(trace["repair_rounds"], 1)
+        self.assertFalse(interview_caption_duration_errors(cues))
+
+    def test_joint_interview_translation_retries_invalid_initial_structure(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                self.prompts.append(messages[-1]["content"])
+                if self.calls == 1:
+                    return {"cards": []}, {"model": "writer", "call": 1}
+                return {"cards": [
+                    {"end_word": 10, "text": "前半段保留原文事实。"},
+                    {"end_word": 20, "text": "后半段完成这个说明。"},
+                ]}, {"model": "writer", "call": 2}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 21))
+        cues = [TranscriptCue("cue-1", 0, 12, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(writer.calls, 2)
+        self.assertEqual(trace["translation_passes"], 1)
+        self.assertEqual(trace["attempts"][0]["window_count"], 1)
+        self.assertEqual(
+            trace["attempts"][0]["windows"][0]["request_attempts"], 2,
+        )
+        self.assertEqual(len(trace["attempts"][0]["earlier_structure_failures"]), 1)
+        self.assertIn("Previous rejection (mandatory:", writer.prompts[1])
+        self.assertEqual(" ".join(cue.source_text for cue in cues), source)
+
+    def test_joint_interview_translation_partitions_large_initial_request(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.window_sizes: list[int] = []
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                rows = json.loads(
+                    prompt.split("Source words: ", 1)[1].split("\nNext source:", 1)[0]
+                )
+                self.window_sizes.append(len(rows))
+                ends = list(range(10, len(rows), 10)) + [len(rows)]
+                return {"cards": [
+                    {"end_word": end, "text": "这段内容。"}
+                    for index, end in enumerate(ends, start=1)
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.local_ids: list[str] = []
+                self.global_calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    self.global_calls += 1
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                self.local_ids.extend(row["id"] for row in rows)
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 302))
+        cues = [TranscriptCue("cue-1", 0, 181, source)]
+        writer = Writer()
+        reviewer = Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(len(writer.window_sizes), 3)
+        self.assertTrue(all(size <= 150 for size in writer.window_sizes))
+        self.assertEqual(trace["translation_passes"], 1)
+        self.assertEqual(" ".join(cue.source_text for cue in cues), source)
+        self.assertEqual(sorted(reviewer.local_ids), sorted(cue.id for cue in cues))
+        self.assertEqual(len(reviewer.local_ids), len(set(reviewer.local_ids)))
+        self.assertEqual(reviewer.global_calls, 1)
+
+    def test_joint_caption_scopes_preserve_editorial_plan_and_cut_boundaries(self) -> None:
+        class Writer:
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                rows = json.loads(
+                    prompt.split("Source words: ", 1)[1].split("\nNext source:", 1)[0]
+                )
+                return {"cards": [
+                    {"end_word": len(rows) // 2, "text": "这一段先说明系统变化。"},
+                    {"end_word": len(rows), "text": "随后说明团队如何响应。"},
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        cues = [
+            TranscriptCue("a", 0, 10, "one two [laughter] three four five six seven eight nine ten"),
+            TranscriptCue("b", 10, 20, "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"),
+        ]
+        plan = {
+            "editorial_mode": "technical_coverage",
+            "collection_title": "固定策划",
+            "bilibili_chapters": [],
+            "wechat_lessons": [
+                {"title": "第一段", "start": 0, "end": 10,
+                 "hook_headlines": ["甲", "乙", "丙"]},
+                {"title": "第二段", "start": 10, "end": 20,
+                 "hook_headlines": ["丁", "戊", "己"]},
+            ],
+        }
+        original_plan = json.loads(json.dumps(plan, ensure_ascii=False))
+
+        trace = NaturalSubtitleTranslator(
+            Writer(), subtitle_reviewer=Reviewer(),
+        ).translate_caption_scopes(
+            cues, [], plan, 20, "technical_coverage",
+        )
+
+        self.assertEqual(plan, original_plan)
+        self.assertEqual(trace["scope_count"], 2)
+        self.assertTrue(trace["cross_scope_consistency_review"]["pass"])
+        self.assertTrue(all(cue.end <= 10 or cue.start >= 10 for cue in cues))
+        self.assertTrue(all(cue.id.startswith("caption-scope-") for cue in cues))
+        self.assertNotIn("laughter", " ".join(cue.source_text for cue in cues))
+
+    def test_subtitle_resegmentation_cannot_reselect_frozen_hook(self) -> None:
+        plan = {
+            "editorial_mode": "technical_coverage",
+            "wechat_lessons": [{
+                "title": "系统设计决定交付速度", "thesis": "团队必须自动验证改动。",
+                "start": 0, "end": 20,
+                "hook_headlines": [
+                    "系统瓶颈不在模型", "自动验证决定交付速度", "工具链减少团队返工",
+                ],
+            }],
+        }
+        original = [
+            TranscriptCue("raw-a", 0, 8, "The system must validate every code change."),
+            TranscriptCue("raw-b", 10, 18, "Automation reduces expensive team rework."),
+        ]
+        snapshot = _snapshot_plan_hooks(plan, 20, original)
+        before = snapshot["wechat:1"][0]
+        final_cards = [
+            TranscriptCue("card-1", 0, 4, "The system must validate", "系统必须验证。"),
+            TranscriptCue("card-2", 4, 8, "every code change.", "每次代码改动。"),
+            TranscriptCue("card-3", 10, 18, "Automation reduces expensive team rework.", "自动化减少返工。"),
+        ]
+
+        remapped = _remap_hook_snapshot(
+            snapshot["wechat:1"], final_cards, "final-item",
+        )
+
+        self.assertEqual(remapped[0].headline_zh, before.headline_zh)
+        self.assertEqual(remapped[0].source_range, before.source_range)
+        self.assertNotEqual(remapped[0].source_cue_ids, before.source_cue_ids)
+        self.assertTrue(set(remapped[0].source_cue_ids) <= {cue.id for cue in final_cards})
+
+    def test_joint_interview_translation_omits_fillers_before_review(self) -> None:
+        class Writer:
             def _request_json(self, *args, **kwargs):
-                raise AssertionError("unchanged audio evidence must not trigger a rewrite")
+                return {"cards": [{
+                    "end_word": 8, "text": "呃，你知道，我是说，我们现在发布。",
+                }]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.chinese = ""
+
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                self.chinese = rows[0]["chinese"]
+                return {"reviews": [{
+                    "id": rows[0]["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                }]}, {"model": "reviewer"}
 
         cues = [TranscriptCue(
-            "benchmark-card", 0, 5,
-            "AI labs use coding as as a competitive benchmark",
-            "AI 实验室把编程作为竞争性基准测试。",
+            "cue-1", 0, 4, "Um, you know, I mean, we ship now.",
         )]
-        audit = {"corrections": [{
-            "cue_id": "benchmark-card",
-            "source": cues[0].source_text,
-            "verified_source": cues[0].source_text,
-            "reasons": ["repeated_content_word:as"],
-            "changed": False,
-        }]}
+        reviewer = Reviewer()
 
-        trace = NaturalSubtitleTranslator(
-            MustNotCall(), None, MustNotCall(),
-        ).repair_audio_verified_cards(cues, [], audit)
+        NaturalSubtitleTranslator(
+            Writer(), subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
 
-        self.assertIsNone(trace)
-        self.assertEqual(cues[0].translation, "AI 实验室把编程作为竞争性基准测试。")
+        self.assertEqual(cues[0].translation, "我们现在发布。")
+        self.assertEqual(reviewer.chinese, "我们现在发布。")
 
-    def test_audio_verified_duplicate_cleanup_keeps_reviewed_translation(self) -> None:
-        class MustNotCall:
-            def _request_json(self, *args, **kwargs):
-                raise AssertionError("duplicate cleanup must not trigger a rewrite")
-
-        cues = [TranscriptCue(
-            "card", 0, 3.5,
-            "The best thing I can think of is is really",
-            "我能想到的最好办法。",
-        )]
-        audit = {"corrections": [{
-            "cue_id": "card",
-            "source": cues[0].source_text,
-            "verified_source": "The best thing I can think of is really",
-            "reasons": ["repeated_content_word:is"],
-            "changed": True,
-        }]}
-
-        trace = NaturalSubtitleTranslator(
-            MustNotCall(), None, MustNotCall(),
-        ).repair_audio_verified_cards(cues, [], audit)
-
-        self.assertEqual(trace["duplicate_cleanup_cue_ids"], ["card"])
-        self.assertEqual(cues[0].source_text, "The best thing I can think of is really")
-        self.assertEqual(cues[0].translation, "我能想到的最好办法。")
-
-    def test_audio_verified_dangling_fragment_merges_into_accepted_payoff(self) -> None:
-        class MustNotCall:
-            def _request_json(self, *args, **kwargs):
-                raise AssertionError("dangling fragment merge must remain model-free")
-
-        preferred = "长期来看，行业利润会逐渐向应用层转移。"
-        cues = [
-            TranscriptCue(
-                "cycle-card-1", 85.0, 87.0,
-                "The compet cycle tends to be though", "竞争周期通常如此。",
-            ),
-            TranscriptCue(
-                "cycle-card-2", 87.0, 92.8,
-                "that earnings over long stretches move toward the application layer",
-                preferred,
-            ),
-        ]
-        audit = {"corrections": [{
-            "cue_id": "cycle-card-1",
-            "source": cues[0].source_text,
-            "verified_source": "cycle tends to be",
-            "reasons": ["unknown_cycle_modifier:compet"],
-        }]}
-
-        trace = NaturalSubtitleTranslator(
-            MustNotCall(), None, MustNotCall(),
-        ).repair_audio_verified_cards(cues, [], audit)
-
-        self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0].id, "cycle-card-2")
-        self.assertEqual(cues[0].start, 85.0)
-        self.assertEqual(cues[0].translation, preferred)
-        self.assertTrue(cues[0].source_text.startswith("cycle tends to be that earnings"))
-        self.assertEqual(trace["merged_fragments"][0]["removed_cue_id"], "cycle-card-1")
-
-    def test_final_chinese_style_gate_does_not_rewrite_without_specific_error(self) -> None:
-        class MustNotRun:
-            def _request_json(self, *args, **kwargs):
-                raise AssertionError("global style rewrite must not run")
-
-        cues = [
-            TranscriptCue(
-                "country", 0, 5, "what about the other layers across the United States?",
-                "全美其他层面怎么办。",
-            ),
-            TranscriptCue(
-                "downstream", 5, 8, "Now I'm doing downstream.",
-                "我现在往下游做。",
-            ),
-            TranscriptCue(
-                "cycle", 8, 12, "The competitive cycle tends to move earnings up the stack.",
-                "竞争周期往往是，利润向上转移。",
-            ),
-            TranscriptCue(
-                "cycle_owner", 12, 16, "Earnings move during the competitive cycle.",
-                "竞争周期的利润会向应用层转移。",
-            ),
-        ]
-        trace = NaturalSubtitleTranslator(
-            MustNotRun(), MustNotRun(),
-        ).repair_interview_chinese_style(cues, [])
-
-        self.assertIsNone(trace)
-        self.assertEqual(cues[1].translation, "我现在往下游做。")
-
-    def test_final_chinese_style_gate_repairs_post_terminology_density(self) -> None:
-        class CapturingWriter:
+    def test_joint_translation_uses_audio_hypothesis_only_as_conflict_evidence(self) -> None:
+        class Writer:
             def __init__(self) -> None:
                 self.prompt = ""
 
             def _request_json(self, messages, **kwargs):
                 self.prompt = messages[-1]["content"]
-                return {
-                    "translations": [{
-                        "id": "data-center-card-1",
-                        "text": "data center：数据中心开放了。",
-                    }],
-                }, {"provider": "test"}
+                return {"cards": [{
+                    "end_word": 8, "text": "这些非常信奉 AI 的创始人会运行编码智能体。",
+                }]}, {"model": "writer"}
 
-        writer = CapturingWriter()
-        cues = [TranscriptCue(
-            "data-center-card-1", 0, 4,
-            "the data center opened",
-            "这是一个为了触发术语补全后密度门而故意写得特别特别长的中文测试句子。",
-        )]
-        terminology = [TerminologyEntry(
-            "data center", TerminologyStrategy.BILINGUAL_ONCE,
-            first_use_explanation="数据中心",
-        )]
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": rows[0]["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                }]}, {"model": "reviewer"}
+
+        source = "These founders are super AID run coding agents."
+        cues = [TranscriptCue("cue-1", 0, 5, source)]
+        writer = Writer()
+
+        NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(
+            cues, [], source_words_from_cues(cues), "alignment",
+            "These founders are super AI-pilled, running coding agents.",
+        )
+
+        self.assertIn("Nearby audio ASR hypothesis", writer.prompt)
+        self.assertIn("AI-pilled", writer.prompt)
+        self.assertEqual(cues[0].source_text, source)
+
+    def test_joint_translation_surfaces_numeric_audio_conflict_before_review(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.prompt = ""
+
+            def _request_json(self, messages, **kwargs):
+                self.prompt = messages[-1]["content"]
+                return {"cards": [{
+                    "end_word": 9, "text": "排名前 1% 的用户每月支出 903 美元。",
+                }]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": rows[0]["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                }]}, {"model": "reviewer"}
+
+        source = "The top 1% user is spending $93 per month."
+        cues = [TranscriptCue("cue-1", 0, 5, source)]
+        writer = Writer()
 
         trace = NaturalSubtitleTranslator(
-            writer, None,
-        ).repair_interview_chinese_style(cues, terminology)
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(
+            cues, [], source_words_from_cues(cues), "alignment",
+            "The top 1% user is spending $903 per month.",
+        )
 
-        self.assertEqual(trace["step"], "interview_chinese_style_repair")
-        self.assertEqual(cues[0].translation, "data center：数据中心开放了。")
-        self.assertLessEqual(
-            len(re.sub(r"\s+", "", cues[0].translation)),
-            INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS,
+        self.assertIn('Numeric conflict evidence', writer.prompt)
+        self.assertIn('"93"', writer.prompt)
+        self.assertIn('"903"', writer.prompt)
+        ownership = json.loads(
+            writer.prompt.split("Entity ownership: ", 1)[1].split("\nMandatory split ranges:", 1)[0]
         )
-        self.assertIn("first_use_explanation", writer.prompt)
-        self.assertIn(
-            f"within {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS} visible characters",
-            writer.prompt,
+        self.assertNotIn("93", {row["entity"] for row in ownership})
+        self.assertEqual(trace["audio_conflict_numbers"], ["93"])
+        self.assertEqual(trace["audio_only_numbers"], ["903"])
+        self.assertEqual(
+            trace["numeric_conflict_pairs"][0]["source_value"], "93",
         )
+        self.assertEqual(
+            trace["numeric_conflict_pairs"][0]["audio_candidate"], "903",
+        )
+        self.assertEqual(cues[0].source_text, source)
+        self.assertIn("903", cues[0].translation)
+
+    def test_numeric_audio_conflicts_pair_only_unambiguous_local_replacements(self) -> None:
+        source = "Price moved from 93 dollars to 15 dollars today."
+        cues = [TranscriptCue("cue-1", 0, 6, source)]
+
+        pairs = _numeric_audio_conflict_pairs(
+            source_words_from_cues(cues),
+            "Price moved from 903 dollars to 50 dollars today.",
+        )
+
+        self.assertEqual(
+            [(row["source_value"], row["audio_candidate"]) for row in pairs],
+            [("93", "903"), ("15", "50")],
+        )
+
+        ambiguous = _numeric_audio_conflict_pairs(
+            source_words_from_cues([TranscriptCue(
+                "cue-2", 0, 5, "The values are 10 and 20 today.",
+            )]),
+            "The values are 100 200 and 300 today.",
+        )
+        self.assertEqual(ambiguous, [])
+
+    def test_numeric_ownership_rejects_missing_and_moved_values(self) -> None:
+        words = source_words_from_cues([
+            TranscriptCue("cue-1", 0, 3, "The cost is 93 dollars."),
+        ])
+
+        errors = _caption_numeric_alignment_errors(
+            words, 0, len(words), "价格是 94 美元。", [],
+        )
+
+        self.assertIn("missing_number:93@4", errors)
+        self.assertIn("moved_number:94", errors)
+
+    def test_numeric_audio_exception_is_bound_to_one_source_occurrence(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.prompt = ""
+
+            def _request_json(self, messages, **kwargs):
+                self.prompt = messages[-1]["content"]
+                return {"cards": [{
+                    "end_word": 12, "text": "标价是 903 美元，后面又提到 93 美元。",
+                }]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": rows[0]["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                }]}, {"model": "reviewer"}
+
+        source = "The listed price 93 dollars today and repeated price 93 dollars later."
+        cues = [TranscriptCue("cue-1", 0, 7, source)]
+        writer = Writer()
+        NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(
+            cues, [], source_words_from_cues(cues), "alignment",
+            "The listed price 903 dollars today and repeated price 93 dollars later.",
+        )
+
+        ownership = json.loads(
+            writer.prompt.split("Entity ownership: ", 1)[1].split(
+                "\nMandatory split ranges:", 1,
+            )[0]
+        )
+        numeric = next(row for row in ownership if row["entity"] == "93")
+        self.assertEqual(numeric["source_word_start_indices"], [10])
+
+    def test_numeric_audio_pair_is_rebased_inside_later_writer_window(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.pairs: list[list[dict]] = []
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                evidence = json.loads(
+                    prompt.split("Numeric conflict evidence: ", 1)[1].split(
+                        ". Authoritative English", 1,
+                    )[0]
+                )
+                self.pairs.append(evidence["locally_aligned_pairs"])
+                rows = json.loads(
+                    prompt.split("Source words: ", 1)[1].split("\nNext source:", 1)[0]
+                )
+                ends = list(range(10, len(rows), 10)) + [len(rows)]
+                cards = []
+                left = 0
+                for end in ends:
+                    contains_conflict = any(
+                        row["word"] == "93" for row in rows[left:end]
+                    )
+                    cards.append({
+                        "end_word": end,
+                        "text": "音频值是 903。" if contains_conflict else "这段内容。",
+                    })
+                    left = end
+                return {"cards": cards}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        tokens = [f"word{index}" for index in range(1, 181)]
+        tokens[159] = "93"
+        audio_tokens = list(tokens)
+        audio_tokens[159] = "903"
+        source = " ".join(tokens)
+        cues = [TranscriptCue("cue-1", 0, 108, source)]
+        writer = Writer()
+
+        NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(
+            cues, [], source_words_from_cues(cues), "alignment",
+            " ".join(audio_tokens),
+        )
+
+        nonempty = [pairs for pairs in writer.pairs if pairs]
+        self.assertEqual(len(nonempty), 1)
+        self.assertEqual(nonempty[0][0]["source_word_index"], 40)
+
+    def test_translation_trace_archive_keeps_inline_trace_compact(self) -> None:
+        trace = [{
+            "step": "interview_joint_boundary_translation",
+            "alignment_fingerprint": "abc",
+            "attempts": [{"failed_cards": ["large payload"]}],
+        }]
+
+        compact = _compact_translation_trace(trace)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = _write_translation_audit(root, trace)
+            payload = json.loads((root / audit["asset"]).read_text())
+            plan_path = root / "translation-plan.json"
+            restored = _translation_trace_from_plan(plan_path, {
+                "trace": compact, "translation_audit": audit,
+            })
+
+        self.assertNotIn("attempts", compact[0])
+        self.assertEqual(compact[0]["alignment_fingerprint"], "abc")
+        self.assertEqual(payload["trace"], trace)
+        self.assertEqual(restored, trace)
+        self.assertEqual(audit["bytes"], len(
+            (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        ))
+
+    def test_non_speech_laughter_and_cough_are_removed_from_publishable_source(self) -> None:
+        self.assertEqual(
+            omit_non_speech_directions("[laughter] Hello. 【咳嗽】 We can begin."),
+            "Hello. We can begin.",
+        )
+
+    def test_joint_interview_translation_deterministically_coalesces_short_entity_card(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, *args, **kwargs):
+                self.calls += 1
+                return {"cards": [
+                    {"end_word": 9, "text": "系统随后调用 API。"},
+                    {"end_word": 10, "text": "接口。"},
+                    {"end_word": 20, "text": "其余请求继续按原路径处理。"},
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        tokens = [f"word{index}" for index in range(1, 21)]
+        tokens[9] = "API"
+        source = " ".join(tokens)
+        cues = [TranscriptCue("cue-1", 0, 12, source)]
+        words = source_words_from_cues(cues)
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], words)
+
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(len(cues), 2)
+        self.assertIn("API", cues[0].source_text)
+        self.assertTrue(any(
+            item["kind"] == "deterministic_boundary_coalesce"
+            for item in trace["attempts"]
+        ))
+
+    def test_joint_interview_translation_coalesces_toward_nonadjacent_entity_owner(self) -> None:
+        class Writer:
+            def _request_json(self, *args, **kwargs):
+                return {"cards": [
+                    {"end_word": 4, "text": "系统会调用 API。"},
+                    {"end_word": 8, "text": "随后检查权限。"},
+                    {"end_word": 12, "text": "最后执行接口请求。"},
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        tokens = [f"word{index}" for index in range(1, 13)]
+        tokens[8] = "API"
+        source = " ".join(tokens)
+        cues = [TranscriptCue("cue-1", 0, 7.2, source)]
+
+        NaturalSubtitleTranslator(
+            Writer(), subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(len(cues), 1)
+        self.assertIn("API", cues[0].source_text)
+
+    def test_joint_repair_window_expands_to_distant_entity_owner(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, *args, **kwargs):
+                self.calls += 1
+                first = "系统调用 API。" if self.calls == 1 else "系统先检查权限。"
+                return {"cards": [
+                    {"end_word": 10, "text": first},
+                    {"end_word": 20, "text": "随后准备请求。"},
+                    {"end_word": 30, "text": "最后调用 API。"},
+                ]}, {"model": "writer", "call": self.calls}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        tokens = [f"word{index}" for index in range(1, 31)]
+        tokens[25] = "API"
+        source = " ".join(tokens)
+        cues = [TranscriptCue("cue-1", 0, 18, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(writer.calls, 2)
+        self.assertEqual(trace["repair_rounds"], 1)
+        self.assertNotIn("API", cues[0].translation)
+        self.assertIn("API", cues[-1].source_text)
+
+    def test_acronym_plural_owns_same_singular_chinese_entity(self) -> None:
+        self.assertEqual(
+            _caption_entity_alignment_errors(
+                "We inspect internal APIs and services.",
+                "我们会检查内部 API 和服务。",
+            ),
+            [],
+        )
+
+    def test_compact_preserved_term_matches_spaced_source_variant(self) -> None:
+        terminology = [TerminologyEntry(
+            "openweight", TerminologyStrategy.PRESERVE, target="openweight",
+            rationale="The video uses both compact and spaced spellings.",
+        )]
+        cues = [TranscriptCue(
+            "card", 0, 4, "The open weight models are spreading.",
+            "openweight 模型正在扩散。",
+        )]
+
+        self.assertEqual(terminology_contract_errors(cues, terminology), [])
+
+    def test_contextual_translation_satisfies_acronym_entity_ownership(self) -> None:
+        terminology = [TerminologyEntry(
+            "RL", TerminologyStrategy.TRANSLATE, target="强化学习",
+            rationale="The speaker contrasts training methods in this passage.",
+        )]
+
+        self.assertEqual(
+            _caption_entity_alignment_errors(
+                "RL is useful here.", "这里适合强化学习。", terminology,
+            ),
+            [],
+        )
+        self.assertEqual(
+            interview_caption_duration_errors([
+                TranscriptCue(
+                    "rl-card", 0, 3, "RL is useful here.",
+                    "这里适合强化学习。",
+                ),
+            ], terminology),
+            [],
+        )
+        phrase_terminology = [TerminologyEntry(
+            "RL environments", TerminologyStrategy.TRANSLATE,
+            target="强化学习环境",
+        )]
+        self.assertEqual(
+            _caption_entity_alignment_errors(
+                "We test RL environments.", "我们测试强化学习环境。",
+                phrase_terminology,
+            ),
+            [],
+        )
+
+    def test_preserved_term_must_remain_on_each_owning_card(self) -> None:
+        terminology = [TerminologyEntry(
+            "Postgres", TerminologyStrategy.PRESERVE, target="Postgres",
+        )]
+        cues = [
+            TranscriptCue("one", 0, 3, "Postgres stores the rows.", "它会存储这些行。"),
+            TranscriptCue("two", 3, 6, "The cache serves reads.", "Postgres 会提供读取。"),
+        ]
+
+        errors = terminology_contract_errors(cues, terminology)
+
+        self.assertTrue(any("one" in error and "missing" in error for error in errors))
+        self.assertTrue(any("two" in error and "moved" in error for error in errors))
+
+    def test_longer_preserved_phrase_owns_nested_short_term(self) -> None:
+        terminology = [
+            TerminologyEntry("runtime", TerminologyStrategy.PRESERVE, target="runtime"),
+            TerminologyEntry(
+                "agent runtime", TerminologyStrategy.TRANSLATE,
+                target="智能体运行时",
+            ),
+        ]
+        cues = [TranscriptCue(
+            "one", 0, 4, "The agent runtime gathers context.",
+            "智能体运行时会收集上下文。",
+        )]
+
+        self.assertEqual(terminology_contract_errors(cues, terminology), [])
+
 
     def test_headline_font_places_fullwidth_comma_near_baseline(self) -> None:
         from PIL import ImageFont
@@ -2914,107 +3171,10 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertIn("maybe it's the supply chain", merged[0].source_text)
 
-    def test_long_merged_thought_splits_before_maybe_not_after_it(self) -> None:
-        source = (
-            "I look across the ecosystem and look for bottlenecks and if there are places "
-            "where extraordinary companies are being built constraints may appear uh "
-            "maybe it's the supply chain that has to scale up so that compute can deploy "
-            "and so this is like looking upstream."
-        )
 
-        parts = _semantic_english_parts(source, 5)
 
-        self.assertGreaterEqual(len(parts), 2)
-        self.assertLessEqual(len(parts), 5)
-        self.assertTrue(any("maybe it's" in part for part in parts))
-        self.assertFalse(any(part.rstrip(" ,.;").endswith("maybe") for part in parts))
-        self.assertTrue(all(
-            not part.casefold().rstrip(" ,.;").endswith((" and", " so", " uh", " um"))
-            for part in parts[:-1]
-        ))
 
-    def test_semantic_split_keeps_defining_relative_clause_with_its_noun(self) -> None:
-        source = (
-            "Like lines of code, ideally good code is the thing "
-            "that will be correlated to whether you produced software people wanted."
-        )
 
-        parts = _semantic_english_parts(source, 2)
-
-        self.assertEqual(parts, [source])
-
-    def test_semantic_split_does_not_cut_lists_or_open_relative_clauses(self) -> None:
-        list_source = (
-            "knowledge and expertise and meetings and everything but ultimately "
-            "the text is the thing that produces the program people want."
-        )
-        relative_source = (
-            "It is a technical audience where when they deploy an agentic system "
-            "and they run into a bug, they fix it. They know how to triage it."
-        )
-
-        list_parts = _semantic_english_parts(list_source, 4)
-        relative_parts = _semantic_english_parts(relative_source, 3)
-
-        self.assertFalse(any(part.startswith("and expertise") for part in list_parts))
-        self.assertFalse(any(part.endswith("agentic system") for part in relative_parts))
-        self.assertFalse(any(part.casefold() == "but but like" for part in list_parts))
-
-    def test_overlong_semantic_part_is_refined_before_card_translation(self) -> None:
-        source = (
-            "That is good because without it we will not have broad diffusion "
-            "because otherwise we will return to a mainframe ecosystem."
-        )
-
-        parts = _split_overlong_semantic_parts([source], 16.0)
-        weights = [len(part.split()) for part in parts]
-
-        self.assertGreaterEqual(len(parts), 2)
-        self.assertTrue(all(
-            16.0 * weight / sum(weights) <= 7.5
-            or len(_semantic_english_parts(part, 2)) == 1
-            for part, weight in zip(parts, weights)
-        ))
-
-    def test_merged_caption_repair_batches_large_interview_without_dropping_ids(self) -> None:
-        class CopyWriter:
-            def __init__(self) -> None:
-                self.batch_sizes = []
-
-            def _request_json(self, messages, max_tokens):
-                prompt = messages[-1]["content"]
-                prefix = "Cues: " if "Cues: " in prompt else "Rows: "
-                line = next(row for row in prompt.splitlines() if row.startswith(prefix))
-                rows = json.loads(line[len(prefix):])
-                self.batch_sizes.append(len(rows))
-                return ({
-                    "translations": [
-                        {"id": row["id"], "text": f"第{row['id'][1:]}条完整字幕。"}
-                        for row in rows
-                    ],
-                }, {"provider": "deepseek", "model": "copy"})
-
-        copy_writer = CopyWriter()
-        wrapper = type("Wrapper", (), {"fallback": copy_writer})()
-        translator = NaturalSubtitleTranslator(wrapper)
-        before = [
-            TranscriptCue(f"c{index}", index * 3, index * 3 + 3, f"fragment {index}", "旧字幕。")
-            for index in range(9)
-        ]
-        merged = [
-            TranscriptCue(
-                cue.id, cue.start, cue.end,
-                cue.source_text + " completed", cue.translation,
-            ) for cue in before
-        ]
-
-        trace = translator.repair_merged_interview_translations(before, merged, [])
-
-        self.assertEqual(copy_writer.batch_sizes, [8, 8, 1, 1])
-        self.assertEqual(len(trace["batches"]), 2)
-        self.assertEqual([cue.translation for cue in merged], [
-            f"第{index}条完整字幕。" for index in range(9)
-        ])
 
     def test_interview_directing_audit_uses_primary_model_not_transport_fallback(self) -> None:
         class PrimaryCritic:
@@ -3350,147 +3510,10 @@ class YouTubeCollectionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "refusing fallback-quality hooks"):
             translator.audit_interview_directing(plan, cues, 60)
 
-    def test_translation_density_repair_shortens_only_overfast_cues(self) -> None:
-        class ConciseWriter:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": [{
-                    "id": "cue-0743",
-                    "text": "knowledge work。也许能画出分布图，但不知是否有人发表。",
-                }]}, {"provider": "test", "model": "concise"})
 
-        cues = [TranscriptCue(
-            "cue-0743", 0, 3.04,
-            "knowledge work, and you would probably have a histogram; I do not know if anyone published it.",
-            "knowledge work。你大概会得到一个 histogram，我不知道有没有人发表过，也许",
-        )]
-        translator = NaturalSubtitleTranslator(ConciseWriter())
 
-        self.assertEqual([cue.id for cue in fast_translation_cues(cues)], ["cue-0743"])
-        trace = translator._repair_reading_speed(cues)
 
-        self.assertEqual(trace["step"], "subtitle_reading_speed_repair")
-        self.assertEqual(fast_translation_cues(cues), [])
-        self.assertIn("knowledge work", cues[0].translation)
 
-    def test_translation_density_repair_retries_with_exact_limit_feedback(self) -> None:
-        class RetryWriter:
-            def __init__(self):
-                self.prompts = []
-
-            def _request_json(self, messages, **kwargs):
-                self.prompts.append(messages[-1]["content"])
-                text = (
-                    "这是一条仍然明显超过限制而且没有认真压缩的中文翻译字幕文本"
-                    if len(self.prompts) == 1 else "可读的短翻译"
-                )
-                return ({"translations": [{"id": "dense", "text": text}]}, {
-                    "attempt": len(self.prompts),
-                })
-
-        writer = RetryWriter()
-        cue = TranscriptCue("dense", 0, 1.5, "A dense sentence.", "一段非常长的翻译文本用于触发修复。")
-
-        trace = NaturalSubtitleTranslator(writer)._repair_reading_speed([cue])
-
-        self.assertEqual(len(writer.prompts), 2)
-        self.assertIn("maximum is 18", writer.prompts[1])
-        self.assertEqual(trace["step"], "subtitle_reading_speed_repair")
-
-    def test_translation_density_repair_retries_when_required_term_is_dropped(self) -> None:
-        class TerminologyWriter:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, *args, **kwargs):
-                self.calls += 1
-                text = "知识工作能画成分布图" if self.calls == 1 else "knowledge work 能画成分布图"
-                return ({"translations": [{"id": "dense", "text": text}]}, {
-                    "attempt": self.calls,
-                })
-
-        writer = TerminologyWriter()
-        cue = TranscriptCue("dense", 0, 3, "knowledge work can form a histogram.", "很长的翻译")
-        terminology = [TerminologyEntry(
-            "knowledge work", TerminologyStrategy.PRESERVE,
-        )]
-
-        NaturalSubtitleTranslator(writer)._repair_reading_speed(
-            [cue], terminology=terminology,
-        )
-
-        self.assertEqual(writer.calls, 2)
-        self.assertIn("knowledge work", cue.translation)
-
-    def test_translation_density_repair_keeps_bilingual_first_use_explanation(self) -> None:
-        class ExplanationWriter:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, *args, **kwargs):
-                self.calls += 1
-                text = "harness 提升可靠性" if self.calls == 1 else "harness（智能体运行框架）更可靠"
-                return ({"translations": [{"id": "dense", "text": text}]}, {
-                    "attempt": self.calls,
-                })
-
-        writer = ExplanationWriter()
-        cue = TranscriptCue("dense", 0, 3, "The harness is more reliable.", "很长的翻译")
-        terminology = [TerminologyEntry(
-            "harness", TerminologyStrategy.BILINGUAL_ONCE,
-            first_use_explanation="智能体运行框架",
-        )]
-
-        NaturalSubtitleTranslator(writer)._repair_reading_speed(
-            [cue], terminology=terminology,
-        )
-
-        self.assertEqual(writer.calls, 2)
-        self.assertEqual(cue.translation.count("智能体运行框架"), 1)
-
-    def test_translation_retries_when_model_drops_cue_id_prefix(self) -> None:
-        class PrefixRetryWriter:
-            def __init__(self):
-                self.translation_calls = 0
-
-            def _request_json(self, messages, **kwargs):
-                prompt = messages[-1]["content"]
-                if "senior Chinese editor" in prompt:
-                    return ({
-                        "editorial_mode": "known_tech_interview_clip",
-                        "collection_title": "AI经济学",
-                        "story_start": 0, "story_end": 60,
-                        "terminology": [], "bilibili_chapters": [],
-                        "wechat_lessons": [{
-                            "start": 0, "end": 60,
-                            "title": "应用层必须能赚钱",
-                            "thesis": "应用公司需要可持续利润。",
-                            "speaker_label": "Satya Nadella",
-                            "framing": "speaker",
-                            "hook_headlines": [
-                                "应用层必须能赚钱", "模型定价决定利润", "开源竞争压低成本",
-                            ],
-                        }],
-                    }, {"step": "plan"})
-                self.translation_calls += 1
-                cue_id = "0001" if self.translation_calls == 1 else "cue-0001"
-                return ({"translations": [{
-                    "id": cue_id, "text": "应用公司需要可持续利润。",
-                }]}, {"step": self.translation_calls})
-
-        writer = PrefixRetryWriter()
-        cues = [TranscriptCue(
-            "cue-0001", 0, 60,
-            "Application companies need sustainable margins.",
-        )]
-
-        _, _, trace = NaturalSubtitleTranslator(writer).translate(
-            {"duration": 60, "title": "Satya on AI economics"},
-            cues, "known_tech_interview_clip",
-        )
-
-        self.assertEqual(writer.translation_calls, 2)
-        self.assertEqual(cues[0].translation, "应用公司需要可持续利润。")
-        self.assertTrue(any(row["step"] == "translate_chunk_rejected" for row in trace))
 
     def test_spoken_fillers_are_omitted_without_dropping_meaning(self) -> None:
         source = "Um, open source wins, you know, inference cloud, uh."
@@ -3501,6 +3524,7 @@ class YouTubeCollectionTest(unittest.TestCase):
             "开源赢了，推理云。",
         )
         self.assertTrue(source_is_spoken_filler_only("Um, uh, you know."))
+        self.assertTrue(source_is_spoken_filler_only("Well, so."))
         self.assertEqual(omit_spoken_fillers_from_translation("Um, uh.", "嗯，呃。"), "")
 
     def test_non_speech_directions_are_omitted_from_both_visible_languages(self) -> None:
@@ -3516,39 +3540,9 @@ class YouTubeCollectionTest(unittest.TestCase):
             "Um and then I would hypothesize they executed well",
         )
         self.assertTrue(source_is_non_speech_only("[clears throat]"))
+        self.assertTrue(source_is_non_speech_only("[laughter】"))
         self.assertEqual(omit_spoken_fillers_from_translation("[coughs]", "[咳嗽]"), "")
 
-    def test_translation_retries_only_missing_cue_ids(self) -> None:
-        class PartialWriter:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, messages, max_tokens):
-                self.calls += 1
-                if self.calls == 1:
-                    return ({
-                        "terminology": [], "main_ranges": [{"start": 0, "end": 900}],
-                        "themes": [
-                            {"title": f"完整主题 {index}", "thesis": "完整观点", "start": index * 300, "end": (index + 1) * 300}
-                            for index in range(3)
-                        ],
-                    }, {"call": 1})
-                if self.calls == 2:
-                    return ({"translations": [{"id": "c1", "text": "第一句。"}]}, {"call": 2})
-                return ({"translations": [{"id": "c2", "text": "第二句。"}]}, {"call": 3})
-
-        writer = PartialWriter()
-        cues = [
-            TranscriptCue("c1", 0, 3, "First sentence."),
-            TranscriptCue("c2", 3, 6, "Second sentence."),
-        ]
-
-        _, _, traces = NaturalSubtitleTranslator(writer).translate({"duration": 1200}, cues)
-
-        self.assertEqual(writer.calls, 3)
-        self.assertEqual([item.translation for item in cues], ["第一句。", "第二句。"])
-        chunk_traces = [item for item in traces if item["step"] == "translate_chunk"]
-        self.assertEqual([item["requested"] for item in chunk_traces], [2, 1])
 
     def test_editorial_ranges_accept_natural_timecodes(self) -> None:
         source_range = _coerce_range(
@@ -3581,36 +3575,6 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertIsNotNone(edge)
         self.assertTrue(edge.has_explicit_crop)
 
-    def test_translation_repairs_only_terms_omitted_by_first_pass(self) -> None:
-        class RepairingWriter:
-            def __init__(self):
-                self.calls = 0
-
-            def _request_json(self, messages, max_tokens):
-                self.calls += 1
-                if self.calls == 1:
-                    return ({
-                        "terminology": [{"source": "RAG", "strategy": "preserve"}],
-                        "main_ranges": [{"start": 0, "end": 900}],
-                        "themes": [
-                            {"title": f"完整主题 {index}", "thesis": "完整观点", "start": index * 300, "end": (index + 1) * 300}
-                            for index in range(3)
-                        ],
-                    }, {"call": 1})
-                if self.calls == 2:
-                    return ({
-                        "translations": [{"id": "c1", "text": "这是检索增强流程。"}],
-                    }, {"call": 2})
-                return ({
-                    "translations": [{"id": "c1", "text": "这是 RAG 检索增强流程。"}],
-                }, {"call": 3})
-
-        cues = [TranscriptCue("c1", 0, 3, "This is a RAG pipeline.")]
-        terms, _, traces = NaturalSubtitleTranslator(RepairingWriter()).translate({"duration": 1200}, cues)
-
-        self.assertEqual(terms[0].source, "RAG")
-        self.assertIn("RAG", cues[0].translation)
-        self.assertEqual(traces[-1]["step"], "terminology_repair")
 
     def test_deterministic_term_enforcement_handles_model_noncompliance(self) -> None:
         cues = [TranscriptCue("c1", 0, 4, "The LLM uses RAG.", "模型使用检索增强生成。")]
@@ -3626,63 +3590,7 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertIn("（RAG）", cues[0].translation)
         self.assertEqual(terminology_contract_errors(cues, terminology), [])
 
-    def test_terminology_repair_falls_back_after_directing_provider_failure(self) -> None:
-        class FailedDirector:
-            def _request_json(self, *args, **kwargs):
-                raise RuntimeError("transient SSL EOF")
 
-        class RecoveryWriter:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": [{
-                    "id": "c1", "text": "芯片供应链需要扩容。",
-                }]}, {"provider": "deepseek", "model": "recovery"})
-
-        cues = [TranscriptCue(
-            "c1", 0, 4, "The chips supply chain must scale.",
-            "供应网络需要扩容。",
-        )]
-        terms = [TerminologyEntry(
-            "supply chain", TerminologyStrategy.TRANSLATE, target="供应链",
-        )]
-        errors = terminology_contract_errors(cues, terms)
-
-        trace = NaturalSubtitleTranslator(
-            RecoveryWriter(), FailedDirector(),
-        )._repair_terminology(cues, terms, errors)
-
-        self.assertEqual(cues[0].translation, "芯片供应链需要扩容。")
-        self.assertEqual(trace["provenance"]["provider"], "deepseek")
-        self.assertTrue(trace["provider_failures"])
-
-    def test_terminology_repair_retries_when_first_writer_uses_wrong_synonym(self) -> None:
-        class NoncompliantDirector:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": [{
-                    "id": "c1", "text": "模型可能会故意误导。",
-                }]}, {"provider": "director"})
-
-        class ExactWriter:
-            def _request_json(self, *args, **kwargs):
-                return ({"translations": [{
-                    "id": "c1", "text": "模型可能会刻意欺骗。",
-                }]}, {"provider": "translator"})
-
-        cues = [TranscriptCue(
-            "c1", 0, 4, "The model may be deliberately deceptive.",
-            "模型可能会故意误导。",
-        )]
-        terms = [TerminologyEntry(
-            "deceptive", TerminologyStrategy.TRANSLATE, target="刻意欺骗",
-        )]
-        errors = terminology_contract_errors(cues, terms)
-
-        trace = NaturalSubtitleTranslator(
-            ExactWriter(), NoncompliantDirector(),
-        )._repair_terminology(cues, terms, errors)
-
-        self.assertEqual(cues[0].translation, "模型可能会刻意欺骗。")
-        self.assertEqual(trace["provenance"]["provider"], "translator")
-        self.assertTrue(trace["provider_failures"])
 
     def test_cached_reviewed_translation_is_reaudited_before_render(self) -> None:
         cues = [TranscriptCue(
@@ -3790,9 +3698,20 @@ class YouTubeCollectionTest(unittest.TestCase):
                 "太空中的可用空间近乎无限。",
             ),
         ]
-        terminology = [TerminologyEntry(
-            "real estate", TerminologyStrategy.TRANSLATE, target="房地产",
-        )]
+        terminology = [
+            TerminologyEntry(
+                "buy real estate", TerminologyStrategy.TRANSLATE, target="买地",
+                rationale="The speaker describes purchasing land.",
+            ),
+            TerminologyEntry(
+                "real estate goes", TerminologyStrategy.TRANSLATE, target="地价",
+                rationale="The following numbers are per-acre prices.",
+            ),
+            TerminologyEntry(
+                "real estate in space", TerminologyStrategy.TRANSLATE,
+                target="可用空间", rationale="The passage discusses available space.",
+            ),
+        ]
 
         self.assertEqual(terminology_contract_errors(cues, terminology), [])
 
@@ -4029,6 +3948,15 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(cues[0].source_text, "Um")
         self.assertEqual(cues[1].source_text, "Stop fixing the code.")
         self.assertAlmostEqual(cues[1].start, 1.0)
+        self.assertEqual(
+            [(row["raw"], row["start"], row["end"]) for row in cues[1].source_tokens],
+            [
+                ("Stop", 1.0, 1.4),
+                ("fixing", 1.4, 1.8),
+                ("the", 1.8, 2.1),
+                ("code.", 2.1, 2.5),
+            ],
+        )
 
     def test_json3_parser_restores_spaces_across_caption_events(self) -> None:
         payload = {"events": [
@@ -4343,10 +4271,85 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         row = repaired["wechat_lessons"][0]
         self.assertEqual((row["start"], row["end"]), (80, 290))
-        self.assertIn(
-            "interview highlight must be a complete 45–180 second source range",
-            editorial_plan_contract_errors(repaired, 400, cues),
+        self.assertEqual(editorial_plan_contract_errors(repaired, 400, cues), [])
+
+    def test_short_interview_highlight_has_no_minimum_duration(self) -> None:
+        cues = [TranscriptCue("cue-1", 10, 22, "A complete and useful answer.")]
+        plan = {
+            "editorial_mode": "known_tech_interview_clip",
+            "bilibili_chapters": [],
+            "wechat_lessons": [{
+                "speaker_label": "Speaker", "title": "短回答也有完整结论",
+                "thesis": "一个完整且有价值的回答。", "start": 10, "end": 22,
+                "framing": "speaker", "hook_headlines": [
+                    "短回答直接给出结论", "关键取舍没有废话", "完整观点不需要凑时长",
+                ],
+            }],
+        }
+        self.assertEqual(editorial_plan_contract_errors(plan, 120, cues), [])
+
+    def test_strong_interview_highlight_up_to_300_seconds_needs_no_magic_field(self) -> None:
+        cues = [TranscriptCue("cue-1", 10, 220, "A complete and useful technical answer.")]
+        row = {
+            "speaker_label": "Speaker", "title": "上下文决定工程结论",
+            "thesis": "完整保留机制和结果。", "start": 10, "end": 220,
+            "framing": "speaker", "hook_headlines": [
+                "上下文改变工程判断", "机制解释需要完整保留", "结论来自前因后果",
+            ],
+        }
+        plan = {
+            "editorial_mode": "known_tech_interview_clip",
+            "bilibili_chapters": [], "wechat_lessons": [row],
+        }
+        self.assertEqual(editorial_plan_contract_errors(plan, 400, cues), [])
+        row["essential_context_justification"] = "Removing the setup would make the mechanism misleading."
+        self.assertEqual(editorial_plan_contract_errors(plan, 400, cues), [])
+
+    def test_conference_highlights_are_independent_and_bounded(self) -> None:
+        plan = {
+            "editorial_mode": "conference_highlights", "bilibili_chapters": [],
+            "wechat_lessons": [
+                {"title": "检索系统的延迟取舍", "thesis": "解释延迟与召回率。", "start": 100, "end": 180,
+                 "hook_headlines": ["延迟决定检索体验", "召回率不是越高越好", "系统取舍改变结果"]},
+                {"title": "智能体评测的真实难点", "thesis": "解释生产评测方法。", "start": 500, "end": 620,
+                 "hook_headlines": ["离线分数会误导团队", "生产评测需要真实任务", "反馈闭环决定可靠性"]},
+            ],
+        }
+        self.assertEqual(editorial_plan_contract_errors(plan, 30_000), [])
+        plan["wechat_lessons"][1]["start"] = 150
+        plan["wechat_lessons"][1]["end"] = 250
+        self.assertTrue(any(
+            "must not overlap" in error
+            for error in editorial_plan_contract_errors(plan, 30_000)
+        ))
+
+    def test_trusted_multi_hour_stream_uses_conference_highlights(self) -> None:
+        item = YouTubeCandidate(
+            video_id="conference", url="https://youtube.com/watch?v=conference",
+            title="AI Engineer conference: production agent systems",
+            channel="AI Engineer", description="Engineering production agent architecture and eval workflow.",
+            published_at="20261001", duration_seconds=31_455,
+            transcript_available=True, source_width=1920, source_height=1080,
+            source_quality_verified=True,
         )
+        YouTubeDiscoveryService._score(
+            item, DiscoveryConfig(), datetime(2026, 10, 5, tzinfo=UTC),
+        )
+        self.assertEqual(item.editorial_mode, "conference_highlights")
+        self.assertNotIn("duration_out_of_range", item.rejection_reasons)
+
+    def test_legacy_bilingual_once_is_normalized_before_validation(self) -> None:
+        cues = [TranscriptCue("cue-1", 0, 5, "This is the system of record.")]
+        terms = NaturalSubtitleTranslator._parse_terminology([{
+            "source": "system of record", "strategy": "bilingual_once",
+            "target": "权威数据源", "first_use_explanation": "权威数据源",
+        }, {
+            "source": "Harness", "strategy": "bilingual_once",
+            "first_use_explanation": "Agent 的执行与反馈框架",
+        }], cues)
+        by_source = {term.source: term for term in terms}
+        self.assertEqual(by_source["system of record"].strategy, TerminologyStrategy.TRANSLATE)
+        self.assertNotIn("Harness", by_source)
 
     def test_short_source_boundaries_are_deterministic_and_complete(self) -> None:
         cues = [

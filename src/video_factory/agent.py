@@ -447,13 +447,21 @@ class BoundedContentAgent:
             try:
                 calls += 1
                 issues, review_provenance = review_method(writing_packet, raw_draft)
+                blocking_issues = _blocking_initial_review_issues(issues)
                 trace.append({
-                    "step": "copy_review", "status": "approved" if not issues else "repair_required",
-                    "issues": issues, "provenance": review_provenance,
+                    "step": "copy_review",
+                    "status": (
+                        "approved" if not issues else
+                        "approved_with_advisories" if not blocking_issues else "repair_required"
+                    ),
+                    "issues": issues, "blocking_issues": blocking_issues,
+                    "provenance": review_provenance,
                 })
-                if issues:
+                if blocking_issues:
                     calls += 1
-                    review_error = "semantic copy critic issues: " + json.dumps(issues, ensure_ascii=False)
+                    review_error = "semantic copy critic issues: " + json.dumps(
+                        blocking_issues, ensure_ascii=False,
+                    )
                     request, repair_provenance, repaired = self.primary.repair(
                         writing_packet, raw_draft, review_error,
                     )
@@ -497,20 +505,25 @@ class BoundedContentAgent:
                         raise ValueError("copy-review repair could not be independently verified within the LLM call budget")
                     calls += 1
                     remaining_issues, verify_provenance = review_method(writing_packet, raw_draft)
+                    blocking_issues = _blocking_final_review_issues(remaining_issues)
                     trace.append({
                         "step": "copy_review_verify",
-                        "status": "approved" if not remaining_issues else "failed",
+                        "status": (
+                            "approved" if not remaining_issues else
+                            "approved_with_advisories" if not blocking_issues else "failed"
+                        ),
                         "issues": remaining_issues,
+                        "blocking_issues": blocking_issues,
                         "provenance": verify_provenance,
                     })
-                    if remaining_issues:
+                    if blocking_issues:
                         # One review and one independent verification are the
                         # complete semantic circuit. A still-rejected draft is
                         # routed to human review rather than paying for more
                         # Gemini repair loops with a weakening acceptance bar.
                         raise ValueError(
                             "semantic copy critic still rejects repaired draft after final verification: "
-                            + json.dumps(remaining_issues, ensure_ascii=False)
+                            + json.dumps(blocking_issues, ensure_ascii=False)
                         )
             except (StoryDraftError, ValueError, RuntimeError) as error:
                 manifest = None
@@ -654,6 +667,24 @@ def _blocking_quality_errors(manifest: RenderManifest) -> list[str]:
     return [
         f"{item.name}: {item.detail}" for item in validate_manifest(manifest)
         if not item.passed and item.name not in {"editorial_safety_review", "music_license_record"}
+    ]
+
+
+def _blocking_final_review_issues(issues: list[dict[str, object]]) -> list[dict[str, object]]:
+    advisory_categories = {
+        "natural_chinese", "pacing", "retention_hook", "editorial_value",
+    }
+    return [
+        item for item in issues
+        if str(item.get("category") or "").casefold() not in advisory_categories
+    ]
+
+
+def _blocking_initial_review_issues(issues: list[dict[str, object]]) -> list[dict[str, object]]:
+    advisory_categories = {"natural_chinese", "pacing"}
+    return [
+        item for item in issues
+        if str(item.get("category") or "").casefold() not in advisory_categories
     ]
 
 

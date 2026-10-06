@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import unittest
 import json
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -456,6 +457,37 @@ class RadarV2Test(unittest.TestCase):
 
         self.assertLessEqual(visible_reading_rate(shot), 12.0)
 
+    def test_overloaded_derived_card_drops_optional_and_duplicate_chinese_copy(self) -> None:
+        brief = _brief(opening_mode="")
+        shot = brief.evidence_shots[1]
+        shot.duration = 4.0
+        shot.visual_family = "impact_card"
+        shot.fact = "新工厂整合机器人焊接自动喷涂与智能组装，并支持北美仓储物流机器人硬件生产"
+        shot.audience_copy = "这是亚马逊继续扩大美国本土制造版图的一步"
+        shot.translation = "这座工厂会整合机器人焊接自动喷涂与智能组装，生产北美仓储物流使用的机器人硬件"
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertTrue(shot.fact)
+        self.assertEqual(shot.audience_copy, "")
+        self.assertEqual(shot.translation, "")
+        self.assertLessEqual(visible_reading_rate(shot), 12.0)
+
+    def test_classic_short_also_gets_deterministic_readable_timing(self) -> None:
+        brief = _brief()
+        brief.opening_mode = ""
+        shot = brief.evidence_shots[1]
+        shot.duration = 2.0
+        shot.visual_family = "impact_card"
+        shot.fact = "亚马逊自己建设工厂生产北美履约网络使用的机器人硬件"
+        shot.audience_copy = "这句话只是重复机器人硬件将供北美履约网络使用"
+        shot.translation = "工厂会生产支持北美履约和机器人网络的产品"
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertGreater(shot.duration, 2.0)
+        self.assertLessEqual(visible_reading_rate(shot), 12.0)
+
     def test_autonomous_driving_story_prefers_category_explicit_model_hook(self) -> None:
         brief = _brief()
         brief.headline = "Waymo 自动驾驶进军德国慕尼黑"
@@ -509,6 +541,17 @@ class RadarV2Test(unittest.TestCase):
         apply_readable_radar_timing(brief)
 
         self.assertEqual(sum(shot.duration for shot in brief.evidence_shots), 18.0)
+        self.assertEqual(brief.duration_target, 20.0)
+
+    def test_static_research_rounding_never_exceeds_twenty_second_ceiling(self) -> None:
+        brief = _brief(duration_target=20.0)
+        brief.evidence_shots.append(deepcopy(brief.evidence_shots[-1]))
+        for shot, duration in zip(brief.evidence_shots, (4.0, 4.629, 5.6, 5.8), strict=True):
+            shot.duration = duration
+
+        apply_readable_radar_timing(brief)
+
+        self.assertLessEqual(round(sum(shot.duration for shot in brief.evidence_shots), 3), 20.0)
         self.assertEqual(brief.duration_target, 20.0)
 
     def test_unacquired_source_image_is_compiled_to_a_grounded_card(self) -> None:
@@ -589,6 +632,21 @@ class RadarV2Test(unittest.TestCase):
 
         self.assertIn("ctx-1", brief.director_brief.selected_context_ids)
         self.assertNotIn("ctx-1", brief.context_graph.discarded_context_ids)
+
+    def test_discarded_context_references_are_removed_without_rewriting_copy(self) -> None:
+        brief = _brief(opening_mode="")
+        brief.context_graph = ContextGraph(discarded_context_ids=["ctx-discarded"])
+        brief.evidence_shots[1].context_event_ids = ["ctx-discarded"]
+        brief.director_brief = DirectorBrief(
+            "thesis", "tension", "neutral", 1, ["ctx-discarded"], [], 10, "trigger",
+        )
+        original_fact = brief.evidence_shots[1].fact
+
+        canonicalize_editorial_brief(brief, [_manifest().evidence[0]])
+
+        self.assertEqual(brief.evidence_shots[1].fact, original_fact)
+        self.assertEqual(brief.evidence_shots[1].context_event_ids, [])
+        self.assertEqual(brief.director_brief.selected_context_ids, [])
 
     def test_radar_web_opening_does_not_get_tweet_translation_budget(self) -> None:
         brief = _brief()

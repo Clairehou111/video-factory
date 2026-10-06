@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from video_factory.youtube_runtime import (
     BGUTIL_VERSION, YTDLP_EJS_VERSION, YTDLP_VERSION,
-    ManagedYouTubeRuntime, YouTubeRuntimeSettings,
+    STABLE_TS_COMMIT, ManagedYouTubeRuntime, YouTubeRuntimeSettings,
 )
 
 
@@ -22,6 +22,7 @@ class YouTubeRuntimeTest(unittest.TestCase):
                 "yt_dlp": YTDLP_VERSION,
                 "yt_dlp_ejs": YTDLP_EJS_VERSION,
                 "bgutil_provider": BGUTIL_VERSION,
+                "stable_ts_commit": STABLE_TS_COMMIT,
                 "provider_mode": "script",
             }), encoding="utf-8")
             runtime = ManagedYouTubeRuntime(settings)

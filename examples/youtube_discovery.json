@@ -14,7 +14,8 @@
     "a16z": ["https://www.youtube.com/channel/UC9cn0TuPq4dnbTY-CBsm8XA"],
     "lightspeed": ["https://www.youtube.com/channel/UCwBTFE_6Bsb_EtmXlW2aTlg"],
     "mad_podcast": ["https://www.youtube.com/channel/UCQID78IY6EOojr5RUdD47MQ"],
-    "saastr": ["https://www.youtube.com/channel/UCwOILzAcxK5CM2M7oRBuWSg"]
+    "saastr": ["https://www.youtube.com/channel/UCwOILzAcxK5CM2M7oRBuWSg"],
+    "ai_engineer": ["https://www.youtube.com/@aiDotEngineer"]
   },
   "query_pools": {
     "perplexity": [
@@ -57,6 +58,10 @@
       "AI engineering agents talk",
       "coding agents platform engineering",
       "AI developer productivity conference"
+    ],
+    "ai_engineer": [
+      "AI Engineer conference agents",
+      "AI Engineer conference LLM systems"
     ],
     "startup_builders": [
       "AI startup team technical demo",

@@ -2,7 +2,7 @@
   "timezone": "Asia/Tokyo",
   "retry_backoff_seconds": [0, 30, 120],
   "blocked_retry_delay_hours": 6,
-  "max_blocked_retry_runs": 2,
+  "max_blocked_retry_runs": 3,
   "event_dedupe_days": 30,
   "adoption_policy": {
     "general_minimum_score": 75,
@@ -224,7 +224,8 @@
           "a16z": ["https://www.youtube.com/channel/UC9cn0TuPq4dnbTY-CBsm8XA"],
           "lightspeed": ["https://www.youtube.com/channel/UCwBTFE_6Bsb_EtmXlW2aTlg"],
           "mad_podcast": ["https://www.youtube.com/channel/UCQID78IY6EOojr5RUdD47MQ"],
-          "saastr": ["https://www.youtube.com/channel/UCwOILzAcxK5CM2M7oRBuWSg"]
+          "saastr": ["https://www.youtube.com/channel/UCwOILzAcxK5CM2M7oRBuWSg"],
+          "ai_engineer": ["https://www.youtube.com/@aiDotEngineer"]
         }
       }
     },

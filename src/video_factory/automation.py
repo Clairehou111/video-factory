@@ -181,7 +181,9 @@ class DiscoveryPublishBridge:
             or getattr(manifest, "editorial_mode", "")
             or ""
         )
-        if editorial_mode not in {"technical_coverage", "known_tech_interview_clip"}:
+        if editorial_mode not in {
+            "technical_coverage", "known_tech_interview_clip", "conference_highlights",
+        }:
             return PreparedPublishBatch(
                 channel, candidate.id, manifest.id,
                 reason="YouTube candidate is neither technical coverage nor a known-tech interview clip",

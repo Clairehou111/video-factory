@@ -140,7 +140,7 @@ python tools/check_llm_pipeline_corpus.py --workspace workspace --limit 30
 YouTube 是一等来源：每 2 小时从科技人物、AI 工程、startup、机器人/自动驾驶池搜索，每轮最多选 1 条 ≥70 分候选，无合格候选只记 `no_selection`。来源权威分只看实际发布频道；二次搬运硬淘汰。翻译用 `translate / preserve / bilingual_once` 三态术语表，产品/API/代码词保留英文。
 
 ```bash
-# 首次使用：安装固定版本 yt-dlp、EJS 和本地 bgutil PO-token provider
+# 首次使用：安装固定版本 yt-dlp、EJS、stable-ts 和本地 bgutil PO-token provider
 video-factory youtube-runtime setup
 video-factory youtube-runtime status
 
@@ -239,7 +239,7 @@ video-factory --workspace workspace frame-video \
 
 每次运行在 `workspace/jobs/<job-id>/result.json` 持久化阶段、路由、模型、清单、成片与质量门结果。快报目标 10–15 秒（可扩展到 24 秒）。`--no-render` 只采集与内容 Agent，`--research off` 关上下文扩展，`--refresh` 跳采集+生成缓存，`--refresh-prices` 强制查价；Schema 变化后旧归档证据仍复用，不重新打开登录浏览器。
 
-非 GitHub 内容先出 `EditorialOpportunity + ContextGraph`，再出 `AttentionStrategy + DirectorBrief + subjects/context_events/evidence_shots`；只有改变事件理解的上下文节点进入成片。观众文案由独立低成本 critic 逐字段审稿（人物—动作—对象—接收者、因果强度、中文自然度、无旁白可读性），失败项以结构化 issue 做一次字段级修复。模型/产品视频标题必须保留具体模型/产品名；面向 vibe coder 的短片每条最多解释一个真正影响结论的指标。
+非 GitHub 内容先出 `EditorialOpportunity + ContextGraph`，再出 `AttentionStrategy + DirectorBrief + subjects/context_events/evidence_shots`；只有改变事件理解的上下文节点进入成片。执行层会确定性移除被舍弃的上下文引用、合并同屏重复中文并按最终素材类型重算阅读时间。观众文案由独立低成本 critic 逐字段审稿（人物—动作—对象—接收者、因果强度、中文自然度、无旁白可读性）：事实、关系与来源问题最多做一次字段级修复，纯中文风格和节奏建议记录为 advisory，不触发昂贵修复循环。模型/产品视频标题必须保留具体模型/产品名；面向 vibe coder 的短片每条最多解释一个真正影响结论的指标。
 
 外链官网的合影、产品截图、架构图与 Benchmark 图归档为一等 `web:source_image` 证据；清单保存 `editorial_evidence_coverage`（已用与舍弃的证据），黄色只用于真实来源的重点框与相邻翻译。文档页不能升级成“正式发布”，除非原文明确 release/launch/announcement。Flash 门禁拒绝近似重复、机械直译、无来源推断、员工账号冒充官方、浪费结尾等；外文 X 帖保持一张卡并附 40–120 字中文释义，底栏超 62 字符渲染前做低 Token 字段压缩。
 
@@ -256,7 +256,7 @@ video-factory generate <youtube-url> --provider auto --model kimi/kimi3 --no-ren
 
 GitHub 背景采集按 README 内生规则：只打开 README 明确链接的 `vendor-notes`、background/reference 文档，X 帖子研究范围更宽，两类不发散共用。
 
-设置 `OPENROUTER_API_KEY` 后，`generate --provider auto` 每天缓存 Models API 与折扣页快照，按一次典型任务的有效成本选最便宜合格模型；可用 `OPENROUTER_TEXT_MODELS` / `OPENROUTER_VISION_MODELS`（准入名单）、`OPENROUTER_MIN_INTELLIGENCE`（故事/审稿 55、视觉 45、翻译 30）、`OPENROUTER_DATA_COLLECTION=deny` / `OPENROUTER_ZDR=1`。OpenRouter 也是独立 2 小时渠道，只有价格异常（便宜 50%、折扣 ≥75% 或新模型 5 折）且 `temptation_score >= 70` 才成片；DeepSeek 比价以官方价格页为主证据。阈值见 `examples/resource_discovery.json` 的 `openrouter.settings`。
+设置 `OPENROUTER_API_KEY` 后，`generate --provider auto` 的故事写作默认固定使用低成本 `google/gemini-3.7-flash`，可用 `VIDEO_FACTORY_STORY_MODEL` 或 `--model` 覆盖；将 `VIDEO_FACTORY_STORY_MODEL` 显式设为空时，才按每日 Models API 快照选择最便宜合格模型。视觉和翻译仍使用每日价格/能力路由；可用 `OPENROUTER_TEXT_MODELS` / `OPENROUTER_VISION_MODELS`（准入名单）、`OPENROUTER_MIN_INTELLIGENCE`（故事/审稿 55、视觉 45、翻译 30）、`OPENROUTER_DATA_COLLECTION=deny` / `OPENROUTER_ZDR=1`。OpenRouter 也是独立 2 小时渠道，只有价格异常（便宜 50%、折扣 ≥75% 或新模型 5 折）且 `temptation_score >= 70` 才成片；DeepSeek 比价以官方价格页为主证据。阈值见 `examples/resource_discovery.json` 的 `openrouter.settings`。
 
 GitHub README 只有 Architecture/Benchmark/Performance/Workflow 等段落中的图才进多模态分析（badge/赞助图/Star History 排除）；结果只用于编辑理解，不作唯一事实来源。无 `OPENROUTER_API_KEY` 回退 DeepSeek 文本路径。GitHub 成片浏览器路径固定：仓库首页与文件树 → README 顶部 → 两个有价值的真实模块；完整遍历另存为审核证据。代码示例用代码上方的真实说明句画黄框（文字外侧 8px outline，释义最长 44 字贴原文下方）。
 

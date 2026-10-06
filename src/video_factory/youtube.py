@@ -21,12 +21,16 @@ from .media import probe_audio_loudness, probe_video
 from .models import (
     Candidate, CollectionItem, CollectionItemKind, Evidence, FramingMode, PlatformRender,
     HookSpec, HookStrategy, RenderProfile, RightsReview, SlideTranslation, SourceMediaInfo, SourceRange,
-    SourceType, SubtitleMode, TerminologyEntry, TerminologyStrategy, TranscriptCue,
+    SourceType, SourceWord, SubtitleMode, TerminologyEntry, TerminologyStrategy, TranscriptCue,
     VideoCollectionManifest, now_iso,
 )
 from .quality import CheckResult
 from .storage import Workspace
 from .youtube_runtime import ManagedYouTubeRuntime
+from .youtube_alignment import (
+    ALIGNMENT_POLICY_VERSION, AudioWordAligner, card_times_from_words,
+    source_ledger_fingerprint, source_words_from_cues,
+)
 
 
 DEFAULT_QUERY_POOLS: dict[str, list[str]] = {
@@ -286,27 +290,11 @@ ESTABLISHED_CHINESE_TERMS: dict[str, str] = {
     "agent": "智能体",
     "bug": "故障",
     "royalty": "版税",
-    "open-source check": "开源制衡",
     "token pricing": "token 定价",
     "memory system": "记忆系统",
     "model family": "模型系列",
     "windows interrupt": "Windows 中断",
     "slop": "低质内容",
-}
-CONTEXTUAL_CHINESE_TERMS: dict[tuple[str, str], tuple[str, ...]] = {
-    # In product/business interviews, “business model” means 商业模式.  A
-    # substring-only `model -> 模型` contract corrupts an already correct
-    # translation and then loops forever trying to insert the wrong noun.
-    ("model", "business model"): ("商业模式",),
-    (
-        "open-source check", "open-source check on closed source",
-    ): ("开源对闭源的制衡",),
-    ("open-source check", "open-source check"): ("开源的制衡", "制衡"),
-    ("royalty", "royalty"): ("版税", "收益"),
-    ("app tier", "app tier"): ("应用层", "应用"),
-    ("real estate", "buy real estate"): ("买地", "土地"),
-    ("real estate", "real estate goes"): ("地价",),
-    ("real estate", "real estate in space"): ("可用空间", "空间"),
 }
 CAPTION_ENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "TSMC": ("TSMC", "台积电"),
@@ -327,10 +315,13 @@ NON_SPEECH_DIRECTION = re.compile(
 # growing blacklist of Chinese phrases produced by earlier model runs.
 INTERVIEW_CHINESE_STYLE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = ()
 INTERVIEW_BOUNDARY_PADDING_SECONDS = 2.0
-INTERVIEW_MIN_SECONDS = 45.0
-INTERVIEW_MAX_SECONDS = 180.0
+INTERVIEW_PREFERRED_MAX_SECONDS = 180.0
+INTERVIEW_MAX_SECONDS = 300.0
+CONFERENCE_HIGHLIGHT_MIN_SECONDS = 45.0
+CONFERENCE_HIGHLIGHT_MAX_SECONDS = 300.0
+CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS = 900.0
 INTERVIEW_MAX_INTERNAL_SILENCE_SECONDS = 3.0
-INTERVIEW_CAPTION_POLICY_VERSION = "2026-09-22-v3"
+INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-06-v10-subtitle-hardening"
 INTERVIEW_CAPTION_TARGET_MAX_SECONDS = 5.0
 INTERVIEW_CAPTION_HARD_MAX_SECONDS = 7.5
 INTERVIEW_CAPTION_MIN_SECONDS = 1.2
@@ -338,12 +329,21 @@ INTERVIEW_CAPTION_BRIEF_ACK_MIN_SECONDS = 0.75
 INTERVIEW_CAPTION_TARGET_MAX_ENGLISH_WORDS = 14
 INTERVIEW_CAPTION_MAX_ENGLISH_WORDS = 28
 INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS = 22
-INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS = 32
 INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND = 12.0
 INTERVIEW_CAPTION_MAX_RENDERED_LINES = 3
 INTERVIEW_HOOK_CONTEXT_MIN_VISIBLE_CHARACTERS = 22
 INTERVIEW_HOOK_CONTEXT_DRAFT_TARGET_MAX_VISIBLE_CHARACTERS = 105
 INTERVIEW_DIRECTING_POLICY_VERSION = "2026-09-21-v3-atomic-hook-pair"
+
+
+def _subtitle_reading_units(value: str) -> int:
+    """Count CJK glyphs and Latin tokens as comparable subtitle reading units."""
+    return len(re.findall(
+        r"[A-Za-z0-9]+(?:[._/+:'’-][A-Za-z0-9]+)*"
+        r"|[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]"
+        r"|[^\s]",
+        value,
+    ))
 
 
 def _interview_caption_policy_fingerprint() -> str:
@@ -360,7 +360,6 @@ def _interview_caption_policy_fingerprint() -> str:
         "target_maximum_chinese_characters": (
             INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS
         ),
-        "maximum_chinese_characters": INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS,
         "maximum_chinese_characters_per_second": (
             INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
         ),
@@ -383,6 +382,14 @@ class YouTubeWebAuthRequired(YouTubeAcquisitionError):
 
 class SourceBelow1080Error(YouTubeAcquisitionError):
     pass
+
+
+class InterviewJointTranslationError(ValueError):
+    """A failed self-healing run with a serializable diagnostic trace."""
+
+    def __init__(self, message: str, trace: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.trace = trace
 
 
 @dataclass(frozen=True, slots=True)
@@ -852,6 +859,14 @@ class YouTubeDiscoveryService:
             return item
         item.title = str(raw.get("title") or item.title)
         item.channel = str(raw.get("channel") or raw.get("uploader") or item.channel)
+        canonical_channel = str(
+            raw.get("channel_url") or raw.get("uploader_url") or ""
+        ).strip()
+        channel_id = str(raw.get("channel_id") or "").strip()
+        if not canonical_channel and channel_id:
+            canonical_channel = f"https://www.youtube.com/channel/{channel_id}"
+        if canonical_channel:
+            item.source_channel_url = canonical_channel
         # Search output should remain auditable without dumping an entire promotional
         # description into every CLI run. Acquisition records the full metadata later.
         item.description = str(raw.get("description") or "")[:2000]
@@ -963,6 +978,15 @@ class YouTubeDiscoveryService:
         item.editorial_mode = mode
         item.matched_known_people = known_people
         item.political_signals = political
+        trusted_channel = any(marker in channel for marker in TRUSTED_CHANNEL_MARKERS)
+        trusted_conference = bool(
+            trusted_channel
+            and item.duration_seconds > config.maximum_duration_seconds
+            and not item.chapters
+            and mode in {"technical_coverage", "known_tech_interview_clip"}
+        )
+        if trusted_conference:
+            item.editorial_mode = mode = "conference_highlights"
         if not item.scope_markers:
             reasons.append("outside_it_software_ai_scope")
         audience, audience_breakdown, audience_matches = audience_relevance(haystack)
@@ -974,7 +998,11 @@ class YouTubeDiscoveryService:
             reasons.append("political_content_forbidden")
         elif mode == "rejected":
             reasons.append("not_technical_share_or_known_tech_interview")
-        if not config.minimum_duration_seconds <= item.duration_seconds <= config.maximum_duration_seconds:
+        if not trusted_conference and not (
+            config.minimum_duration_seconds
+            <= item.duration_seconds
+            <= config.maximum_duration_seconds
+        ):
             reasons.append("duration_out_of_range")
         if item.duration_seconds < 900:
             reasons.append("insufficient_material_for_main_and_three_episodes")
@@ -982,7 +1010,6 @@ class YouTubeDiscoveryService:
             reasons.append("english_transcript_unavailable")
         if not item.title.strip() or not item.channel.strip():
             reasons.append("missing_identity")
-        trusted_channel = any(marker in channel for marker in TRUSTED_CHANNEL_MARKERS)
         obvious_repost = not trusted_channel and bool(REPOST_DISCLOSURE.search(item.description))
         if obvious_repost:
             reasons.append("secondary_repost_source")
@@ -1056,6 +1083,46 @@ def _join_caption_fragments(fragments: list[str]) -> str:
     return result.strip()
 
 
+def _join_timed_caption_fragments(
+    fragments: list[tuple[float, float, str]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Join JSON3 fragments and retain timing for the resulting whitespace words."""
+    result = ""
+    spans: list[tuple[int, int, float, float]] = []
+    closing_punctuation = set(",.!?;:%)]}，。！？；：、")
+    opening_punctuation = set("([{“‘")
+    contractions = ("'s", "'re", "'ve", "'ll", "'d", "'m", "n't")
+    for start, end, raw in fragments:
+        fragment = re.sub(r"\s+", " ", raw).strip()
+        if not fragment:
+            continue
+        needs_space = bool(result) and (
+            fragment[0] not in closing_punctuation
+            and not fragment.casefold().startswith(contractions)
+            and result[-1] not in opening_punctuation
+            and result[-1] not in "-/—–"
+        )
+        if needs_space:
+            result += " "
+        left = len(result)
+        result += fragment
+        spans.append((left, len(result), start, end))
+    timed_words: list[dict[str, Any]] = []
+    for match in re.finditer(r"\S+", result):
+        owners = [
+            row for row in spans
+            if row[0] < match.end() and match.start() < row[1]
+        ]
+        if not owners:
+            continue
+        timed_words.append({
+            "raw": match.group(0),
+            "start": round(min(row[2] for row in owners), 3),
+            "end": round(max(row[3] for row in owners), 3),
+        })
+    return result.strip(), timed_words
+
+
 def parse_youtube_json3(path: Path) -> list[TranscriptCue]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     tokens: list[tuple[float, float, str]] = []
@@ -1083,27 +1150,30 @@ def parse_youtube_json3(path: Path) -> list[TranscriptCue]:
     tokens.sort(key=lambda item: (item[0], item[1]))
 
     cues: list[TranscriptCue] = []
-    buffer: list[str] = []
+    buffer: list[tuple[float, float, str]] = []
     cue_start = cue_end = 0.0
 
     def flush() -> None:
         nonlocal buffer, cue_start, cue_end
-        text = _join_caption_fragments(buffer)
+        text, source_tokens = _join_timed_caption_fragments(buffer)
         if text:
             cues.append(TranscriptCue(
                 id=f"cue-{len(cues) + 1:04d}", start=round(cue_start, 3),
                 end=round(max(cue_end, cue_start + 0.8), 3), source_text=text,
+                source_tokens=source_tokens,
             ))
         buffer = []
 
     for start, end, text in tokens:
         if not buffer:
             cue_start = start
-        prospective = re.sub(r"\s+", " ", "".join([*buffer, text])).strip()
+        prospective = _join_caption_fragments([
+            *[item[2] for item in buffer], text,
+        ])
         if buffer and (start - cue_end > 0.6 or start - cue_start > 6.0 or len(prospective) > 105):
             flush()
             cue_start = start
-        buffer.append(text)
+        buffer.append((start, end, text))
         cue_end = end
         if re.search(r"[.!?][\"']?$", text.strip()) and cue_end - cue_start >= 1.0:
             flush()
@@ -1111,7 +1181,12 @@ def parse_youtube_json3(path: Path) -> list[TranscriptCue]:
         flush()
     for current, following in zip(cues, cues[1:]):
         if 0 < following.start - current.end <= 2.0:
-            current.end = round(min(following.start - 0.05, current.start + 6.0), 3)
+            # Fill a visible gap without shortening the cue below its final
+            # authoritative fragment or invalidating retained token timing.
+            current.end = round(max(
+                current.end,
+                min(following.start - 0.05, current.start + 6.0),
+            ), 3)
     return cues
 
 
@@ -1128,6 +1203,7 @@ def terminology_contract_errors(
         if established_target and (
             entry.strategy != TerminologyStrategy.TRANSLATE
             or entry.target.strip() != established_target
+            or bool(entry.alternatives)
         ):
             errors.append(
                 f"term:{entry.source}: established Chinese term must translate as "
@@ -1137,9 +1213,13 @@ def terminology_contract_errors(
         if entry.strategy == TerminologyStrategy.TRANSLATE and not entry.target.strip():
             errors.append(f"term:{entry.source}: translated terms require target")
         if entry.strategy == TerminologyStrategy.TRANSLATE and entry.target.strip():
+            # A shorter glossary term must never be enforced inside a longer
+            # declared phrase. The longer phrase owns that source span,
+            # regardless of whether it is translated or preserved.
             protected_terms = [
                 item.source for item in terminology
-                if item.strategy == TerminologyStrategy.PRESERVE
+                if item is not entry
+                and len(item.source) > len(entry.source)
                 and entry.source.casefold() in item.source.casefold()
             ]
             relevant = [
@@ -1164,9 +1244,34 @@ def terminology_contract_errors(
                         f"term:{entry.source}:{item.id}: ordinary English term remains "
                         "in Chinese translation"
                     )
-        if entry.strategy == TerminologyStrategy.PRESERVE and not _contains_term(combined_target, entry.source):
-            errors.append(f"term:{entry.source}: preserved English term is missing from translation")
+        if entry.strategy == TerminologyStrategy.PRESERVE:
+            protected_terms = [
+                item.source for item in terminology
+                if item is not entry
+                and len(item.source) > len(entry.source)
+                and entry.source.casefold() in item.source.casefold()
+            ]
+            for item in cues:
+                source_owns_term = _contains_unprotected_term(
+                    item.source_text, entry.source, protected_terms,
+                )
+                target_has_term = _contains_unprotected_term(
+                    item.translation, entry.source, protected_terms,
+                )
+                if source_owns_term and not target_has_term:
+                    errors.append(
+                        f"term:{entry.source}:{item.id}: preserved English term "
+                        "is missing from its source card"
+                    )
+                elif target_has_term and not source_owns_term:
+                    errors.append(
+                        f"term:{entry.source}:{item.id}: preserved English term "
+                        "moved from another source card"
+                    )
         if entry.strategy == TerminologyStrategy.BILINGUAL_ONCE:
+            # Kept only so already-materialized legacy manifests remain
+            # renderable. New/cached planning rows are normalized by
+            # _parse_terminology before reaching this validator.
             if not _contains_term(combined_target, entry.source) or not entry.first_use_explanation.strip():
                 errors.append(f"term:{entry.source}: bilingual_once needs English and first-use explanation")
                 continue
@@ -1190,20 +1295,99 @@ def terminology_contract_errors(
 
 
 def _translated_term_present(
-    entry: TerminologyEntry, cue: TranscriptCue,
+    entry: TerminologyEntry, cue: TranscriptCue, *, allow_alternatives: bool = False,
 ) -> bool:
-    """Accept an exact target or a declared phrase-specific Chinese meaning."""
-    if entry.target and entry.target in cue.translation:
-        return True
-    source_key = entry.source.casefold()
-    for (term, phrase), targets in CONTEXTUAL_CHINESE_TERMS.items():
-        if (
-            source_key == term
-            and _contains_term(cue.source_text, phrase)
-            and any(target in cue.translation for target in targets)
-        ):
-            return True
-    return False
+    """Check the selected target, optionally admitting planner candidates pre-review."""
+    targets = [entry.target]
+    if allow_alternatives:
+        targets.extend(entry.alternatives)
+    return any(target and target in cue.translation for target in targets)
+
+
+def _accepted_terminology_targets(
+    entry: TerminologyEntry, source: str,
+) -> list[str]:
+    """Expose only the per-video choices proposed from this video's context."""
+    if not _contains_term(source, entry.source):
+        return []
+    targets = [entry.target, *entry.alternatives]
+    return list(dict.fromkeys(targets))
+
+
+def _terminology_prompt_row(
+    entry: TerminologyEntry, source: str,
+) -> dict[str, Any]:
+    row = asdict(entry)
+    row["accepted_targets"] = _accepted_terminology_targets(entry, source)
+    return row
+
+
+def _relevant_terminology_prompt_rows(
+    terminology: list[TerminologyEntry], source: str,
+) -> list[dict[str, Any]]:
+    """Return glossary rows whose complete source phrase occurs in this context."""
+    rows: list[dict[str, Any]] = []
+    for entry in terminology:
+        protected_terms = [
+            other.source for other in terminology
+            if other is not entry
+            and len(other.source) > len(entry.source)
+            and entry.source.casefold() in other.source.casefold()
+        ]
+        if _contains_unprotected_term(source, entry.source, protected_terms):
+            rows.append(_terminology_prompt_row(entry, source))
+    return rows
+
+
+def _adopt_independently_reviewed_terminology_targets(
+    cues: list[TranscriptCue], terminology: list[TerminologyEntry],
+) -> list[dict[str, str]]:
+    """Commit one reviewer-approved contextual rendering as the video target.
+
+    Alternatives are candidates for semantic review, not deterministic aliases.
+    Adoption is allowed only when every occurrence uses the same declared
+    rendering. The final terminology contract then enforces that one target.
+    """
+    adopted: list[dict[str, str]] = []
+    for entry in terminology:
+        if entry.strategy != TerminologyStrategy.TRANSLATE or not entry.alternatives:
+            continue
+        protected_terms = [
+            other.source for other in terminology
+            if other is not entry
+            and len(other.source) > len(entry.source)
+            and entry.source.casefold() in other.source.casefold()
+        ]
+        relevant = [
+            cue for cue in cues
+            if _contains_unprotected_term(cue.source_text, entry.source, protected_terms)
+        ]
+        if not relevant:
+            continue
+        candidates = list(dict.fromkeys([entry.target, *entry.alternatives]))
+        selected: list[str] = []
+        for cue in relevant:
+            matches = sorted(
+                (target for target in candidates if target and target in cue.translation),
+                key=len, reverse=True,
+            )
+            if not matches:
+                selected = []
+                break
+            selected.append(matches[0])
+        if len(set(selected)) != 1 or not selected or selected[0] == entry.target:
+            continue
+        previous = entry.target
+        entry.target = selected[0]
+        entry.alternatives = list(dict.fromkeys([
+            previous, *[item for item in entry.alternatives if item != entry.target],
+        ]))[:2]
+        adopted.append({
+            "source": entry.source,
+            "previous_target": previous,
+            "target": entry.target,
+        })
+    return adopted
 
 
 def enforce_cached_terminology_contract(
@@ -1264,10 +1448,20 @@ def _contains_term(value: str, term: str) -> bool:
         plural = ""
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9 .+-]*[A-Za-z]", term) and not term.casefold().endswith("s"):
             plural = r"(?:s|es)?"
-        return bool(re.search(
+        if re.search(
             rf"(?<![A-Za-z0-9]){re.escape(term)}{plural}(?![A-Za-z0-9])", value,
             re.IGNORECASE,
-        ))
+        ):
+            return True
+        compact = re.sub(r"[^A-Za-z0-9]+", "", term).casefold()
+        if len(compact) >= 8 and re.fullmatch(r"[A-Za-z0-9]+", term):
+            tokens = re.findall(r"[A-Za-z0-9]+", value)
+            return any(
+                "".join(tokens[start:end]).casefold() in {compact, compact + "s", compact + "es"}
+                for start in range(len(tokens))
+                for end in range(start + 2, min(len(tokens), start + 3) + 1)
+            )
+        return False
     return term.casefold() in value.casefold()
 
 
@@ -1286,7 +1480,7 @@ def rebalance_translated_cues(cues: list[TranscriptCue], max_chars_per_second: f
     index = 0
     while index < len(cues):
         current = cues[index]
-        needed = len(re.sub(r"\s+", "", current.translation)) / max_chars_per_second if current.translation else 0
+        needed = _subtitle_reading_units(current.translation) / max_chars_per_second if current.translation else 0
         if needed > current.duration and index + 1 < len(cues):
             following = cues[index + 1]
             combined_duration = following.end - current.start
@@ -1297,6 +1491,7 @@ def rebalance_translated_cues(cues: list[TranscriptCue], max_chars_per_second: f
                     source_text=f"{current.source_text} {following.source_text}".strip(),
                     translation=f"{current.translation}{separator}{following.translation}".strip(),
                     speaker=current.speaker, confidence=current.confidence,
+                    source_tokens=[*current.source_tokens, *following.source_tokens],
                 ))
                 index += 2
                 continue
@@ -1311,7 +1506,7 @@ def fast_translation_cues(
     return [
         cue for cue in cues
         if cue.translation.strip()
-        and len(re.sub(r"\s+", "", cue.translation))
+        and _subtitle_reading_units(cue.translation)
         / max(cue.duration, 0.1) > max_chars_per_second
     ]
 
@@ -1323,11 +1518,7 @@ def interview_chinese_style_errors(cues: list[TranscriptCue]) -> dict[str, list[
             reason for pattern, reason in INTERVIEW_CHINESE_STYLE_PATTERNS
             if pattern.search(cue.translation)
         ]
-        visible = len(re.sub(r"\s+", "", cue.translation))
-        if visible > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS:
-            found.append(
-                f"exceeds {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS} visible characters"
-            )
+        visible = _subtitle_reading_units(cue.translation)
         if (
             cue.translation.strip()
             and visible / max(cue.duration, 0.1)
@@ -1341,29 +1532,6 @@ def interview_chinese_style_errors(cues: list[TranscriptCue]) -> dict[str, list[
         if found:
             errors[cue.id] = found
     return errors
-
-
-def normalize_interview_asr_terms(
-    cues: list[TranscriptCue], terminology: list[TerminologyEntry],
-) -> list[dict[str, str]]:
-    """Correct a bounded homophone only when the reviewed glossary confirms it."""
-    glossary = {entry.source.casefold() for entry in terminology}
-    corrections: list[dict[str, str]] = []
-    if "per seat pricing" not in glossary:
-        return corrections
-    pattern = re.compile(r"\bperceived\s+pricing\b", re.IGNORECASE)
-    for cue in cues:
-        corrected = pattern.sub("per seat pricing", cue.source_text)
-        if corrected == cue.source_text:
-            continue
-        corrections.append({
-            "cue_id": cue.id,
-            "before": cue.source_text,
-            "after": corrected,
-            "basis": "reviewed glossary plus adjacent CRM pricing context",
-        })
-        cue.source_text = corrected
-    return corrections
 
 
 SOURCE_DANGLING_END = re.compile(
@@ -1385,6 +1553,8 @@ def rebalance_source_cues(cues: list[TranscriptCue], maximum_duration: float = 1
             id=seed.id, start=seed.start, end=seed.end,
             source_text=seed.source_text, translation=seed.translation,
             speaker=seed.speaker, confidence=seed.confidence,
+            original_start=seed.original_start, original_end=seed.original_end,
+            source_tokens=list(seed.source_tokens),
         )
         index += 1
         while index < len(cues):
@@ -1410,6 +1580,8 @@ def rebalance_source_cues(cues: list[TranscriptCue], maximum_duration: float = 1
                 current.source_text = f"{current.source_text} {following.source_text}".strip()
                 current.translation = ""
                 current.speaker = current.speaker or following.speaker
+                current.original_end = following.original_end
+                current.source_tokens.extend(following.source_tokens)
                 index += 1
                 continue
             break
@@ -1534,6 +1706,31 @@ def normalize_editorial_plan_structure(
                 "framing": str(raw.get("framing") or "speaker"),
                 "hook_headlines": _normalized_plan_hooks(raw.get("hook_headlines"), title),
             }],
+        })
+        return normalized
+    if mode == "conference_highlights":
+        rows = [
+            row for row in plan.get("wechat_lessons", []) if isinstance(row, dict)
+        ] if isinstance(plan.get("wechat_lessons"), list) else []
+        normalized_rows: list[dict[str, Any]] = []
+        used_titles: set[str] = set()
+        for index, raw in enumerate(rows[:5], start=1):
+            proposed = _coerce_range(raw, duration)
+            if proposed is None:
+                continue
+            title = _normalized_plan_title(raw.get("title"), index, "大会高光", used_titles)
+            normalized_rows.append({
+                **raw,
+                "start": round(proposed.start, 3),
+                "end": round(proposed.end, 3),
+                "title": title,
+                "thesis": str(raw.get("thesis") or "提炼一个可独立理解的技术观点。").strip(),
+                "framing": str(raw.get("framing") or "speaker"),
+                "hook_headlines": _normalized_plan_hooks(raw.get("hook_headlines"), title),
+            })
+        normalized.update({
+            "story_start": 0.0, "story_end": duration,
+            "bilibili_chapters": [], "wechat_lessons": normalized_rows,
         })
         return normalized
     try:
@@ -1687,7 +1884,9 @@ def _editorial_planning_transcript(
         for item in cues
     ]
     original_characters = sum(len(item.source_text) for item in cues)
-    if editorial_mode != "known_tech_interview_clip" or original_characters <= maximum_characters:
+    if editorial_mode not in {
+        "known_tech_interview_clip", "conference_highlights",
+    } or original_characters <= maximum_characters:
         return complete, {
             "step": "planning_input", "mode": "complete_transcript",
             "original_cues": len(cues), "planning_rows": len(complete),
@@ -1843,7 +2042,7 @@ def _requested_exact_range_from_editorial_guidance(
         return None
     start = _guidance_clock_seconds(match.group("start"))
     end = _guidance_clock_seconds(match.group("end"))
-    if not INTERVIEW_MIN_SECONDS <= end - start <= INTERVIEW_MAX_SECONDS:
+    if not 0 < end - start <= INTERVIEW_MAX_SECONDS:
         return None
     return start, end
 
@@ -1905,18 +2104,6 @@ def _matching_completed_directing_audit(
     ), None)
 
 
-def _asr_duplicate_cleanup_only(source: str, verified: str) -> bool:
-    """Return true when audio verification only removes adjacent duplicates."""
-    def normalized_tokens(value: str) -> list[str]:
-        tokens = re.findall(r"[a-z0-9]+(?:['’][a-z0-9]+)?", value.casefold())
-        return [
-            token for index, token in enumerate(tokens)
-            if index == 0 or token != tokens[index - 1]
-        ]
-
-    source_tokens = normalized_tokens(source)
-    verified_tokens = normalized_tokens(verified)
-    return bool(source_tokens) and source_tokens == verified_tokens
 
 
 class NaturalSubtitleTranslator:
@@ -1924,15 +2111,23 @@ class NaturalSubtitleTranslator:
         self, writer: OpenAICompatibleStoryWriter,
         directing_writer: OpenAICompatibleStoryWriter | None = None,
         subtitle_reviewer: OpenAICompatibleStoryWriter | None = None,
+        runtime_guidance: str = "",
     ) -> None:
         self.writer = writer
         self.directing_writer = directing_writer
         self.subtitle_reviewer = subtitle_reviewer
+        self.runtime_guidance = runtime_guidance.strip()
 
     def translate(
         self, metadata: dict[str, Any], cues: list[TranscriptCue], editorial_mode: str = "study",
         editorial_guidance: str | None = None,
+        *, plan_only: bool = False,
     ) -> tuple[list[TerminologyEntry], dict[str, Any], list[dict[str, Any]]]:
+        """Create the immutable editorial plan; subtitle translation is always deferred.
+
+        ``plan_only`` remains accepted for adapters that predate the shared joint
+        subtitle stage. It no longer enables the retired cue translation path.
+        """
         cues[:] = rebalance_source_cues(cues)
         transcript, planning_input_trace = _editorial_planning_transcript(
             metadata, cues, editorial_mode,
@@ -1965,7 +2160,7 @@ class NaturalSubtitleTranslator:
         if editorial_mode == "known_tech_interview_clip":
             edition_contract = (
                 "Create exactly one exceptionally compelling WeChat highlight from this technology video, interview, or operator conversation. "
-                "Select one continuous, self-contained 45–180 second source range with the strongest surprising, "
+                "Select one continuous, self-contained source range with the strongest surprising, "
                 "counterintuitive, useful, or emotionally resonant insight about technology, AI, companies, founders, "
                 "products, business strategy, markets, investment, infrastructure, or engineering. "
                 "The clip itself, its title, thesis, and all hooks must contain no politics, elections, government, "
@@ -1977,6 +2172,10 @@ class NaturalSubtitleTranslator:
                 "a curiosity gap, reveal the speaker's concrete claim, and promise a useful payoff—without clickbait or invention."
                 " Choose the strongest audience-relevant title angle first, then retrieve one continuous passage that directly delivers every concrete promise in that title. "
                 "Do not attach the title to a merely related high-scoring passage. The passage must include the speaker's answer or payoff, not stop on the host's question."
+            )
+        elif editorial_mode == "conference_highlights":
+            edition_contract = (
+                "This is a trusted multi-hour conference stream without useful chapters. Return 1–5 distinct, non-overlapping, standalone WeChat highlights and no Bilibili chapters. Each highlight must be 45–300 seconds; all highlights together must total no more than 900 seconds. Select only self-contained technical ideas with their own setup and payoff. Do not create a numbered series or make one clip depend on another. If no qualifying highlight exists, return an empty wechat_lessons list."
             )
         elif editorial_mode == "technical_coverage":
             edition_contract = (
@@ -1997,16 +2196,20 @@ class NaturalSubtitleTranslator:
             "Create a curated but faithful edition. Natural Chinese matters more than mirroring English word order.",
             "Never invent a Chinese term merely to make the subtitle fully Chinese. Product names, code, APIs, and emerging terms without a settled Chinese equivalent stay in English.",
             "Preserve English only for product/company names, acronyms, code/API identifiers, or genuinely unsettled technical terms. Ordinary business and technical phrases with established Chinese—including vertical, token pricing, benchmark, eval, agentic system, knowledge work, productivity gain, royalty, and memory system—must use translate, never preserve or bilingual_once.",
-            "Every terminology item must choose translate, preserve, or bilingual_once. bilingual_once keeps the English term, adds one short Chinese explanation at first use, and then keeps English only.",
+            "Every terminology item must choose only translate or preserve. The original English captions are already visible, so never use bilingual_once. Use translate for ordinary established vocabulary and preserve only names, code, APIs, acronyms, and genuinely unsettled terms.",
+            "For each translate row return source, strategy, target, alternatives, rationale. target is the Chinese rendering you select for this video after reading nearby sentences, the actor's role, and its actions. alternatives is an empty list unless one or two other Chinese renderings are genuinely defensible in this same video context; never manufacture synonyms. rationale briefly cites the contextual evidence for the selected meaning. Handle previously unseen compounds such as retrieval agent or recommendation agent by reasoning from this transcript, not by applying a word-specific rule. For preserve rows return alternatives as an empty list and briefly explain why English should remain.",
             edition_contract,
             f"Return JSON with editorial_mode, collection_title, story_start, story_end, terminology, bilibili_chapters, and wechat_lessons. Every returned lesson has title, thesis, numeric start/end source seconds, framing (auto|speaker|slide|split), and hook_headlines. For an interview highlight also return hook_context: one natural {INTERVIEW_HOOK_CONTEXT_MIN_VISIBLE_CHARACTERS}–{INTERVIEW_HOOK_CONTEXT_DRAFT_TARGET_MAX_VISIBLE_CHARACTERS} visible-character fixed explanatory subtitle placed persistently below the hook for the entire clip. This range is a drafting target; deterministic validation uses the real rendered three-line panel rather than a raw character cutoff. Together, the title and hook_context must let the audience grasp the full conflict, mechanism, and resolution; do not split essential meaning across rotating headlines or spoken captions. Write it like a sharp Chinese tech editor explaining the point to a colleague: short subject-verb clauses, spoken cause-and-effect, and concrete actors/actions. The hook states the tension; hook_context must advance the story rather than repeat it. When the selected source gives an answer, remedy, alternative, or decision, hook_context must include that payoff. It should be understandable at first glance, not read like a translated report or academic abstract. For example, prefer 'SaaS 想靠 API 涨价补收入；客户只愿为结果付费，否则就把数据搬走' over '当厂商因席位减少而提高价格时，反而会激励客户将数据移出系统'. Use split when the source simultaneously shows a speaker pane and a slide pane; this preserves the complete left speaker instead of treating the slide crop as the whole frame. Use slide only for a true slide-only shot or when the crop retains all meaningful content.",
             "Return at most 12 terminology rows, using only terms that occur inside the selected source range. Do not translate or reproduce the transcript in this planning response.",
+            (
+                "Validated reusable guidance from self-audit: " + self.runtime_guidance
+            ) if self.runtime_guidance else "",
             (
                 "Advisory from YouTube Ask or a human editor (use it only to locate a stronger source-backed angle; "
                 "verify every visible claim against the supplied transcript and omit unsupported details): "
                 + editorial_guidance.strip()
             ) if editorial_guidance and editorial_guidance.strip() else "",
-            "For interview highlights, prefer a self-contained 75–120 second passage and end on a complete thought. Use the 180-second ceiling only when the argument genuinely cannot stand alone at a shorter natural boundary.",
+            "For interview highlights there is no minimum duration: a short, strong, self-contained answer is best. Prefer passages at or below 180 seconds. A strong passage may extend to 300 seconds when trimming would weaken or break the complete idea; essential_context_justification is useful audit metadata but is not required. Never pad a clip to reach a target length.",
             "hook_headlines contains exactly three distinct, evidence-faithful Simplified Chinese headlines of 8–36 visible characters for an interview highlight, otherwise 8–30: one tension or contrarian claim, one concrete technical choice with stakes, and one consequence or outcome claim. Make each one specific enough to earn the next 8 seconds, not merely label the topic. Every headline must be a complete natural Chinese clause and keep every claim source-backed.",
             "Titles and thesis must sound originally written in natural Simplified Chinese, with direct spoken syntax and concrete cause-and-effect. Use short clauses a Chinese technology practitioner would actually say; do not mirror English subordinate-clause order. An interview title may use up to 36 visible characters when the trigger and consequence both matter; other theme titles use at most 30.",
             mandatory_layout,
@@ -2026,279 +2229,44 @@ class NaturalSubtitleTranslator:
             metadata, cues, plan, editorial_mode, planning_transcript=transcript,
             editorial_guidance=editorial_guidance,
         )
+        if editorial_mode in {"known_tech_interview_clip", "conference_highlights"}:
+            selected_ranges = [
+                source_range for raw in plan.get("wechat_lessons", [])
+                if isinstance(raw, dict)
+                and (source_range := _coerce_range(raw, duration)) is not None
+            ]
+            if editorial_mode == "conference_highlights" and not selected_ranges:
+                raise ValueError("no_self_contained_conference_highlight")
+            if editorial_mode == "known_tech_interview_clip":
+                selected_ranges = selected_ranges[:1]
+            cues[:] = [
+                cue for cue in cues
+                if any(
+                    min(cue.end, selected.end) - max(cue.start, selected.start) >= 0.5
+                    for selected in selected_ranges
+                )
+            ]
         if editorial_mode == "known_tech_interview_clip":
             selected = _coerce_range(plan["wechat_lessons"][0], duration)
             if selected is None:
                 raise ValueError("interview highlight has no valid source range")
-            cues[:] = [
-                cue for cue in cues
-                if min(cue.end, selected.end) - max(cue.start, selected.start) >= 0.5
-            ]
         terminology = self._parse_terminology(plan.get("terminology", []), cues)
-        glossary_rows: list[dict[str, Any]] = []
-        for entry in terminology:
-            row = asdict(entry)
-            row["first_use_cue_id"] = next(
-                (
-                    cue.id for cue in cues
-                    if _contains_term(cue.source_text, entry.source)
-                ),
-                "",
-            )
-            glossary_rows.append(row)
-        glossary_json = json.dumps(glossary_rows, ensure_ascii=False)
         traces: list[dict[str, Any]] = [
             planning_input_trace,
             {"step": "translation_plan", "provenance": provenance}, *plan_repairs,
         ]
-        for offset in range(0, len(cues), 45):
-            chunk = cues[offset:offset + 45]
-            expected = {item.id for item in chunk}
-            translations: dict[str, str] = {}
-            last_invalid = ""
-            for attempt in range(3):
-                pending = [item for item in chunk if item.id not in translations]
-                chunk_payload = [
-                    {"id": item.id, "start": item.start, "end": item.end, "source": item.source_text}
-                    for item in pending
-                ]
-                prompt = "\n".join([
-                    "Translate these English transcript cues into concise, natural Simplified Chinese subtitles for Chinese AI/software practitioners.",
-                    "Translate meaning in chapter context, never English word order. Preserve uncertainty, negation, numbers, scope, and speaker attribution.",
-                    "Voice: a technically fluent Chinese colleague explaining the speaker's point aloud. Prefer short subject-verb-object clauses and familiar spoken cause-and-effect such as '就、结果、可、只会'; choose everyday verbs such as '搬走、涨价、赶走、自己挖坑' when faithful. The result should sound written in Chinese, not translated from English or summarized as a formal report.",
-                    "Translate launch/reveal intent from context: 'Here is/Here's [named product or version]' usually means the product has arrived, so write '[产品名] 来了' or '[产品名] 发布了', not the literal '这是 [产品名]'. Keep '这是' only when the speaker is genuinely identifying or pointing to an object.",
-                    "Strict cue alignment: each Chinese text may translate only the source text carrying the same id. Never move meaning to the previous or next id, never finish a neighboring cue, and never borrow words from another cue. If a supplied source is a fragment, keep the Chinese fragment aligned instead of completing it from context.",
-                    "Translate the substantive meaning of every supplied cue. The English caption remains visible, so omit speech fillers from the Chinese line: do not translate standalone or discourse uses of 'um', 'uh', 'you know', 'I mean', or similar hesitation sounds. Also omit every non-speech stage direction such as '[clears throat]', '[coughs]', '[laughter]', '[music]', or '[applause]'; never render these as Chinese words. A filler-only or non-speech-only cue may have an empty Chinese text. Keep English when the glossary says preserve. For bilingual_once, add the exact first_use_explanation only in first_use_cue_id; all later occurrences keep English without repeating the explanation.",
-                    "For every glossary row marked translate, use its exact Chinese target in each corresponding cue and do not leave the English source word in the Chinese subtitle. Ordinary established words such as chips and applications are Chinese copy here, not product identifiers.",
-                    "Return {translations:[{id,text}]}; return every supplied id exactly once and no extra ids.",
-                    (
-                        "The previous response was rejected: " + last_invalid
-                        + ". Copy the supplied id strings exactly."
-                    ) if last_invalid else "",
-                    "Glossary: " + glossary_json,
-                    "Cues: " + json.dumps(chunk_payload, ensure_ascii=False),
-                ])
-                draft, chunk_provenance = self.writer._request_json([
-                    {"role": "system", "content": "Return one valid JSON object only."},
-                    {"role": "user", "content": prompt},
-                ], max_tokens=6000)
-                returned = {
-                    str(item.get("id")): str(item.get("text") or "").strip()
-                    for item in draft.get("translations", []) if isinstance(item, dict)
-                }
-                pending_ids = {item.id for item in pending}
-                extra = sorted(set(returned) - pending_ids)
-                filler_only_ids = {
-                    item.id for item in pending if source_is_omittable_caption_only(item.source_text)
-                }
-                empty = sorted(
-                    key for key, value in returned.items()
-                    if not value and key not in filler_only_ids
-                )
-                if extra or empty:
-                    last_invalid = f"empty={empty}, extra={extra}"
-                    traces.append({
-                        "step": "translate_chunk_rejected", "offset": offset,
-                        "attempt": attempt + 1, "reason": last_invalid,
-                        "provenance": chunk_provenance,
-                    })
-                    continue
-                translations.update(returned)
-                traces.append({
-                    "step": "translate_chunk", "offset": offset, "attempt": attempt + 1,
-                    "requested": len(pending), "returned": len(returned),
-                    "provenance": chunk_provenance,
-                })
-                if set(translations) == expected:
-                    break
-                if not returned:
-                    break
-            if set(translations) != expected:
-                missing = sorted(expected - set(translations))
-                raise ValueError(f"translation response ids mismatch after retries; missing={missing}")
-            for item in chunk:
-                item.translation = translations[item.id]
-        for _ in range(3):
-            balanced = rebalance_translated_cues(cues)
-            if len(balanced) == len(cues):
-                break
-            cues[:] = balanced
-        errors = terminology_contract_errors(cues, terminology)
-        if errors:
-            repair_trace = self._repair_terminology(cues, terminology, errors)
-            traces.append(repair_trace)
-            enforced = self._enforce_terminology_contract(cues, terminology)
-            if enforced:
-                traces.append({"step": "deterministic_terminology_enforcement", "terms": enforced})
-            for _ in range(2):
-                balanced = rebalance_translated_cues(cues)
-                if len(balanced) == len(cues):
-                    break
-                cues[:] = balanced
-            errors = terminology_contract_errors(cues, terminology)
-            if errors:
-                # Rebalancing can move a translated term into the neighboring
-                # visual card even though the English occurrence stays here.
-                # Repair the final card boundaries, not only the pre-split
-                # translation, so each bilingual card remains aligned.
-                post_balance_repair = self._repair_terminology(
-                    cues, terminology, errors,
-                )
-                traces.append({
-                    **post_balance_repair,
-                    "step": "post_rebalance_terminology_repair",
-                })
-                enforced = self._enforce_terminology_contract(cues, terminology)
-                if enforced:
-                    traces.append({
-                        "step": "post_rebalance_terminology_enforcement",
-                        "terms": enforced,
-                    })
-                errors = terminology_contract_errors(cues, terminology)
-            if errors:
-                raise ValueError("; ".join(errors))
-        if dense := fast_translation_cues(cues):
-            traces.append(self._repair_reading_speed(
-                dense, terminology=terminology, all_cues=cues,
-            ))
-            if remaining := fast_translation_cues(cues):
-                raise ValueError(
-                    "subtitle reading speed repair failed: "
-                    + ", ".join(cue.id for cue in remaining[:10])
-                )
-            term_errors = terminology_contract_errors(cues, terminology)
-            if term_errors:
-                post_density_repair = self._repair_terminology(
-                    cues, terminology, term_errors,
-                )
-                traces.append({
-                    **post_density_repair,
-                    "step": "post_density_terminology_repair",
-                })
-                enforced = self._enforce_terminology_contract(cues, terminology)
-                if enforced:
-                    traces.append({
-                        "step": "post_density_terminology_enforcement",
-                        "terms": enforced,
-                    })
-                term_errors = terminology_contract_errors(cues, terminology)
-                if term_errors:
-                    raise ValueError("; ".join(term_errors))
+        for cue in cues:
+            cue.translation = ""
+        traces.append({
+            "step": (
+                "interview_translation_deferred_until_audio_alignment"
+                if editorial_mode == "known_tech_interview_clip"
+                else "subtitle_translation_deferred_until_joint_boundaries"
+            ),
+            "cue_ids": [cue.id for cue in cues],
+        })
         return terminology, plan, traces
 
-    def _repair_reading_speed(
-        self, cues: list[TranscriptCue], max_chars_per_second: float = 12.0,
-        terminology: list[TerminologyEntry] | None = None,
-        all_cues: list[TranscriptCue] | None = None,
-    ) -> dict[str, Any]:
-        first_use_ids = {
-            entry.source: next((
-                cue.id for cue in (all_cues or cues)
-                if _contains_term(cue.source_text, entry.source)
-            ), "")
-            for entry in (terminology or [])
-        }
-        payload = [{
-            "id": cue.id,
-            "source": cue.source_text,
-            "current_translation": cue.translation,
-            "duration_seconds": round(cue.duration, 3),
-            "maximum_visible_characters": max(
-                4, math.floor(cue.duration * max_chars_per_second),
-            ),
-            "required_terms": [
-                entry.source for entry in (terminology or [])
-                if entry.strategy in {
-                    TerminologyStrategy.PRESERVE,
-                    TerminologyStrategy.BILINGUAL_ONCE,
-                } and _contains_term(cue.source_text, entry.source)
-            ],
-            "required_first_use_explanations": [
-                entry.first_use_explanation for entry in (terminology or [])
-                if entry.strategy == TerminologyStrategy.BILINGUAL_ONCE
-                and entry.first_use_explanation
-                and _contains_term(cue.source_text, entry.source)
-                and first_use_ids.get(entry.source) == cue.id
-            ],
-        } for cue in cues]
-        prompt = "\n".join([
-            "Shorten only these Simplified Chinese interview subtitles so each can be read in its source time.",
-            "Keep every factual claim, number, negation, named entity, and English technical term, but remove filler, repeated phrasing, and translated hesitation. Use concise natural spoken Chinese, not fragments copied from English word order.",
-            "The visible Chinese character count after removing whitespace must not exceed maximum_visible_characters.",
-            "Every string in required_terms must remain exactly in English in that cue.",
-            "Every string in required_first_use_explanations must also remain exactly once in that cue.",
-            "Return {translations:[{id,text}]}; return every supplied id exactly once and no extra ids.",
-            "Cues: " + json.dumps(payload, ensure_ascii=False),
-        ])
-        expected = {cue.id for cue in cues}
-        feedback = ""
-        attempts: list[dict[str, Any]] = []
-        translations: dict[str, str] = {}
-        for attempt in range(3):
-            request = prompt + feedback
-            draft, provenance = self.writer._request_json([
-                {"role": "system", "content": "Return one valid JSON object only."},
-                {"role": "user", "content": request},
-            ], max_tokens=2500)
-            attempts.append(provenance)
-            translations = {
-                str(item.get("id")): str(item.get("text") or "").strip()
-                for item in draft.get("translations", []) if isinstance(item, dict)
-            }
-            invalid: list[str] = []
-            if set(translations) != expected or any(
-                not translations.get(cue_id, "") for cue_id in expected
-            ):
-                invalid.append("return every required id with non-empty text")
-            for cue in cues:
-                proposed = translations.get(cue.id, "")
-                limit = max(4, math.floor(cue.duration * max_chars_per_second))
-                count = len(re.sub(r"\s+", "", proposed))
-                if proposed and count > limit:
-                    invalid.append(f"{cue.id} has {count} characters; maximum is {limit}")
-                required = [
-                    entry.source for entry in (terminology or [])
-                    if entry.strategy in {
-                        TerminologyStrategy.PRESERVE,
-                        TerminologyStrategy.BILINGUAL_ONCE,
-                    } and _contains_term(cue.source_text, entry.source)
-                ]
-                missing = [term for term in required if not _contains_term(proposed, term)]
-                if proposed and missing:
-                    invalid.append(
-                        f"{cue.id} is missing required terms: {', '.join(missing)}"
-                    )
-                explanations = [
-                    entry.first_use_explanation for entry in (terminology or [])
-                    if entry.strategy == TerminologyStrategy.BILINGUAL_ONCE
-                    and entry.first_use_explanation
-                    and _contains_term(cue.source_text, entry.source)
-                    and first_use_ids.get(entry.source) == cue.id
-                ]
-                invalid_explanations = [
-                    explanation for explanation in explanations
-                    if proposed.count(explanation) != 1
-                ]
-                if proposed and invalid_explanations:
-                    invalid.append(
-                        f"{cue.id} must keep each first-use explanation exactly once: "
-                        + ", ".join(invalid_explanations)
-                    )
-            if not invalid:
-                break
-            feedback = (
-                "\nYour previous response failed the deterministic limits: "
-                + "; ".join(invalid)
-                + ". Rewrite again, shorter, without returning commentary."
-            )
-        else:
-            raise ValueError("subtitle reading speed repair failed after 3 attempts: " + feedback.strip())
-        for cue in cues:
-            cue.translation = translations[cue.id]
-        return {
-            "step": "subtitle_reading_speed_repair",
-            "cue_ids": sorted(expected), "attempts": attempts,
-        }
 
     def audit_interview_directing(
         self, plan: dict[str, Any], cues: list[TranscriptCue], duration: float,
@@ -2451,954 +2419,1394 @@ class NaturalSubtitleTranslator:
             f"{type(last_error).__name__}: {last_error}"
         ) from last_error
 
-    def repair_merged_interview_translations(
-        self, before: list[TranscriptCue], merged: list[TranscriptCue],
-        terminology: list[TerminologyEntry],
-    ) -> dict[str, Any] | None:
-        """Retranslate only cached cues that became complete semantic phrases."""
-        original_by_id = {cue.id: cue for cue in before}
-        targets = [
-            cue for cue in merged
-            if cue.id in original_by_id
-            and cue.source_text.strip() != original_by_id[cue.id].source_text.strip()
-        ]
-        if not targets:
-            return None
-        if len(targets) > 8:
-            batch_traces: list[dict[str, Any]] = []
-            for offset in range(0, len(targets), 8):
-                batch_trace = self.repair_merged_interview_translations(
-                    before, targets[offset:offset + 8], terminology,
-                )
-                if batch_trace:
-                    batch_traces.append(batch_trace)
-            return {
-                "step": "merged_interview_translation_repair",
-                "cue_ids": [cue.id for cue in targets],
-                "batches": batch_traces,
-            }
-        glossary = [
-            {"source": item.source, "strategy": item.strategy.value, "target": item.target}
-            for item in terminology
-        ]
-        payload = [{
-            "id": cue.id, "start": cue.start, "end": cue.end,
-            "source": cue.source_text,
-        } for cue in targets]
-        last_error = ""
-        copy_writer = getattr(self.writer, "fallback", self.writer)
-        for attempt in range(2):
-            draft, provenance = copy_writer._request_json([
-                {"role": "system", "content": "Return one valid JSON object only."},
-                {"role": "user", "content": "\n".join([
-                    "Rewrite merged interview captions into concise, natural Simplified Chinese.",
-                    "Audience: Chinese developers and technology practitioners. Write how a fluent colleague would explain the spoken sentence; do not mirror English word order or preserve awkward seams from old fragments.",
-                    "Each returned caption is shown alone, so make it a self-contained spoken Chinese clause with a complete subject-predicate or action-result structure. Reorder the source naturally. Omit false starts, repeated filler, and a trailing connector that only leads into the next cue; never leave a noun such as '这个概念' or a setup such as '这就是我们' dangling at the end.",
-                    "Translate the complete substantive meaning once. Preserve product names, code, APIs, and technical terms in English when that is more natural. Do not add facts or commentary.",
-                    "Return JSON as {translations:[{id,text}]}; return every supplied id exactly once.",
-                    "Terminology: " + json.dumps(glossary, ensure_ascii=False),
-                    "Cues: " + json.dumps(payload, ensure_ascii=False),
-                    ("Previous validation error: " + last_error) if last_error else "",
-                ])},
-            ], max_tokens=2500)
-            rows = draft.get("translations")
-            translated = {
-                str(row.get("id") or ""): str(row.get("text") or "").strip()
-                for row in rows if isinstance(row, dict)
-            } if isinstance(rows, list) else {}
-            expected = {cue.id for cue in targets}
-            if set(translated) != expected or any(not value for value in translated.values()):
-                last_error = "return every requested id exactly once with non-empty text"
-                continue
-            review_provenance: dict[str, Any] | None = None
-            if copy_writer is not None:
-                review_messages = [
-                    {"role": "system", "content": "Return one valid JSON object only."},
-                    {"role": "user", "content": "\n".join([
-                        "You are the final read-aloud editor for Chinese subtitles in a technology interview.",
-                        "Review every proposed card independently. A viewer must understand each card without reading the previous or next card. Rewrite awkward English-order Chinese, remove duplicated filler, and finish every card on a complete Chinese clause. If the English source trails into the next cue, preserve its substantive meaning but omit that unfinished connector instead of leaving the Chinese hanging.",
-                        "Keep established English technical terms natural. Do not add facts, conclusions, emphasis, or commentary.",
-                        "Return JSON as {translations:[{id,text}]}; return every id exactly once.",
-                        "Rows: " + json.dumps([
-                            {
-                                "id": cue.id, "source": cue.source_text,
-                                "proposed_chinese": translated[cue.id],
-                            } for cue in targets
-                        ], ensure_ascii=False),
-                        ("Previous validation error: " + last_error) if last_error else "",
-                    ])},
-                ]
-                reviewed, review_provenance = copy_writer._request_json(
-                    review_messages, max_tokens=2500,
-                )
-                reviewed_rows = reviewed.get("translations")
-                reviewed_translations = {
-                    str(row.get("id") or ""): str(row.get("text") or "").strip()
-                    for row in reviewed_rows if isinstance(row, dict)
-                } if isinstance(reviewed_rows, list) else {}
-                if (
-                    set(reviewed_translations) != expected
-                    or any(not value for value in reviewed_translations.values())
-                ):
-                    last_error = "independent read-aloud review omitted one or more cue ids"
-                    continue
-                translated = reviewed_translations
-            incomplete = [
-                cue.id for cue in targets
-                if not re.search(r"[。！？”’.!?]$", translated[cue.id].strip())
-                or re.search(
-                    r"(?:这个概念|这个过程|这就是我们|所有)$",
-                    translated[cue.id].strip(),
-                )
-            ]
-            if incomplete:
-                last_error = (
-                    "these standalone cards still end on an unfinished setup instead of a complete "
-                    "spoken Chinese sentence: " + ", ".join(incomplete)
-                )
-                continue
-            too_fast = [
-                cue.id for cue in targets
-                if len(re.sub(r"\s+", "", translated[cue.id])) / max(cue.duration, 0.1) > 12
-            ]
-            if too_fast:
-                last_error = "translations exceed 12 visible characters per second: " + ", ".join(too_fast)
-                continue
-            for cue in targets:
-                cue.translation = translated[cue.id]
-            return {
-                "step": "merged_interview_translation_repair",
-                "cue_ids": sorted(expected), "attempt": attempt + 1,
-                "provenance": provenance,
-                "review_provenance": review_provenance,
-            }
-        raise ValueError("merged interview translation repair failed: " + last_error)
 
-    def segment_interview_subtitle_cards(
+
+    def translate_interview_clip_once(
         self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
-    ) -> dict[str, Any] | None:
-        """Turn dense interview cues into speech-timed, semantic clause cards.
-
-        Source boundaries are chosen deterministically and remain a lossless,
-        ordered partition.  A Chinese-language writer translates those fixed
-        spans; an independent reviewer may reject fidelity problems but never
-        rewrites text or changes boundaries.
-        """
-        _retime_existing_semantic_card_groups(cues)
-        plans: dict[str, tuple[TranscriptCue, list[str]]] = {}
-        timing_adjustments: list[dict[str, float | str]] = []
-        for cue in cues:
-            # A stale cached plan may already contain ``-card-*`` rows from an
-            # older policy. Keep compliant rows unchanged, but allow an
-            # overlong/dense legacy card to become the parent of newly
-            # translated fixed spans. Skipping every card here would make an
-            # obsolete cache impossible to migrate without returning to the
-            # coarse pre-review transcript.
-            stale_card_errors = (
-                interview_caption_duration_errors([cue])
-                if "-card-" in cue.id else []
-            )
-            if "-card-" in cue.id and not stale_card_errors:
-                continue
-            desired = _desired_subtitle_card_count(
-                cue.source_text, cue.translation, cue.duration,
-            )
-            parts = _semantic_english_parts(cue.source_text, desired)
-            parts = _coalesce_short_semantic_parts(parts, cue.duration)
-            parts = _split_overlong_semantic_parts(parts, cue.duration)
-            if len(parts) <= 1:
-                # YouTube occasionally leaves a short, indivisible sentence
-                # on screen a few frames beyond the hard display limit. A
-                # translation rewrite cannot repair timing. Trim only that
-                # small trailing display overrun and retain original_end as
-                # the source-evidence boundary; larger spans still fail
-                # closed or require a defensible semantic split.
-                if (
-                    cue.duration > INTERVIEW_CAPTION_HARD_MAX_SECONDS
-                    and cue.duration <= INTERVIEW_CAPTION_HARD_MAX_SECONDS + 0.5
-                ):
-                    previous_end = cue.end
-                    cue.end = round(
-                        cue.start + INTERVIEW_CAPTION_HARD_MAX_SECONDS, 3,
-                    )
-                    timing_adjustments.append({
-                        "cue_id": cue.id,
-                        "previous_end": previous_end,
-                        "display_end": cue.end,
-                        "trimmed_seconds": round(previous_end - cue.end, 3),
-                    })
-                if stale_card_errors:
-                    # Text-density failures can often be repaired by a concise
-                    # card-specific translation without changing the already
-                    # reviewed English span. Timing/English failures remain
-                    # visible to the final gate if no semantic split exists.
-                    plans[cue.id] = (cue, [cue.source_text])
-                continue
-            if re.sub(r"\s+", " ", " ".join(parts)).strip() != re.sub(
-                r"\s+", " ", cue.source_text,
-            ).strip():
-                raise ValueError(f"semantic subtitle split lost source text for {cue.id}")
-            plans[cue.id] = (cue, parts)
-        if not plans:
-            return {
-                "step": "interview_semantic_subtitle_cards",
-                "cue_ids": [],
-                "reviewed_cue_ids": [cue.id for cue in cues],
-                "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
-                "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
-                "fallback_used": False,
-                "fallback_reason": "",
-                "provenance": None,
-                "translation_attempt_provenance": [],
-                "fidelity_review_provenance": None,
-                "timing_adjustments": timing_adjustments,
-            }
-
-        requested: list[dict[str, Any]] = []
-        for cue_id, (cue, parts) in plans.items():
-            durations = _allocate_caption_durations(parts, cue.duration)
-            for index, (source_part, part_duration) in enumerate(
-                zip(parts, durations), start=1,
-            ):
-                requested.append({
-                    "id": f"{cue_id}-card-{index}",
-                    "parent_id": cue_id,
-                    "source": source_part,
-                    "full_source_context": cue.source_text,
-                    "duration_seconds": round(part_duration, 3),
-                })
-        expected = {row["id"] for row in requested}
-        translations: dict[str, str] = {}
-        provenance: dict[str, Any] | None = None
-        fidelity_review_provenance: dict[str, Any] | None = None
-        translation_writer = (
-            self.writer if hasattr(self.writer, "_request_json")
-            else self.directing_writer
-        )
-        fidelity_reviewer = (
-            self.subtitle_reviewer or self.directing_writer
-        )
-        fidelity_reviewer = (
-            fidelity_reviewer
-            if fidelity_reviewer is not None
-            and fidelity_reviewer is not translation_writer
-            else None
-        )
-        error = ""
-        locked_translations: dict[str, str] = {}
-        translation_attempt_provenance: list[dict[str, Any]] = []
-        if translation_writer is not None:
-            # Translation remains one model's responsibility.  The directing
-            # critic audits the hook only; using it as a third translator made
-            # provenance ambiguous and often replaced idiomatic Chinese with a
-            # more literal draft.  Three bounded Kimi attempts are cheaper on
-            # the coding plan and each retry contains only rejected ids.
-            attempt_writers = [translation_writer] * 3
-            for active_writer in attempt_writers:
-                try:
-                    active_requested = [
-                        row for row in requested
-                        if str(row["id"]) not in locked_translations
-                    ]
-                    active_expected = {str(row["id"]) for row in active_requested}
-                    if not active_requested:
-                        translations = dict(locked_translations)
-                        break
-                    draft, provenance = active_writer._request_json([
-                        {"role": "system", "content": "Return one valid JSON object only."},
-                        {"role": "user", "content": "\n".join([
-                            "You are the Chinese subtitle translator for a technology interview. Write concise, idiomatic spoken Simplified Chinese, as a technically informed Chinese colleague would naturally explain the same utterance aloud.",
-                            "The English source field is authoritative and its card boundaries are fixed. Preserve actors, actions, numbers, entities, negation, uncertainty, timing, and cause-effect. Do not move meaning between ids or add a stronger conclusion, opportunity, or explanation. Parent context may only resolve an elided subject, referent, or obvious ASR name.",
-                            "Remove hesitation sounds and repeated filler. Interview ASR may contain duplicated words, broken repetitions, or terse domain shorthand: recover the clear meaning from this card plus parent context, omit transcription noise, and express the domain meaning naturally instead of translating corrupt word order or a shorthand noun literally. If a fixed source span is a discourse setup such as 'back to the ... point on X', write a complete topic-setting Chinese sentence that preserves X; never leave a dash fragment, and never borrow the next card's claim to complete it. Do not invent a relationship that the recoverable context does not support. Make each visible card a complete, easily understood spoken clause. Preserve established English product names, APIs, code, and identifiers; follow the supplied terminology exactly.",
-                            f"Fit the wording to duration_seconds: target at most {INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS} visible Chinese characters and never exceed {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND:g} visible characters per second or the hard {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS}-character ceiling. A short spoken phrase needs a short Chinese line, not an expanded explanation. End each card with Chinese punctuation. Return every id exactly once as {{translations:[{{id,text}}]}}.",
-                            "Terminology: " + json.dumps([
-                                {
-                                    "source": item.source,
-                                    "strategy": item.strategy.value,
-                                    "target": item.target,
-                                } for item in terminology
-                            ], ensure_ascii=False),
-                            "Cards: " + json.dumps(active_requested, ensure_ascii=False),
-                            ("Previous validation error: " + error) if error else "",
-                        ])},
-                    ], max_tokens=5000)
-                    translation_attempt_provenance.append(provenance)
-                    rows = draft.get("translations")
-                    batch_translations = {
-                        str(row.get("id") or ""): str(row.get("text") or "").strip()
-                        for row in rows if isinstance(row, dict)
-                    } if isinstance(rows, list) else {}
-                    unexpected_ids = set(batch_translations) - active_expected
-                    if unexpected_ids - set(locked_translations):
-                        error = (
-                            "translation returned unrequested card ids: "
-                            + ", ".join(sorted(unexpected_ids))
-                        )
-                        translations = dict(locked_translations)
-                        continue
-                    # Some models repeat an already accepted row on a focused
-                    # retry. Ignore that harmless echo without allowing it to
-                    # overwrite independently reviewed copy.
-                    batch_translations = {
-                        card_id: text_value
-                        for card_id, text_value in batch_translations.items()
-                        if card_id in active_expected
-                    }
-                    for card_id, text_value in list(batch_translations.items()):
-                        if not text_value:
-                            continue
-                        if text_value.endswith(("，", "；", ",", ";")):
-                            text_value = text_value[:-1].rstrip() + "。"
-                        elif not re.search(r"[。！？!?]$", text_value):
-                            text_value += "。"
-                        batch_translations[card_id] = text_value
-                    translations = {**locked_translations, **batch_translations}
-                    invalid = [
-                        card_id for card_id in active_expected
-                        if not translations.get(card_id)
-                        or len(re.sub(r"\s+", "", translations[card_id]))
-                        > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS
-                    ]
-                    requested_by_id = {row["id"]: row for row in requested}
-                    for card_id in active_expected:
-                        text_value = translations.get(card_id, "")
-                        source_value = str(requested_by_id[card_id]["source"])
-                        duration_value = float(
-                            requested_by_id[card_id].get("duration_seconds") or 0.1
-                        )
-                        if (
-                            len(re.sub(r"\s+", "", text_value))
-                            / max(duration_value, 0.1)
-                            > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
-                        ):
-                            invalid.append(card_id)
-                        if _caption_entity_alignment_errors(source_value, text_value):
-                            invalid.append(card_id)
-                        if (
-                            _contains_term(source_value, "maybe")
-                            and not re.search(
-                                r"可能|也许|或许|大约|约有?|差不多",
-                                text_value,
-                            )
-                        ):
-                            invalid.append(card_id)
-                        for term in terminology:
-                            if (
-                                term.strategy != TerminologyStrategy.TRANSLATE
-                                or not term.target
-                                or not _contains_term(source_value, term.source)
-                            ):
-                                continue
-                            if (
-                                not _translated_term_present(
-                                    term, TranscriptCue(
-                                        id=card_id, start=0,
-                                        end=duration_value,
-                                        source_text=source_value,
-                                        translation=text_value,
-                                    ),
-                                )
-                                or _contains_term(text_value, term.source)
-                            ):
-                                invalid.append(card_id)
-                    if set(batch_translations) != active_expected:
-                        error = (
-                            "missing, extra, or empty cards: "
-                            + ", ".join(sorted(set(invalid)))
-                        )
-                        translations = dict(locked_translations)
-                        continue
-                    invalid_set = set(invalid)
-                    reviewable_ids = active_expected - invalid_set
-                    if not reviewable_ids:
-                        error = (
-                            "missing, overlong, dependent, or terminology-invalid cards: "
-                            + ", ".join(sorted(invalid_set))
-                        )
-                        translations = dict(locked_translations)
-                        continue
-                    rejected_set: set[str] = set()
-                    if fidelity_reviewer is not None:
-                        try:
-                            reviewed, fidelity_review_provenance = fidelity_reviewer._request_json([
-                                    {"role": "system", "content": "Return one valid JSON object only."},
-                                    {"role": "user", "content": "\n".join([
-                                        "You are an independent bilingual fidelity and spoken-Chinese auditor. Do not rewrite any caption. A complete topic-setting Chinese sentence is a faithful rendering of an English discourse setup such as 'back to the ... point on X' when it preserves X and does not import the following card's claim.",
-                                        "For every fixed English/Chinese pair, score fidelity and naturalness separately from 1 to 5. Fidelity covers actor, action, numbers, entities, negation, uncertainty, timing, cause-effect, omissions, and unsupported additions. Do not penalize omission of hesitation sounds, stutters, or duplicated ASR tokens when substantive meaning is preserved. Do not call a source term untranslated when the supplied terminology explicitly marks it preserve; judge whether the surrounding Chinese is natural instead. When the English ASR is broken, pass only if the Chinese collapses the recoverable context into one coherent proposition; reject Chinese that preserves disconnected transcript debris, unclear parallel fragments, or confidently guesses an ambiguous technical word without contextual support. Naturalness means publication-ready spoken Chinese that a viewer understands on first reading; reject literal English word order, untranslated ordinary nouns not marked preserve, awkward duplicated wording, broken clauses, dangling connective openings, and surface translation of a metaphor when Chinese normally expresses its technical meaning directly.",
-                                        "Set pass=true only when both scores are at least 4 and you would publish the exact Chinese unchanged. A merely understandable but avoidably awkward caption must fail. Ignore only genuinely minor preference. Return every id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. errors is a short list; provide no corrected text.",
-                                        "Terminology: " + json.dumps([
-                                            {
-                                                "source": item.source,
-                                                "strategy": item.strategy.value,
-                                                "target": item.target,
-                                            } for item in terminology
-                                        ], ensure_ascii=False),
-                                        "Rows: " + json.dumps([
-                                            {
-                                                "id": row["id"], "source": row["source"],
-                                                "parent_context": row["full_source_context"],
-                                                "chinese": translations[row["id"]],
-                                            } for row in active_requested
-                                            if str(row["id"]) in reviewable_ids
-                                        ], ensure_ascii=False),
-                                    ])},
-                                ], max_tokens=5000)
-                            review_rows = reviewed.get("reviews")
-                            review_values = {
-                                str(row.get("id") or ""): row
-                                for row in review_rows if isinstance(row, dict)
-                            } if isinstance(review_rows, list) else {}
-                            rejected_set = {
-                                card_id for card_id in reviewable_ids
-                                if card_id not in review_values
-                                or review_values[card_id].get("pass") is not True
-                                or _review_score_out_of_five(
-                                    review_values[card_id].get("fidelity_score")
-                                ) < 4
-                                or _review_score_out_of_five(
-                                    review_values[card_id].get("naturalness_score")
-                                ) < 4
-                            }
-                        except Exception as exc:
-                            # Once an independent reviewer is configured,
-                            # transport or schema failure cannot silently
-                            # turn an unreviewed draft into publishable copy.
-                            fidelity_review_provenance = None
-                            error = (
-                                "fidelity reviewer failed: "
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                            translations = dict(locked_translations)
-                            continue
-                    locked_translations.update({
-                        card_id: translations[card_id]
-                        for card_id in reviewable_ids - rejected_set
-                    })
-                    if invalid_set or rejected_set:
-                        problems: list[str] = []
-                        if invalid_set:
-                            problems.append(
-                                "missing, overlong, dependent, or terminology-invalid cards: "
-                                + ", ".join(sorted(invalid_set))
-                            )
-                        if rejected_set:
-                            problems.append("fidelity reviewer rejected: " + json.dumps({
-                                card_id: {
-                                    "fidelity_score": review_values.get(card_id, {}).get("fidelity_score"),
-                                    "naturalness_score": review_values.get(card_id, {}).get("naturalness_score"),
-                                    "errors": review_values.get(card_id, {}).get("errors", []),
-                                }
-                                for card_id in sorted(rejected_set)
-                            }, ensure_ascii=False))
-                        error = "; ".join(problems)
-                        translations = dict(locked_translations)
-                        continue
-                    translations = dict(locked_translations)
-                    if set(translations) == expected:
-                        break
-                    continue
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-                    translations = dict(locked_translations)
-
-        if set(translations) != expected and fidelity_reviewer is not None:
-            missing = sorted(expected - set(translations))
-            raise ValueError(
-                "reviewed subtitle translation exhausted bounded writer and fallback attempts: "
-                + ", ".join(missing)
-                + ("; " + error if error else "")
-            )
-
-        if set(translations) != expected and translation_writer is not None:
-            # A model can treat a multi-row request as one paragraph and move
-            # meaning between otherwise fixed ids. Recover card-by-card so the
-            # model has no neighboring output slot into which it can shift a
-            # company, action, or payoff.
-            isolated: dict[str, str] = dict(translations)
-            isolated_provenance: list[dict[str, Any]] = []
-            isolated_failures: list[str] = []
-            isolated_writers = []
-            for writer in (
-                translation_writer, getattr(self.writer, "fallback", None),
-            ):
-                if writer is not None and all(
-                    writer is not existing for existing in isolated_writers
-                ):
-                    isolated_writers.append(writer)
-            failed_parent_ids: set[str] = set()
-            for row in requested:
-                card_id = str(row["id"])
-                if card_id in isolated:
-                    continue
-                duration_value = float(row.get("duration_seconds") or 0.1)
-                maximum_characters = max(6, min(
-                    INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS,
-                    math.floor(
-                        duration_value
-                        * INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
-                    ),
-                ))
-                accepted = ""
-                for isolated_writer in isolated_writers:
-                    try:
-                        draft, card_provenance = isolated_writer._request_json([
-                            {"role": "system", "content": "Return one valid JSON object only."},
-                            {"role": "user", "content": "\n".join([
-                                "Translate exactly one fixed English interview caption into concise, natural spoken Simplified Chinese.",
-                                "Translate only Source. Parent context may resolve an elided subject or predicate, but you must not import a neighboring fact, entity, action, or conclusion. The Chinese card must stand alone.",
-                                "Preserve timing, modality, negation, numbers, and named entities. Normalize an obvious ASR spelling only when the parent context identifies it unambiguously. Remove fillers.",
-                                "Use direct, idiomatic, standalone spoken Chinese rather than mirroring English word order.",
-                                f"Use at most {maximum_characters} visible characters including punctuation. Return {{text:string}} only.",
-                                "Terminology: " + json.dumps([
-                                    {
-                                        "source": item.source,
-                                        "strategy": item.strategy.value,
-                                        "target": item.target,
-                                    } for item in terminology
-                                ], ensure_ascii=False),
-                                "Source: " + str(row["source"]),
-                                "Parent context: " + str(row["full_source_context"]),
-                            ])},
-                        ], max_tokens=600)
-                        candidate = str(draft.get("text") or "").strip()
-                        if candidate and not re.search(r"[。！？!?]$", candidate):
-                            candidate += "。"
-                        card_errors = _semantic_card_translation_errors(
-                            row, candidate, terminology,
-                        )
-                        if card_errors:
-                            isolated_failures.append(
-                                f"{card_id}:{','.join(card_errors)}"
-                            )
-                            continue
-                        accepted = candidate
-                        isolated_provenance.append({
-                            "id": card_id, "provenance": card_provenance,
-                        })
-                        break
-                    except Exception as exc:
-                        isolated_failures.append(
-                            f"{card_id}:{type(exc).__name__}:{exc}"
-                        )
-                if not accepted:
-                    failed_parent_ids.add(str(row["parent_id"]))
-                    continue
-                isolated[card_id] = accepted
-            if failed_parent_ids:
-                isolated = {
-                    card_id: text_value
-                    for card_id, text_value in isolated.items()
-                    if next(
-                        str(row["parent_id"]) for row in requested
-                        if str(row["id"]) == card_id
-                    ) not in failed_parent_ids
-                }
-            provenance = {
-                "mode": "isolated_card_recovery",
-                "cards": isolated_provenance,
-                "failures": isolated_failures,
-                "failed_parent_ids": sorted(failed_parent_ids),
-            }
-            if isolated:
-                translations = isolated
-
-        fallback_used = any(
-            any(
-                f"{cue_id}-card-{index}" not in translations
-                for index in range(1, len(parts) + 1)
-            )
-            for cue_id, (_, parts) in plans.items()
-        )
-        # A pre-existing Chinese paragraph is never repartitioned to fill
-        # missing card translations. Clause-shaped target slices are not proof
-        # that they align with fixed English spans. Keep the parent intact; the
-        # policy gate below will fail closed when that parent is too dense.
-
-        expanded: list[TranscriptCue] = []
-        segmented_ids: list[str] = []
-        for cue in cues:
-            plan = plans.get(cue.id)
-            if plan is None:
-                expanded.append(cue)
-                continue
-            _, parts = plan
-            card_ids = [f"{cue.id}-card-{index}" for index in range(1, len(parts) + 1)]
-            if any(card_id not in translations for card_id in card_ids):
-                expanded.append(cue)
-                continue
-            durations = _allocate_caption_durations(parts, cue.duration)
-            elapsed = 0.0
-            for index, (source_part, part_duration, card_id) in enumerate(
-                zip(parts, durations, card_ids), start=1,
-            ):
-                start = cue.start + elapsed
-                elapsed += part_duration
-                end = cue.end if index == len(parts) else cue.start + elapsed
-                expanded.append(TranscriptCue(
-                    id=card_id, start=round(start, 3), end=round(end, 3),
-                    source_text=source_part,
-                    translation=translations[card_id], speaker=cue.speaker,
-                    confidence=cue.confidence,
-                ))
-                segmented_ids.append(card_id)
-        cues[:] = expanded
-        self._enforce_terminology_contract(cues, terminology)
-        if term_errors := terminology_contract_errors(cues, terminology):
-            raise ValueError(
-                "semantic subtitle cards violate terminology contract: "
-                + "; ".join(term_errors)
-            )
-        return {
-            "step": "interview_semantic_subtitle_cards",
-            "cue_ids": segmented_ids,
-            "reviewed_cue_ids": [cue.id for cue in cues],
-            "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
-            "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
-            "fallback_used": fallback_used,
-            "fallback_reason": error if fallback_used else "",
-            "provenance": provenance,
-            "translation_attempt_provenance": translation_attempt_provenance,
-            "fidelity_review_provenance": fidelity_review_provenance,
-            "timing_adjustments": timing_adjustments,
-        }
-
-    def repair_audio_verified_cards(
-        self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
-        audit: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Retranslate only cards whose YouTube ASR was corrected from audio."""
-        corrections = [
-            row for row in audit.get("corrections", [])
-            if isinstance(row, dict) and str(row.get("verified_source") or "").strip()
-            and ("changed" not in row or row.get("changed") is True)
-        ]
-        if not corrections:
-            return None
-        merged_fragments: list[dict[str, str]] = []
-        duplicate_cleanup_cue_ids: list[str] = []
-        retained_corrections: list[dict[str, Any]] = []
-        for row in corrections:
-            card_id = str(row.get("cue_id") or "")
-            verified = str(row.get("verified_source") or "").strip()
-            index = next((
-                position for position, cue in enumerate(cues) if cue.id == card_id
-            ), -1)
-            if index >= 0 and _asr_duplicate_cleanup_only(
-                cues[index].source_text, verified,
-            ):
-                # Removing an adjacent ASR duplicate changes no proposition.
-                # Keep the already reviewed Chinese instead of asking a model
-                # to rewrite an intentionally short setup card, which can
-                # introduce a dangling fragment even though the audio only
-                # confirmed "is is" -> "is".
-                cues[index].source_text = verified
-                duplicate_cleanup_cue_ids.append(card_id)
-                continue
-            parent = card_id.rsplit("-card-", 1)[0]
-            can_merge = (
-                index >= 0
-                and index + 1 < len(cues)
-                and cues[index + 1].id.rsplit("-card-", 1)[0] == parent
-                and cues[index].duration <= 3.0
-                and bool(re.search(
-                    r"\b(?:tends?|seems?)\s+to\s+be[,.\s]*$", verified,
-                    re.IGNORECASE,
-                ))
-            )
-            if not can_merge:
-                retained_corrections.append(row)
-                continue
-            current = cues[index]
-            following = cues[index + 1]
-            following.start = current.start
-            following.original_start = current.original_start
-            following.source_text = (
-                verified.rstrip(" ,.") + " " + following.source_text.lstrip()
-            ).strip()
-            del cues[index]
-            merged_fragments.append({
-                "removed_cue_id": card_id,
-                "retained_cue_id": following.id,
-            })
-        corrections = retained_corrections
-        if not corrections:
-            return {
-                "step": "audio_verified_caption_repair",
-                "cue_ids": [],
-                "merged_fragments": merged_fragments,
-                "duplicate_cleanup_cue_ids": duplicate_cleanup_cue_ids,
-                "translation_attempts": [],
-                "review_attempts": [],
-            }
-        by_id = {cue.id: cue for cue in cues}
-        requested = [{
-            "id": str(row["cue_id"]),
-            "youtube_source": str(row.get("source") or ""),
-            "audio_verified_source": str(row["verified_source"]).strip(),
-            "duration_seconds": round(by_id[str(row["cue_id"])].duration, 3),
-            "verification_reasons": list(row.get("reasons") or []),
-        } for row in corrections if str(row.get("cue_id") or "") in by_id]
-        if not requested:
-            return None
+        source_words: list[SourceWord], alignment_fingerprint: str = "",
+        audio_hypothesis: str = "",
+    ) -> dict[str, Any]:
+        """Choose word boundaries and Chinese together, then repair local windows."""
         writer = self.writer if hasattr(self.writer, "_request_json") else None
         reviewer = self.subtitle_reviewer or self.directing_writer
         if writer is None or reviewer is None or reviewer is writer:
             raise RuntimeError(
-                "audio-verified captions require separate translator and reviewer"
+                "interview joint translation requires distinct writer and reviewer calls"
             )
-        expected = {row["id"] for row in requested}
-        locked: dict[str, str] = {}
+        words = [word for word in source_words if word.raw]
+        if not words or not cues:
+            raise ValueError("interview joint translation has no source words")
+        expected_source = re.sub(r"\s+", " ", " ".join(
+            cue.source_text for cue in cues
+        )).strip()
+        actual_source = re.sub(r"\s+", " ", " ".join(
+            word.raw for word in words
+        )).strip()
+        if expected_source != actual_source:
+            raise ValueError("source-word ledger does not exactly reconstruct interview text")
+
+        clip_start = cues[0].start
+        clip_end = cues[-1].end
+        glossary = _relevant_terminology_prompt_rows(terminology, expected_source)
         attempts: list[dict[str, Any]] = []
-        reviews: list[dict[str, Any]] = []
-        error = ""
-        for _ in range(2):
-            active = [row for row in requested if row["id"] not in locked]
-            if not active:
-                break
+        hypothesis_words = re.findall(r"\S+", audio_hypothesis)
+        hypothesis_norm = [
+            re.sub(r"[^a-z0-9']+", "", value.casefold().replace("’", "'"))
+            for value in hypothesis_words
+        ]
+        source_norm = [word.normalized for word in words]
+        audio_conflict_entities = {
+            entity for entity in _uppercase_source_entities(expected_source)
+            if audio_hypothesis and not _contains_term(audio_hypothesis, entity)
+        }
+        source_numbers = set(re.findall(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:%|x)?", expected_source))
+        hypothesis_numbers = set(re.findall(
+            r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:%|x)?", audio_hypothesis,
+        ))
+        audio_conflict_numbers = (
+            source_numbers - hypothesis_numbers if audio_hypothesis else set()
+        )
+        audio_only_numbers = (
+            hypothesis_numbers - source_numbers if audio_hypothesis else set()
+        )
+        numeric_conflict_pairs = _numeric_audio_conflict_pairs(words, audio_hypothesis)
+        paired_source_number_indices = {
+            int(row["source_word_index"]) - 1 for row in numeric_conflict_pairs
+        }
+        hypothesis_blocks = SequenceMatcher(
+            None, source_norm, hypothesis_norm, autojunk=False,
+        ).get_matching_blocks() if hypothesis_norm else []
+
+        def audio_evidence_for_window(start_word: int, end_word: int) -> str:
+            matched_hypothesis_indices = [
+                block.b + offset
+                for block in hypothesis_blocks if block.size
+                for offset in range(block.size)
+                if start_word <= block.a + offset < end_word
+            ]
+            if not matched_hypothesis_indices:
+                return ""
+            start = max(0, min(matched_hypothesis_indices) - 16)
+            end = min(len(hypothesis_words), max(matched_hypothesis_indices) + 17)
+            return " ".join(hypothesis_words[start:end])
+
+        def request_window(
+            start_word: int, end_word: int, previous_source: str,
+            next_source: str, rejection: str, repair_round: int,
+            internal_attempt: int = 0, minimum_card_count: int = 0,
+            mandatory_split_ranges: tuple[tuple[int, int], ...] = (),
+        ) -> tuple[list[tuple[int, int, str]], dict[str, Any]]:
+            window = words[start_word:end_word]
+            duration = max(0.1, window[-1].end - window[0].start)
+            maximum_count = max(1, min(
+                len(window), math.floor(duration / INTERVIEW_CAPTION_MIN_SECONDS),
+            ))
+            minimum_count = max(
+                1, minimum_card_count,
+                math.ceil(duration / INTERVIEW_CAPTION_HARD_MAX_SECONDS),
+            )
+            if minimum_count > maximum_count:
+                raise ValueError(
+                    "joint translation window cannot satisfy both minimum duration "
+                    f"and required split count: {minimum_count}>{maximum_count}"
+                )
+            target_count = max(
+                minimum_count,
+                math.ceil(duration / INTERVIEW_CAPTION_TARGET_MAX_SECONDS),
+                math.ceil(len(window) / INTERVIEW_CAPTION_TARGET_MAX_ENGLISH_WORDS),
+            )
+            target_count = min(maximum_count, target_count)
+            window_numeric_conflict_pairs = [{
+                **row,
+                "source_word_index": int(row["source_word_index"]) - start_word,
+            } for row in numeric_conflict_pairs
+                if start_word < int(row["source_word_index"]) <= end_word]
+            ownership_terms = set(_uppercase_source_entities(
+                " ".join(word.raw for word in window)
+            ))
+            ownership_terms.update(
+                entry.source for entry in terminology
+                if entry.strategy == TerminologyStrategy.PRESERVE
+                and _contains_term(" ".join(word.raw for word in window), entry.source)
+            )
+            ownership: list[dict[str, Any]] = []
+            for entity in sorted(ownership_terms, key=lambda value: (-len(value), value)):
+                width = max(1, len(re.findall(r"\S+", entity)))
+                indices = [
+                    index + 1
+                    for index in range(max(0, len(window) - width + 1))
+                    if _contains_term(
+                        " ".join(word.raw for word in window[index:index + width]),
+                        entity,
+                    )
+                ]
+                ownership.append({
+                    "entity": entity,
+                    "source_word_start_indices": indices,
+                    "word_count": width,
+                })
+            # Numeric ASR exceptions belong to one source occurrence.  A value may
+            # appear more than once in the passage while only one occurrence has
+            # strong local anchors, so never exempt every matching value by text.
+            numeric_occurrences: dict[str, list[int]] = {}
+            for absolute_index in range(start_word, end_word):
+                match = re.search(
+                    r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:%|x)?",
+                    words[absolute_index].raw,
+                )
+                if match and absolute_index not in paired_source_number_indices:
+                    numeric_occurrences.setdefault(match.group(0), []).append(
+                        absolute_index - start_word + 1
+                    )
+            ownership.extend({
+                "entity": entity,
+                "source_word_start_indices": indices,
+                "word_count": 1,
+            } for entity, indices in sorted(numeric_occurrences.items()))
+            prompt = "\n".join([
+                "Create publication-ready bilingual cards for this ordered technology-video speech passage. Choose English word boundaries and write the matching natural Simplified Chinese in the same response. This is the only normal-path translation pass.",
+                "Return {cards:[{end_word,text}]}. end_word is an exclusive cumulative index into Source words beginning at 1. It must increase strictly and the final value must equal the supplied word count. Never rewrite, omit, duplicate, or reorder an English word.",
+                f"This exact source window contains {len(window)} words. The final card's end_word MUST be exactly {len(window)}; {len(window) - 1} or any smaller value is invalid and omits source evidence.",
+                "A sentence may continue across adjacent cards. Cut at a natural speech or semantic boundary without stranding a preposition, noun phrase, condition, or entity. Chinese must preserve actors, actions, negation, uncertainty, entities, cause-effect, scope, and numbers except where the supplied audio-conflict evidence strongly supports a different audible number. Remove hesitation and duplicated speech noise without inventing facts.",
+                "Do not translate discourse fillers or sound descriptions. Omit um/uh/erm/hmm, filler uses of like/well/so, you know, and I mean from Chinese while preserving the substantive clause. Never render [laughter], coughing, throat clearing, music, applause, breathing, or similar caption metadata in Chinese.",
+                "Entity ownership is strict: a product, acronym, company, API, or number may appear in Chinese only when that same card's English word range contains it. Numeric tokens explicitly listed as audio conflicts below are the exception: use the strongly supported nearby audible value on that same semantic card. If a rejected Chinese card moved an entity from a neighbor, either move the English boundary to include the entity or remove it from that Chinese card; never repeat it on both cards.",
+                "The Entity ownership table below is deterministic evidence. Each listed entity may appear only in a Chinese card whose inclusive source range contains one of its word indices. If feedback says moved:X, remove X from the wrong Chinese card or move the boundary over X. If feedback says missing:X, preserve X in its owner card.",
+                "Use the terminology decision and its evidence. alternatives are candidates for the independent reviewer, not a whitelist. A longer phrase owns nested shorter terms. Keep one rendering consistent across the passage.",
+                f"Return {minimum_count}–{maximum_count} cards; aim for {target_count}. Every card must last {INTERVIEW_CAPTION_MIN_SECONDS:g}–{INTERVIEW_CAPTION_HARD_MAX_SECONDS:g} seconds, contain no more than {INTERVIEW_CAPTION_MAX_ENGLISH_WORDS} English words, remain below {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND:g} reading units per second, and fit the measured three-line panel. A CJK glyph, a Latin word, or punctuation is one reading unit, so do not count every letter of an English product name separately. For each end_word, the display cut occurs at the midpoint between the previous word's end and the next word's start; calculate durations from the supplied times and avoid sub-{INTERVIEW_CAPTION_MIN_SECONDS:g}-second cards. Aim for {INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS} reading units, but use rendered fit and reading speed rather than a raw hard ceiling.",
+                "Previous and next source are context only. Never import their claims into this window.",
+                "Audio ASR is conflict evidence only and never replaces the authoritative Source words. When Source contains an obvious transcription ambiguity, use the nearby audio hypothesis plus surrounding actions to translate the most supported audible meaning while leaving the returned English boundaries unchanged. Do not invent a correction when the audio evidence is also uncertain.",
+                "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                "Entity ownership: " + json.dumps(ownership, ensure_ascii=False),
+                "Mandatory split ranges: " + json.dumps([{
+                    "source_word_range": [left - start_word, right - start_word],
+                    "required_end_word_between": [
+                        left - start_word + 1, right - start_word - 1,
+                    ],
+                } for left, right in mandatory_split_ranges], ensure_ascii=False)
+                + ". Every listed rejected range must contain at least one new end_word strictly inside it; adding a boundary only in a neighboring card does not repair the failure.",
+                "Source entities absent or contradicted in audio ASR (the semantic reviewer decides their meaning; do not mechanically copy them into Chinese): "
+                + json.dumps(sorted(audio_conflict_entities), ensure_ascii=False),
+                "Numeric conflict evidence: " + json.dumps({
+                    "source_only_numbers": sorted(audio_conflict_numbers),
+                    "audio_only_candidate_numbers": sorted(audio_only_numbers),
+                    "locally_aligned_pairs": window_numeric_conflict_pairs,
+                }, ensure_ascii=False)
+                + ". Authoritative English stays unchanged. Use an audio candidate only from locally_aligned_pairs on the matching semantic card. Global unpaired values are diagnostic only; retain the source value when no local pair exists.",
+                "Nearby audio ASR hypothesis: " + audio_evidence_for_window(
+                    start_word, end_word,
+                ),
+                ("Validated reusable guidance: " + self.runtime_guidance) if self.runtime_guidance else "",
+                "Previous source: " + previous_source,
+                "Source words: " + json.dumps([{
+                    "index": index, "word": word.raw,
+                    "start": round(word.start, 3), "end": round(word.end, 3),
+                    "alignment_status": word.alignment_status,
+                    "confidence": word.confidence,
+                } for index, word in enumerate(window, start=1)], ensure_ascii=False),
+                "Next source: " + next_source,
+                (
+                    "Previous rejection (mandatory: change every rejected wording or "
+                    "boundary; never return the rejected Chinese unchanged): " + rejection
+                ) if rejection else "",
+            ])
             draft, provenance = writer._request_json([
                 {"role": "system", "content": "Return one valid JSON object only."},
-                {"role": "user", "content": "\n".join([
-                    "Translate audio-verified technology interview captions into concise, natural spoken Simplified Chinese.",
-                    "Reconcile both evidence fields. audio_verified_source is authoritative for corrected content words, spellings, and entities; youtube_source may restore a short preposition or function word that Whisper omitted when it is compatible with the audio evidence. Preserve recoverable meaning, modality, entities, numbers, and cause-effect while removing stutters and false starts. Restructure fragmentary speech naturally. If a complete clause is followed by disconnected repeated noun fragments, translate the complete clause and omit the ambiguous debris; never turn those nouns into a causal, locative, or explanatory relationship. More generally, if the relationship among fragments is unclear, translate only the clear proposition rather than inventing a relationship or mirroring broken English word order.",
-                    "Translate domain meaning, not the nearest dictionary word. In infrastructure or industry discussion, English 'compute' normally means 算力; reserve 计算 for an actual calculation or machine-operation sense. When industry profit or value moves 'up the stack toward the application layer', express it naturally as profit or value moving toward the application layer, never as physical 堆栈/技术栈 movement. Preserve product and company names accurately.",
-                    "Each result must be understandable on first reading, end with Chinese punctuation, stay within 42 visible characters, and fit duration_seconds at no more than 12 visible characters per second. Return every requested id exactly once as {translations:[{id,text}]}",
-                    "Terminology: " + json.dumps([
-                        {"source": item.source, "strategy": item.strategy.value, "target": item.target}
-                        for item in terminology
-                    ], ensure_ascii=False),
-                    "Cards: " + json.dumps(active, ensure_ascii=False),
-                    ("Previous audit error: " + error) if error else "",
-                ])},
-            ], max_tokens=1800)
-            attempts.append(provenance)
-            rows = draft.get("translations")
-            translated = {
-                str(row.get("id") or ""): str(row.get("text") or "").strip()
-                for row in rows if isinstance(row, dict)
-            } if isinstance(rows, list) else {}
-            for card_id, text_value in list(translated.items()):
-                if text_value and not re.search(r"[。！？!?]$", text_value):
-                    translated[card_id] = text_value + "。"
-            active_ids = {row["id"] for row in active}
-            active_by_id = {row["id"]: row for row in active}
-            invalid = [
-                card_id for card_id in active_ids
-                if not translated.get(card_id)
-                or len(re.sub(r"\s+", "", translated[card_id])) > 42
-                or len(re.sub(r"\s+", "", translated[card_id]))
-                / max(by_id[card_id].duration, 0.1) > 12
-                or _caption_entity_alignment_errors(
-                    active_by_id[card_id]["audio_verified_source"],
-                    translated[card_id],
-                )
-                or (
-                    _contains_term(
-                        active_by_id[card_id]["audio_verified_source"],
-                        "up the stack",
+                {"role": "user", "content": prompt},
+            ], max_tokens=9000 if repair_round == 0 else 3500)
+            rows = draft.get("cards")
+            if not isinstance(rows, list) or not minimum_count <= len(rows) <= maximum_count:
+                if repair_round > 0 and internal_attempt < 2:
+                    return request_window(
+                        start_word, end_word, previous_source, next_source,
+                        rejection + (
+                            "\nDeterministic structure failure: return between "
+                            f"{minimum_count} and {maximum_count} cards; got "
+                            f"{len(rows) if isinstance(rows, list) else type(rows).__name__}."
+                        ),
+                        repair_round, internal_attempt=internal_attempt + 1,
+                        minimum_card_count=minimum_count,
+                        mandatory_split_ranges=mandatory_split_ranges,
                     )
-                    and re.search(
-                        r"(?:堆栈|技术栈).{0,6}(?:上移|向上)", translated[card_id],
-                    )
+                raise ValueError(
+                    f"joint translation returned invalid card count for words "
+                    f"{start_word}:{end_word}"
                 )
-            ]
-            if invalid or set(translated) != active_ids:
-                error = "invalid audio-verified translations: " + ", ".join(
-                    sorted(set(invalid) | (active_ids - set(translated)))
-                )
-                continue
-            verdict, review_provenance = reviewer._request_json([
-                {"role": "system", "content": "Return one valid JSON object only."},
-                {"role": "user", "content": "\n".join([
-                    "Audit each audio-verified English/Chinese subtitle pair. Do not rewrite it.",
-                    "Use both evidence fields: audio_verified_source controls corrected content words, spellings, and entities; youtube_source may preserve a compatible short preposition or function word omitted by Whisper. Pass only publication-ready spoken Chinese that preserves the recoverable substantive meaning and is immediately natural to a technical Chinese viewer. Do not penalize omission of hesitation, false starts, duplicated words, or genuinely ambiguous transcript debris, and allow structural reordering required by natural Chinese. Reject lost clear claims, literal word order, ambiguous dictionary translation, wrong entities, invented relationships, or unsupported explanation. In an industry-profit context, reject physical 堆栈/技术栈 wording for 'up the stack toward the application layer'; it must convey profit or value moving toward the application layer. fidelity_score and naturalness_score must be integers from 1 to 5. Return {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]} and every id exactly once.",
-                    "Rows: " + json.dumps([{
-                        "id": row["id"],
-                        "youtube_source": row["youtube_source"],
-                        "audio_verified_source": row["audio_verified_source"],
-                        "chinese": translated[row["id"]],
-                    } for row in active], ensure_ascii=False),
-                ])},
-            ], max_tokens=1400)
-            reviews.append(review_provenance)
-            review_rows = verdict.get("reviews")
-            review_map = {
-                str(row.get("id") or ""): row
-                for row in review_rows if isinstance(row, dict)
-            } if isinstance(review_rows, list) else {}
-            rejected = [
-                card_id for card_id in active_ids
-                if card_id not in review_map
-                or review_map[card_id].get("pass") is not True
-                or _review_score_out_of_five(
-                    review_map[card_id].get("fidelity_score")
-                ) < 4
-                or _review_score_out_of_five(
-                    review_map[card_id].get("naturalness_score")
-                ) < 4
-            ]
-            rejected_set = set(rejected)
-            locked.update({
-                card_id: translated[card_id]
-                for card_id in active_ids - rejected_set
-            })
-            if rejected:
-                error = "audio-verified reviewer rejected: " + json.dumps({
-                    card_id: {
-                        "chinese": translated.get(card_id, ""),
-                        "pass": review_map.get(card_id, {}).get("pass"),
-                        "fidelity_score": review_map.get(card_id, {}).get("fidelity_score"),
-                        "naturalness_score": review_map.get(card_id, {}).get("naturalness_score"),
-                        "errors": review_map.get(card_id, {}).get("errors", []),
-                    }
-                    for card_id in rejected
-                }, ensure_ascii=False)
-                continue
-            break
-        if set(locked) != expected:
-            raise ValueError(
-                "audio-verified caption repair failed closed: "
-                + ", ".join(sorted(expected - set(locked)))
-                + ("; " + error if error else "")
-            )
-        source_by_id = {
-            row["id"]: row["audio_verified_source"] for row in requested
-        }
-        for card_id in expected:
-            cue = by_id[card_id]
-            cue.source_text = source_by_id[card_id]
-            cue.translation = locked[card_id]
-        self._enforce_terminology_contract(cues, terminology)
-        return {
-            "step": "audio_verified_caption_repair",
-            "cue_ids": sorted(expected),
-            "merged_fragments": merged_fragments,
-            "duplicate_cleanup_cue_ids": duplicate_cleanup_cue_ids,
-            "translation_attempts": attempts,
-            "review_attempts": reviews,
-        }
-    def repair_interview_chinese_style(
-        self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
-    ) -> dict[str, Any] | None:
-        """Repair explicitly detected failures without globally rewriting good copy."""
-        errors = interview_chinese_style_errors(cues)
-        if not errors:
-            return None
-        by_id = {cue.id: cue for cue in cues}
-        positions = {cue.id: index for index, cue in enumerate(cues)}
-        payload = []
-        for cue_id, reasons in errors.items():
-            index = positions[cue_id]
-            cue = by_id[cue_id]
-            payload.append({
-                "id": cue.id,
-                "source": cue.source_text,
-                "current_chinese": cue.translation,
-                "style_errors": reasons,
-                "previous_source": cues[index - 1].source_text if index else "",
-                "next_source": cues[index + 1].source_text if index + 1 < len(cues) else "",
-            })
-        expected = set(errors)
-        last_error = ""
-        provenance: dict[str, Any] | None = None
-        provider_failures: list[str] = []
-        repair_writers = []
-        for writer in (
-            getattr(self.writer, "fallback", None),
-            self.directing_writer, self.writer,
-        ):
+            ends = [row.get("end_word") if isinstance(row, dict) else None for row in rows]
             if (
-                writer is not None and hasattr(writer, "_request_json")
-                and all(writer is not existing for existing in repair_writers)
+                any(type(value) is not int for value in ends)
+                or ends[-1] != len(window)
+                or any(left >= right for left, right in zip((0, *ends[:-1]), ends))
             ):
-                repair_writers.append(writer)
-        if not repair_writers:
-            return None
-        for repair_writer in repair_writers:
-            for _ in range(2):
-                try:
-                    draft, provenance = repair_writer._request_json([
+                if repair_round > 0 and internal_attempt < 2:
+                    return request_window(
+                        start_word, end_word, previous_source, next_source,
+                        rejection + (
+                            "\nDeterministic structure failure: end_word must increase "
+                            f"strictly and finish at {len(window)}; got {ends}."
+                        ),
+                        repair_round, internal_attempt=internal_attempt + 1,
+                        minimum_card_count=minimum_count,
+                        mandatory_split_ranges=mandatory_split_ranges,
+                    )
+                raise ValueError(
+                    f"joint translation returned invalid word boundaries: {ends}"
+                )
+            absolute_boundaries = {
+                start_word + value for value in ends[:-1]
+            }
+            unsplit = [
+                (left, right) for left, right in mandatory_split_ranges
+                if not any(left < boundary < right for boundary in absolute_boundaries)
+            ]
+            if unsplit:
+                if repair_round > 0 and internal_attempt < 2:
+                    return request_window(
+                        start_word, end_word, previous_source, next_source,
+                        rejection + (
+                            "\nDeterministic boundary failure: add an end_word "
+                            "strictly inside each rejected source range: "
+                            + json.dumps(unsplit)
+                        ),
+                        repair_round, internal_attempt=internal_attempt + 1,
+                        minimum_card_count=minimum_count,
+                        mandatory_split_ranges=mandatory_split_ranges,
+                    )
+                raise ValueError(
+                    "joint translation did not split rejected source ranges: "
+                    + json.dumps(unsplit)
+                )
+            spans: list[tuple[int, int, str]] = []
+            left = 0
+            for row, right in zip(rows, ends):
+                text_value = str(row.get("text") or "").strip()
+                if not text_value:
+                    if repair_round > 0 and internal_attempt < 2:
+                        return request_window(
+                            start_word, end_word, previous_source, next_source,
+                            rejection + "\nDeterministic structure failure: no Chinese card may be empty.",
+                            repair_round, internal_attempt=internal_attempt + 1,
+                            minimum_card_count=minimum_count,
+                            mandatory_split_ranges=mandatory_split_ranges,
+                        )
+                    raise ValueError("joint translation returned an empty Chinese card")
+                spans.append((start_word + left, start_word + right, text_value))
+                left = right
+            if repair_round > 0:
+                proposed_cards = materialize(spans)
+                local_errors = interview_caption_duration_errors(
+                    proposed_cards, terminology, audio_conflict_entities,
+                )
+                for card in proposed_cards:
+                    local_errors.extend(
+                        f"{card.id}:{error}"
+                        for error in _semantic_card_translation_errors({
+                            "id": card.id, "source": card.source_text,
+                            "duration_seconds": card.duration,
+                        }, card.translation, terminology, require_punctuation=False,
+                           audio_conflict_entities=audio_conflict_entities)
+                    )
+                if local_errors and internal_attempt == 0:
+                    split_failure = any(
+                        "hard maximum" in error
+                        or "English words" in error
+                        or "does not fit the three-line subtitle panel" in error
+                        for error in local_errors
+                    )
+                    stricter_minimum = (
+                        min(maximum_count, len(spans) + 1)
+                        if split_failure and len(spans) < maximum_count
+                        else minimum_count
+                    )
+                    retry_feedback = json.dumps({
+                        "errors": local_errors,
+                        "rejected_cards": [{
+                            "source": card.source_text,
+                            "chinese": card.translation,
+                            "duration": round(card.duration, 3),
+                        } for card in proposed_cards],
+                    }, ensure_ascii=False)
+                    return request_window(
+                        start_word, end_word, previous_source, next_source,
+                        retry_feedback, repair_round, internal_attempt=1,
+                        minimum_card_count=stricter_minimum,
+                        mandatory_split_ranges=mandatory_split_ranges,
+                    )
+            return spans, provenance
+
+        def materialize(
+            spans: list[tuple[int, int, str]],
+        ) -> list[TranscriptCue]:
+            cards: list[TranscriptCue] = []
+            for index, (start_word, end_word, chinese) in enumerate(spans, start=1):
+                if start_word == 0:
+                    start = clip_start
+                else:
+                    start = (words[start_word - 1].end + words[start_word].start) / 2
+                if end_word == len(words):
+                    end = clip_end
+                else:
+                    end = (words[end_word - 1].end + words[end_word].start) / 2
+                source_text = " ".join(
+                    word.raw for word in words[start_word:end_word]
+                )
+                translation = omit_spoken_fillers_from_translation(
+                    source_text, normalize_chinese_subtitle(chinese),
+                )
+                cards.append(TranscriptCue(
+                    id=f"interview-card-{index}", start=round(start, 3),
+                    end=round(end, 3),
+                    source_text=source_text, translation=translation,
+                    source_tokens=[{
+                        "raw": word.raw,
+                        "start": round(word.start, 3),
+                        "end": round(word.end, 3),
+                    } for word in words[start_word:end_word]],
+                    confidence=min((
+                        word.confidence for word in words[start_word:end_word]
+                        if word.confidence is not None
+                    ), default=None),
+                ))
+            return cards
+
+        def coalesce_mechanical_boundary_failures(
+            spans: list[tuple[int, int, str]],
+        ) -> tuple[list[tuple[int, int, str]], list[dict[str, Any]]]:
+            """Merge only failures whose correct neighbor is mechanically knowable."""
+            normalized = list(spans)
+            changes: list[dict[str, Any]] = []
+            while len(normalized) > 1:
+                cards = materialize(normalized)
+                target: int | None = next((
+                    index for index, card in enumerate(cards)
+                    if card.duration < INTERVIEW_CAPTION_MIN_SECONDS - 1e-6
+                    and not (
+                        card.duration >= INTERVIEW_CAPTION_BRIEF_ACK_MIN_SECONDS - 1e-6
+                        and len(card.source_text.split()) <= 2
+                        and len(re.sub(r"\s+", "", card.translation)) <= 4
+                    )
+                ), None)
+                reason = "minimum_duration"
+                preferred_neighbors: list[int] = []
+                if target is None:
+                    for index, card in enumerate(cards):
+                        moved = [
+                            value.split(":", 1)[1]
+                            for value in _caption_entity_alignment_errors(
+                                card.source_text, card.translation, terminology,
+                                audio_conflict_entities,
+                            ) if value.startswith("moved:")
+                        ]
+                        for entity in moved:
+                            owners = [
+                                owner for owner, candidate in enumerate(cards)
+                                if owner != index
+                                and _contains_term(candidate.source_text, entity)
+                            ]
+                            if owners:
+                                owner = min(owners, key=lambda value: abs(value - index))
+                                target = index
+                                preferred_neighbors = [
+                                    index - 1 if owner < index else index + 1
+                                ]
+                                reason = f"entity_owner:{entity}"
+                            if target is not None:
+                                break
+                        if target is not None:
+                            break
+                if target is None:
+                    break
+                candidates = preferred_neighbors or [
+                    index for index in (target - 1, target + 1)
+                    if 0 <= index < len(normalized)
+                ]
+                accepted: tuple[int, list[tuple[int, int, str]], TranscriptCue] | None = None
+                for neighbor in sorted(
+                    candidates, key=lambda index: cards[index].duration,
+                ):
+                    left = min(target, neighbor)
+                    right = max(target, neighbor)
+                    merged_text = normalize_chinese_subtitle(
+                        normalized[left][2].rstrip("，；,; ")
+                        + normalized[right][2].lstrip()
+                    )
+                    proposed = [
+                        *normalized[:left],
+                        (normalized[left][0], normalized[right][1], merged_text),
+                        *normalized[right + 1:],
+                    ]
+                    merged_card = materialize(proposed)[left]
+                    remaining_entity_errors = _caption_entity_alignment_errors(
+                        merged_card.source_text, merged_card.translation, terminology,
+                        audio_conflict_entities,
+                    )
+                    allow_step_toward_entity_owner = (
+                        reason.startswith("entity_owner:")
+                        and all(value.startswith("moved:") for value in remaining_entity_errors)
+                    )
+                    if (
+                        merged_card.duration <= INTERVIEW_CAPTION_HARD_MAX_SECONDS + 1e-6
+                        and len(merged_card.source_text.split())
+                        <= INTERVIEW_CAPTION_MAX_ENGLISH_WORDS
+                        and _subtitle_reading_units(merged_card.translation)
+                        / max(merged_card.duration, 0.1)
+                        <= INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
+                        and not interview_caption_layout_errors([merged_card])
+                        and (
+                            not remaining_entity_errors
+                            or allow_step_toward_entity_owner
+                        )
+                    ):
+                        accepted = left, proposed, merged_card
+                        break
+                if accepted is None:
+                    break
+                left, normalized, merged_card = accepted
+                changes.append({
+                    "reason": reason,
+                    "merged_at_card": left + 1,
+                    "resulting_source": merged_card.source_text,
+                    "resulting_duration": round(merged_card.duration, 3),
+                })
+            return normalized, changes
+
+        def validate_and_review(
+            spans: list[tuple[int, int, str]], repair_round: int,
+        ) -> tuple[list[TranscriptCue], dict[int, list[str]], dict[str, Any] | None]:
+            cards = materialize(spans)
+            problems: dict[int, list[str]] = {}
+            for error in interview_caption_duration_errors(
+                cards, terminology, audio_conflict_entities,
+            ):
+                match = re.match(r"interview-card-(\d+)", error)
+                if match:
+                    problems.setdefault(int(match.group(1)) - 1, []).append(error)
+            for index, card in enumerate(cards):
+                semantic_errors = _semantic_card_translation_errors({
+                    "id": card.id, "source": card.source_text,
+                    "duration_seconds": card.duration,
+                }, card.translation, terminology, require_punctuation=False,
+                   audio_conflict_entities=audio_conflict_entities)
+                if semantic_errors:
+                    problems.setdefault(index, []).extend(semantic_errors)
+                left, right, _ = spans[index]
+                numeric_errors = _caption_numeric_alignment_errors(
+                    words, left, right, card.translation,
+                    numeric_conflict_pairs,
+                )
+                if numeric_errors:
+                    problems.setdefault(index, []).extend(numeric_errors)
+            if problems:
+                return cards, problems, None
+            expected = {card.id for card in cards}
+
+            def partition_indices() -> list[tuple[int, int]]:
+                partitions: list[tuple[int, int]] = []
+                start = 0
+                while start < len(cards):
+                    end = min(len(cards), start + 24)
+                    while end > start + 1 and len(json.dumps([
+                        {"id": card.id, "source": card.source_text,
+                         "chinese": card.translation}
+                        for card in cards[start:end]
+                    ], ensure_ascii=False)) > 10000:
+                        end -= 1
+                    if end < len(cards) and end - start > 12:
+                        sentence_ends = [
+                            index for index in range(start + 12, end)
+                            if re.search(r"[.!?][\"')\]]?$", cards[index - 1].source_text)
+                        ]
+                        if sentence_ends:
+                            end = sentence_ends[-1]
+                    partitions.append((start, end))
+                    start = end
+                return partitions
+
+            partitions = partition_indices()
+            by_id: dict[str, dict[str, Any]] = {}
+            local_review_traces: list[dict[str, Any]] = []
+            for partition_number, (core_start, core_end) in enumerate(partitions, start=1):
+                core = cards[core_start:core_end]
+                context = cards[max(0, core_start - 2):core_start] + cards[
+                    core_end:min(len(cards), core_end + 2)
+                ]
+                core_expected = {card.id for card in core}
+                attempt_provenances: list[dict[str, Any]] = []
+                structure_failures: list[list[str]] = []
+                for review_attempt in range(2):
+                    reviewed, attempt_provenance = reviewer._request_json([
                         {"role": "system", "content": "Return one valid JSON object only."},
                         {"role": "user", "content": "\n".join([
-                            "Act as the final Chinese translation editor for these interview captions. Rewrite every row as fluent, compact Chinese that a viewer can understand while seeing that row alone; do not merely polish or preserve English sentence structure.",
-                            "Preserve the English source's actor, action, timing, uncertainty, negation, numbers, entities, and cause-effect. Do not borrow a new fact from neighboring cards. When English begins with a conjunction or relative clause, use neighboring source only to recover the omitted subject, predicate, or referent, then write a complete standalone Chinese sentence rather than a continuation. Resolve obvious ASR spellings from context. For product-stack language such as 'up the stack toward the application layer', express the movement naturally in Chinese instead of translating 'up' as supply-chain upstream. Every result must end with punctuation, fit its speaking duration, "
-                            f"and remain within {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS} visible characters and {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND:g} visible characters per second.",
-                            "Return every id exactly once as {translations:[{id,text}]}; no commentary.",
-                            "Terminology: " + json.dumps([
-                                {
-                                    "source": item.source, "strategy": item.strategy.value,
-                                    "target": item.target,
-                                    "first_use_explanation": item.first_use_explanation,
-                                } for item in terminology
+                            "Independently review this ordered bilingual subtitle partition. Do not rewrite it. Context rows are read-only and must not appear in the response. A sentence may continue naturally across cards; do not require every card to be a standalone proposition.",
+                            "Reject only material omissions, inventions, changed modality or scope, misplaced entities, misleading cuts, incomprehensible Chinese, or a contextual term unsupported by the actual actor and actions. Accept faithful natural paraphrases. A preference, optional nuance, or stylistic suggestion is not enough to fail a card. alternatives are candidates, not automatic approvals.",
+                            "Reject Chinese that translates discourse fillers or sound metadata. Their omission is intentional and is not a semantic omission.",
+                            "Return every core id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. Pass only when both scores are at least 4.",
+                            "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                            "Local audio ASR hypothesis (conflict evidence only): "
+                            + audio_evidence_for_window(
+                                spans[core_start][0], spans[core_end - 1][1],
+                            ),
+                            "Local numeric conflict evidence: " + json.dumps([
+                                row for row in numeric_conflict_pairs
+                                if spans[core_start][0] < int(row["source_word_index"])
+                                <= spans[core_end - 1][1]
                             ], ensure_ascii=False),
-                            "Rows: " + json.dumps(payload, ensure_ascii=False),
-                            ("Previous validation error: " + last_error) if last_error else "",
+                            (
+                                "The previous reviewer response failed deterministic structure validation: "
+                                + json.dumps(structure_failures[-1], ensure_ascii=False)
+                                + ". Review the unchanged core rows again and return the exact schema."
+                            ) if structure_failures else "",
+                            "Context rows: " + json.dumps([{
+                                "id": card.id, "source": card.source_text,
+                                "chinese": card.translation,
+                            } for card in context], ensure_ascii=False),
+                            "Rows: " + json.dumps([{
+                                "id": card.id, "source": card.source_text,
+                                "chinese": card.translation,
+                            } for card in core], ensure_ascii=False),
                         ])},
-                    ], max_tokens=2500)
-                except Exception as error:
-                    last_error = f"{type(error).__name__}: {error}"
-                    provider_failures.append(last_error)
-                    break
-                rows = draft.get("translations")
-                translated = {
-                    str(row.get("id") or ""): str(row.get("text") or "").strip()
-                    for row in rows if isinstance(row, dict)
-                } if isinstance(rows, list) else {}
-                if set(translated) != expected or any(not value for value in translated.values()):
-                    last_error = "return every flagged id exactly once with non-empty text"
-                    continue
-                proposed = [TranscriptCue(
-                    id=cue_id, start=by_id[cue_id].start, end=by_id[cue_id].end,
-                    source_text=by_id[cue_id].source_text,
-                    translation=(
-                        translated[cue_id]
-                        if re.search(r"[。！？!?]$", translated[cue_id])
-                        else translated[cue_id] + "。"
-                    ),
-                ) for cue_id in expected]
-                validation_errors = {
-                    cue.id: _semantic_card_translation_errors({
-                        "source": cue.source_text,
-                        "duration_seconds": cue.duration,
-                    }, cue.translation, terminology)
-                    for cue in proposed
-                }
-                validation_errors = {
-                    cue_id: values for cue_id, values in validation_errors.items()
-                    if values
-                }
-                if validation_errors:
-                    last_error = json.dumps({
-                        "validation_errors": validation_errors,
-                    }, ensure_ascii=False)
-                    continue
-                previous_translations = {cue.id: cue.translation for cue in cues}
-                for cue in proposed:
-                    by_id[cue.id].translation = cue.translation
-                self._enforce_terminology_contract(cues, terminology)
-                if term_errors := terminology_contract_errors(cues, terminology):
-                    for cue in cues:
-                        cue.translation = previous_translations[cue.id]
-                    last_error = "final Chinese style repair violated terminology: " + "; ".join(
-                        term_errors
+                    ], max_tokens=min(8000, 500 + 220 * len(core)))
+                    attempt_provenances.append(attempt_provenance)
+                    rows = reviewed.get("reviews")
+                    structure_errors: list[str] = []
+                    if not isinstance(rows, list):
+                        structure_errors.append("reviews must be an array")
+                        candidate_rows: list[dict[str, Any]] = []
+                    else:
+                        candidate_rows = [row for row in rows if isinstance(row, dict)]
+                        if len(candidate_rows) != len(rows):
+                            structure_errors.append("every review must be an object")
+                    ids = [str(row.get("id") or "") for row in candidate_rows]
+                    if (
+                        len(ids) != len(core_expected)
+                        or len(set(ids)) != len(ids)
+                        or set(ids) != core_expected
+                    ):
+                        structure_errors.append(
+                            "review ids must contain every core id exactly once"
+                        )
+                    for row in candidate_rows:
+                        row_id = str(row.get("id") or "")
+                        if type(row.get("pass")) is not bool:
+                            structure_errors.append(f"{row_id}: pass must be boolean")
+                        for score_name in ("fidelity_score", "naturalness_score"):
+                            if not 1 <= _review_score_out_of_five(row.get(score_name)) <= 5:
+                                structure_errors.append(
+                                    f"{row_id}: {score_name} must be between 1 and 5"
+                                )
+                        if not isinstance(row.get("errors"), list):
+                            structure_errors.append(f"{row_id}: errors must be an array")
+                    if not structure_errors:
+                        by_id.update({str(row["id"]): row for row in candidate_rows})
+                        break
+                    structure_failures.append(structure_errors)
+                else:
+                    raise ValueError(
+                        "independent subtitle reviewer returned invalid partition structure twice: "
+                        + json.dumps(structure_failures, ensure_ascii=False)
                     )
-                    continue
-                if caption_errors := interview_caption_duration_errors(
-                    [by_id[cue_id] for cue_id in expected]
+                local_review_traces.append({
+                    "partition": partition_number,
+                    "core_card_ids": [card.id for card in core],
+                    "context_card_ids": [card.id for card in context],
+                    "attempts": attempt_provenances,
+                    "structure_failures": structure_failures,
+                })
+
+            global_trace: dict[str, Any] | None = None
+            if len(partitions) > 1:
+                global_failures: list[list[str]] = []
+                global_provenances: list[dict[str, Any]] = []
+                for global_attempt in range(2):
+                    verdict, global_provenance = reviewer._request_json([
+                        {"role": "system", "content": "Return one valid JSON object only."},
+                        {"role": "user", "content": "\n".join([
+                            "Check only cross-partition consistency in this already locally reviewed bilingual subtitle sequence. Do not rewrite it.",
+                            "Check consistent contextual terminology, entity ownership, adjacent boundary meaning, and cross-card duplication or omission. Return {pass,issues:[{ids,errors}]}. pass=true requires an empty issues array. Every issue id must come from Sequence.",
+                            "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                            (
+                                "The previous global response failed deterministic structure validation: "
+                                + json.dumps(global_failures[-1], ensure_ascii=False)
+                                + ". Check the unchanged sequence again and return the exact schema."
+                            ) if global_failures else "",
+                            "Sequence: " + json.dumps([{
+                                "id": card.id, "source": card.source_text,
+                                "chinese": card.translation,
+                            } for card in cards], ensure_ascii=False),
+                        ])},
+                    ], max_tokens=3500)
+                    global_provenances.append(global_provenance)
+                    structure_errors: list[str] = []
+                    passed = verdict.get("pass")
+                    issues = verdict.get("issues")
+                    if type(passed) is not bool:
+                        structure_errors.append("pass must be boolean")
+                    if not isinstance(issues, list):
+                        structure_errors.append("issues must be an array")
+                        issue_rows: list[dict[str, Any]] = []
+                    else:
+                        issue_rows = [row for row in issues if isinstance(row, dict)]
+                        if len(issue_rows) != len(issues):
+                            structure_errors.append("every issue must be an object")
+                    for issue in issue_rows:
+                        ids = issue.get("ids")
+                        errors = issue.get("errors")
+                        if (
+                            not isinstance(ids, list) or not ids
+                            or not set(map(str, ids)) <= expected
+                        ):
+                            structure_errors.append("issue ids must be non-empty sequence ids")
+                        if not isinstance(errors, list) or not errors:
+                            structure_errors.append("issue errors must be a non-empty array")
+                    if passed is True and issue_rows:
+                        structure_errors.append("pass=true requires no issues")
+                    if passed is False and not issue_rows:
+                        structure_errors.append("pass=false requires at least one issue")
+                    if not structure_errors:
+                        if passed is False:
+                            index_by_id = {card.id: index for index, card in enumerate(cards)}
+                            for issue in issue_rows:
+                                for card_id in map(str, issue["ids"]):
+                                    problems.setdefault(index_by_id[card_id], []).extend(
+                                        str(error) for error in issue["errors"]
+                                    )
+                        break
+                    global_failures.append(structure_errors)
+                else:
+                    raise ValueError(
+                        "global subtitle consistency reviewer returned invalid structure twice: "
+                        + json.dumps(global_failures, ensure_ascii=False)
+                    )
+                global_trace = {
+                    "attempts": global_provenances,
+                    "structure_failures": global_failures,
+                    "pass": passed,
+                    "issues": issue_rows,
+                }
+            provenance = {
+                "local_review_partitions": local_review_traces,
+                "global_consistency_review": global_trace,
+            }
+            for index, card in enumerate(cards):
+                row = by_id.get(card.id, {})
+                if (
+                    row.get("pass") is not True
+                    or _review_score_out_of_five(row.get("fidelity_score")) < 4
+                    or _review_score_out_of_five(row.get("naturalness_score")) < 4
                 ):
-                    for cue in cues:
-                        cue.translation = previous_translations[cue.id]
-                    last_error = (
-                        "final Chinese style repair violated caption policy: "
-                        + "; ".join(caption_errors)
+                    raw_errors = row.get("errors", ["missing independent review"])
+                    errors = [str(value) for value in raw_errors] \
+                        if isinstance(raw_errors, list) else [str(raw_errors)]
+                    problems.setdefault(index, []).extend(errors)
+            return cards, problems, provenance
+
+        def initial_windows() -> list[tuple[int, int]]:
+            """Bound response size while assigning every source word exactly once."""
+            windows: list[tuple[int, int]] = []
+            start = 0
+            while len(words) - start > 150:
+                lower = start + 90
+                upper = min(len(words), start + 150)
+                candidates = [
+                    index for index in range(lower, upper + 1)
+                    if re.search(r"[.!?][\"')\]]?$", words[index - 1].raw)
+                ]
+                end = max(candidates) if candidates else start + 120
+                windows.append((start, end))
+                start = end
+            windows.append((start, len(words)))
+            return windows
+
+        spans: list[tuple[int, int, str]] = []
+        initial_window_traces: list[dict[str, Any]] = []
+        initial_structure_failures: list[str] = []
+        for window_start, window_end in initial_windows():
+            initial_rejection = ""
+            window_failures: list[str] = []
+            for initial_attempt in range(2):
+                try:
+                    replacement, provenance = request_window(
+                        window_start, window_end,
+                        " ".join(word.raw for word in words[max(0, window_start - 16):window_start]),
+                        " ".join(word.raw for word in words[window_end:min(len(words), window_end + 16)]),
+                        initial_rejection, 0, internal_attempt=initial_attempt,
                     )
-                    continue
-                return {
-                    "step": "interview_chinese_style_repair",
-                    "cue_ids": sorted(expected),
-                    "provenance": provenance,
-                    "provider_failures": provider_failures,
+                    spans.extend(replacement)
+                    initial_window_traces.append({
+                        "source_word_window": [window_start, window_end],
+                        "request_attempts": initial_attempt + 1,
+                        "earlier_structure_failures": window_failures,
+                        "provenance": provenance,
+                    })
+                    break
+                except ValueError as exc:
+                    failure = str(exc)
+                    window_failures.append(failure)
+                    initial_structure_failures.append(failure)
+                    initial_rejection = (
+                        "The previous response for this exact source window failed "
+                        f"deterministic output validation: {exc}. Return the complete "
+                        "cards array again with strictly increasing end_word values "
+                        "and exact final coverage."
+                    )
+            else:
+                diagnostic = [{
+                    "round": 0, "kind": "initial_joint_translation_failed",
+                    "source_word_window": [window_start, window_end],
+                    "errors": window_failures,
+                }]
+                raise InterviewJointTranslationError(
+                    "interview initial joint translation failed after one structural "
+                    "self-repair: " + "; ".join(window_failures), diagnostic,
+                )
+        attempts.append({
+            "round": 0, "kind": "initial_joint_translation",
+            "window_count": len(initial_window_traces),
+            "windows": initial_window_traces,
+            "earlier_structure_failures": initial_structure_failures,
+        })
+        last_problems: dict[int, list[str]] = {}
+        final_cards: list[TranscriptCue] = []
+        review_provenance: dict[str, Any] | None = None
+        for repair_round in range(4):
+            spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
+            if deterministic_merges:
+                attempts.append({
+                    "round": repair_round,
+                    "kind": "deterministic_boundary_coalesce",
+                    "changes": deterministic_merges,
+                })
+            final_cards, last_problems, review_provenance = validate_and_review(
+                spans, repair_round,
+            )
+            attempts.append({
+                "round": repair_round, "kind": "validation_and_review",
+                "failed_card_ids": [final_cards[index].id for index in last_problems],
+                "errors": last_problems,
+                "failed_cards": [{
+                    "id": final_cards[index].id,
+                    "source": final_cards[index].source_text,
+                    "chinese": final_cards[index].translation,
+                    "start": final_cards[index].start,
+                    "end": final_cards[index].end,
+                } for index in last_problems],
+                "review_provenance": review_provenance,
+            })
+            if not last_problems:
+                break
+            if repair_round == 3:
+                break
+            failed = sorted(last_problems)
+            windows: list[tuple[int, int]] = []
+            for index in failed:
+                start = max(0, index - 1)
+                end = min(len(spans), index + 2)
+                moved_entities = {
+                    match.group(1)
+                    for error in last_problems[index]
+                    for match in [re.search(r"moved:([A-Za-z0-9._+-]+)", error)]
+                    if match
                 }
-        raise ValueError("interview Chinese style repair failed: " + last_error)
+                for entity in moved_entities:
+                    owners = [
+                        owner for owner, card in enumerate(final_cards)
+                        if _contains_term(card.source_text, entity)
+                    ]
+                    if owners:
+                        owner = min(owners, key=lambda value: abs(value - index))
+                        start = max(0, min(start, owner - 1))
+                        end = min(len(spans), max(end, owner + 2))
+                if windows and start <= windows[-1][1]:
+                    windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+                else:
+                    windows.append((start, end))
+            repaired: list[tuple[int, int, str]] = []
+            cursor = 0
+            repair_traces: list[dict[str, Any]] = []
+            for start, end in windows:
+                repaired.extend(spans[cursor:start])
+                word_start = spans[start][0]
+                word_end = spans[end - 1][1]
+                previous = final_cards[start - 1].source_text if start else ""
+                following = final_cards[end].source_text if end < len(final_cards) else ""
+                rejection = json.dumps({
+                    final_cards[index].id: {
+                        "source": final_cards[index].source_text,
+                        "rejected_chinese": final_cards[index].translation,
+                        "errors": last_problems[index],
+                    }
+                    for index in range(start, end) if index in last_problems
+                }, ensure_ascii=False)
+                requires_extra_card = any(
+                    "hard maximum" in error
+                    or "English words" in error
+                    or "does not fit the three-line subtitle panel" in error
+                    for index in range(start, end)
+                    for error in last_problems.get(index, [])
+                )
+                mandatory_split_ranges = tuple(
+                    (spans[index][0], spans[index][1])
+                    for index in range(start, end)
+                    if index in last_problems
+                    and spans[index][1] - spans[index][0] > 1
+                    and any(
+                        "hard maximum" in error
+                        or "English words" in error
+                        or "does not fit the three-line subtitle panel" in error
+                        for error in last_problems[index]
+                    )
+                )
+                replacement, provenance = request_window(
+                    word_start, word_end, previous, following, rejection,
+                    repair_round + 1,
+                    minimum_card_count=(end - start + 1 if requires_extra_card else 0),
+                    mandatory_split_ranges=mandatory_split_ranges,
+                )
+                repaired.extend(replacement)
+                repair_traces.append({
+                    "old_card_window": [start + 1, end],
+                    "source_word_window": [word_start, word_end],
+                    "new_card_count": len(replacement),
+                    "replacement_cards": [{
+                        "source_word_window": [left, right],
+                        "source": " ".join(
+                            word.raw for word in words[left:right]
+                        ),
+                        "chinese": chinese,
+                    } for left, right, chinese in replacement],
+                    "provenance": provenance,
+                })
+                cursor = end
+            repaired.extend(spans[cursor:])
+            spans = repaired
+            attempts.append({
+                "round": repair_round + 1, "kind": "local_joint_repair",
+                "windows": repair_traces,
+            })
+        if last_problems:
+            raise InterviewJointTranslationError(
+                "interview joint translation exhausted three local repair rounds: "
+                + json.dumps(last_problems, ensure_ascii=False), attempts,
+            )
+        if " ".join(card.source_text for card in final_cards) != actual_source:
+            raise ValueError("joint subtitle cards lost or reordered source words")
+        cues[:] = final_cards
+        adopted_targets = _adopt_independently_reviewed_terminology_targets(
+            cues, terminology,
+        )
+        if term_errors := terminology_contract_errors(cues, terminology):
+            raise ValueError(
+                "joint subtitle cards violate terminology contract: "
+                + "; ".join(term_errors)
+            )
+        return {
+            "step": "interview_joint_boundary_translation",
+            "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
+            "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+            "reviewed_cue_ids": [cue.id for cue in cues],
+            "source_word_ids": [word.id for word in words],
+            "source_ledger_fingerprint": source_ledger_fingerprint(words),
+            "strict_source_fingerprint": _strict_interview_source_fingerprint(cues),
+            "caption_content_fingerprint": _interview_caption_content_fingerprint(cues),
+            "terminology_decision_fingerprint": _terminology_decision_fingerprint(
+                terminology,
+            ),
+            "alignment_fingerprint": alignment_fingerprint,
+            "audio_hypothesis_sha256": (
+                hashlib.sha256(audio_hypothesis.encode("utf-8")).hexdigest()
+                if audio_hypothesis else ""
+            ),
+            "audio_conflict_entities": sorted(audio_conflict_entities),
+            "audio_conflict_numbers": sorted(audio_conflict_numbers),
+            "audio_only_numbers": sorted(audio_only_numbers),
+            "numeric_conflict_pairs": numeric_conflict_pairs,
+            "translation_passes": 1,
+            "repair_rounds": sum(
+                item["kind"] == "local_joint_repair" for item in attempts
+            ),
+            "attempts": attempts,
+            "adopted_terminology_targets": adopted_targets,
+        }
+
+    def translate_caption_scopes(
+        self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
+        plan: dict[str, Any], duration: float, editorial_mode: str,
+    ) -> dict[str, Any]:
+        """Run the joint subtitle engine inside immutable editorial cut ranges."""
+        publishable_source_cues: list[TranscriptCue] = []
+        for cue in cues:
+            source_text = omit_non_speech_directions(cue.source_text)
+            if not source_text:
+                continue
+            publishable_source_cues.append(TranscriptCue(
+                **{
+                    **asdict(cue),
+                    "source_text": source_text,
+                    "translation": "",
+                    "source_tokens": [
+                        row for row in cue.source_tokens
+                        if omit_non_speech_directions(
+                            str(row.get("raw") or "")
+                        ).strip()
+                    ],
+                }
+            ))
+        source_words = source_words_from_cues(publishable_source_cues)
+        ranges = _caption_plan_ranges(plan, duration)
+        scope_traces: list[dict[str, Any]] = []
+        translated: list[TranscriptCue] = []
+        assigned_word_ids: set[str] = set()
+        for scope_number, source_range in enumerate(ranges, start=1):
+            scope_words = [
+                word for word in source_words
+                if source_range.start <= (word.start + word.end) / 2 < source_range.end
+                and word.id not in assigned_word_ids
+            ]
+            if not scope_words:
+                continue
+            assigned_word_ids.update(word.id for word in scope_words)
+            scope_cues = [TranscriptCue(
+                id=f"caption-scope-{scope_number:03d}",
+                start=scope_words[0].start,
+                end=scope_words[-1].end,
+                source_text=" ".join(word.raw for word in scope_words),
+                source_tokens=[{
+                    "raw": word.raw, "start": word.start, "end": word.end,
+                } for word in scope_words],
+            )]
+            scope_trace = self.translate_interview_clip_once(
+                scope_cues, terminology, scope_words,
+                "json3:" + source_ledger_fingerprint(scope_words), "",
+            )
+            for card_number, card in enumerate(scope_cues, start=1):
+                card.id = (
+                    f"caption-scope-{scope_number:03d}-card-{card_number:04d}"
+                )
+            translated.extend(scope_cues)
+            scope_traces.append({
+                "scope": scope_number,
+                "source_range": [source_range.start, source_range.end],
+                "reviewed_cue_ids": [card.id for card in scope_cues],
+                "trace": scope_trace,
+            })
+        selected_word_ids = {
+            word.id for word in source_words
+            if any(
+                source_range.start <= (word.start + word.end) / 2 < source_range.end
+                for source_range in ranges
+            )
+        }
+        if assigned_word_ids != selected_word_ids:
+            missing = sorted(selected_word_ids - assigned_word_ids)
+            duplicated_or_extra = sorted(assigned_word_ids - selected_word_ids)
+            raise ValueError(
+                "joint caption scopes did not cover selected source words exactly once: "
+                f"missing={missing[:10]}, extra={duplicated_or_extra[:10]}"
+            )
+        if not translated:
+            raise ValueError("selected editorial ranges contain no subtitle source words")
+        translated.sort(key=lambda cue: (cue.start, cue.end, cue.id))
+        if term_errors := terminology_contract_errors(translated, terminology):
+            raise ValueError(
+                "joint caption scopes violate terminology contract: "
+                + "; ".join(term_errors)
+            )
+        cross_scope_trace: dict[str, Any] | None = None
+        if len(scope_traces) > 1:
+            boundary_ids = {
+                cue_id
+                for scope in scope_traces
+                for cue_id in (
+                    scope["reviewed_cue_ids"][0],
+                    scope["reviewed_cue_ids"][-1],
+                )
+            }
+            consistency_rows = [
+                {
+                    "id": cue.id, "source": cue.source_text,
+                    "chinese": cue.translation,
+                }
+                for cue in translated
+                if cue.id in boundary_ids or any(
+                    _contains_term(cue.source_text, entry.source)
+                    or entry.target in cue.translation
+                    or any(value in cue.translation for value in entry.alternatives)
+                    for entry in terminology
+                )
+            ]
+            expected_ids = {row["id"] for row in consistency_rows}
+            structure_failures: list[list[str]] = []
+            provenances: list[dict[str, Any]] = []
+            for attempt in range(2):
+                verdict, provenance = (
+                    self.subtitle_reviewer or self.directing_writer
+                )._request_json([
+                    {"role": "system", "content": "Return one valid JSON object only."},
+                    {"role": "user", "content": "\n".join([
+                        "Independently check only cross-scope consistency in these already reviewed bilingual subtitle boundary and terminology rows. Do not rewrite them.",
+                        "Reject a contextual term that changes meaning without source support, an entity or number moved across a scope, or meaning duplicated or lost at a scope boundary. Return {pass,issues:[{ids,errors}]}. pass=true requires an empty issues array.",
+                        "Terminology: " + json.dumps(
+                            _relevant_terminology_prompt_rows(
+                                terminology,
+                                " ".join(cue.source_text for cue in translated),
+                            ), ensure_ascii=False,
+                        ),
+                        (
+                            "The previous response failed deterministic structure validation: "
+                            + json.dumps(structure_failures[-1], ensure_ascii=False)
+                        ) if structure_failures else "",
+                        "Sequence: " + json.dumps(consistency_rows, ensure_ascii=False),
+                    ])},
+                ], max_tokens=3500)
+                provenances.append(provenance)
+                passed = verdict.get("pass")
+                issues = verdict.get("issues")
+                errors: list[str] = []
+                if type(passed) is not bool:
+                    errors.append("pass must be boolean")
+                if not isinstance(issues, list):
+                    errors.append("issues must be an array")
+                    issue_rows: list[dict[str, Any]] = []
+                else:
+                    issue_rows = [row for row in issues if isinstance(row, dict)]
+                    if len(issue_rows) != len(issues):
+                        errors.append("every issue must be an object")
+                for issue in issue_rows:
+                    ids = issue.get("ids")
+                    issue_errors = issue.get("errors")
+                    if (
+                        not isinstance(ids, list) or not ids
+                        or not set(map(str, ids)) <= expected_ids
+                    ):
+                        errors.append("issue ids must be non-empty sequence ids")
+                    if not isinstance(issue_errors, list) or not issue_errors:
+                        errors.append("issue errors must be a non-empty array")
+                if passed is True and issue_rows:
+                    errors.append("pass=true requires no issues")
+                if passed is False and not issue_rows:
+                    errors.append("pass=false requires at least one issue")
+                if errors:
+                    structure_failures.append(errors)
+                    continue
+                cross_scope_trace = {
+                    "pass": passed, "issues": issue_rows,
+                    "attempts": provenances,
+                    "structure_failures": structure_failures,
+                    "reviewed_cue_ids": sorted(expected_ids),
+                }
+                if passed is False:
+                    raise InterviewJointTranslationError(
+                        "cross-scope consistency review rejected joint captions",
+                        [{
+                            "kind": "cross_scope_consistency_review",
+                            "issues": issue_rows,
+                            "provenance": provenance,
+                        }],
+                    )
+                break
+            else:
+                raise ValueError(
+                    "cross-scope consistency reviewer returned invalid structure twice: "
+                    + json.dumps(structure_failures, ensure_ascii=False)
+                )
+        cues[:] = translated
+        return {
+            "step": "joint_caption_scopes_translation",
+            "editorial_mode": editorial_mode,
+            "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
+            "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+            "scope_count": len(scope_traces),
+            "scope_traces": scope_traces,
+            "cross_scope_consistency_review": cross_scope_trace,
+            "reviewed_cue_ids": [cue.id for cue in cues],
+            "strict_source_fingerprint": _strict_interview_source_fingerprint(cues),
+            "caption_content_fingerprint": _interview_caption_content_fingerprint(cues),
+            "terminology_decision_fingerprint": _terminology_decision_fingerprint(
+                terminology,
+            ),
+        }
+
+
+
+    def discover_missing_terminology(
+        self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
+    ) -> dict[str, Any]:
+        """Propose missing terms from the fixed subtitle source without editing the plan."""
+        existing = {entry.source.casefold() for entry in terminology}
+        transcript = [{"id": cue.id, "text": cue.source_text} for cue in cues]
+        failures: list[str] = []
+        for attempt in range(2):
+            response, provenance = self.writer._request_json([
+                {"role": "system", "content": "Return one valid JSON object only."},
+                {"role": "user", "content": "\n".join([
+                    "Inspect only this already-selected English subtitle passage for missing terminology needed by a Simplified Chinese translation. Do not select a clip, write a title, propose a hook, summarize, or translate captions.",
+                    "Return at most 8 source phrases that occur verbatim in the passage, are absent from Existing terminology, and need one video-level decision because they are a technical compound, an emerging term, or context-sensitive vocabulary whose inconsistent translation could change meaning. Do not return ordinary words merely to fill the quota.",
+                    "For each row choose translate or preserve. translate requires a concise natural Chinese target; preserve is only for a product/company name, acronym, code/API identifier, or a genuinely unsettled term without a clear Chinese rendering. Include at most two defensible Chinese alternatives and a concise rationale citing the actor/action/context.",
+                    "Return {terminology:[{source,strategy,target,alternatives,rationale}]}. Return an empty array when nothing is missing.",
+                    "Existing terminology: " + json.dumps(
+                        sorted(entry.source for entry in terminology), ensure_ascii=False,
+                    ),
+                    (
+                        "The previous response failed deterministic validation: "
+                        + failures[-1] + ". Return the complete corrected object."
+                    ) if failures else "",
+                    "Selected subtitle passage: " + json.dumps(transcript, ensure_ascii=False),
+                ])},
+            ], max_tokens=3000)
+            raw = response.get("terminology")
+            if not isinstance(raw, list) or len(raw) > 8:
+                failures.append("terminology must be an array with at most 8 rows")
+                continue
+            raw_sources = [
+                str(row.get("source") or "").strip()
+                for row in raw if isinstance(row, dict)
+            ]
+            if len(raw_sources) != len(raw) or len({value.casefold() for value in raw_sources}) != len(raw):
+                failures.append("every row needs one unique source")
+                continue
+            invalid_sources = [
+                source for source in raw_sources
+                if not source or source.casefold() in existing
+                or not any(_contains_term(cue.source_text, source) for cue in cues)
+            ]
+            if invalid_sources:
+                failures.append(
+                    "sources must occur in the passage and must not duplicate existing terms: "
+                    + json.dumps(invalid_sources, ensure_ascii=False)
+                )
+                continue
+            parsed = self._parse_terminology(raw, cues)
+            returned = {source.casefold() for source in raw_sources}
+            additions = [
+                entry for entry in parsed
+                if entry.source.casefold() in returned
+                and entry.source.casefold() not in existing
+                and entry.rationale
+                and (
+                    entry.strategy == TerminologyStrategy.PRESERVE
+                    or bool(re.search(r"[\u3400-\u9fff]", entry.target))
+                )
+            ]
+            if len(additions) != len(raw):
+                failures.append(
+                    "every row needs a valid strategy, target, and contextual rationale"
+                )
+                continue
+            terminology.extend(additions)
+            return {
+                "step": "selected_subtitle_terminology_discovery",
+                "attempt": attempt + 1,
+                "existing_sources": sorted(existing),
+                "added_sources": [entry.source for entry in additions],
+                "decisions": [asdict(entry) for entry in additions],
+                "earlier_failures": failures,
+                "provenance": provenance,
+            }
+        raise ValueError(
+            "selected subtitle terminology discovery failed deterministic validation: "
+            + "; ".join(failures)
+        )
+
+    def review_terminology_decisions(
+        self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
+    ) -> dict[str, Any] | None:
+        """Review planner terminology choices before interview translation."""
+        contextual = [
+            entry for entry in terminology
+            if entry.rationale
+            and entry.source.casefold() not in ESTABLISHED_CHINESE_TERMS
+            and any(_contains_term(cue.source_text, entry.source) for cue in cues)
+        ]
+        if not contextual:
+            return None
+        reviewer = self.subtitle_reviewer or self.directing_writer
+        if reviewer is None or reviewer is self.writer:
+            raise RuntimeError(
+                "terminology decisions require an independent subtitle reviewer"
+            )
+
+        review_attempts: list[dict[str, Any]] = []
+        review_structure_failures: list[dict[str, Any]] = []
+        revision_attempts: list[dict[str, Any]] = []
+        last_rejected: dict[str, list[str]] = {}
+        for attempt in range(2):
+            rows: list[dict[str, Any]] = []
+            for entry in contextual:
+                matching = [
+                    index for index, cue in enumerate(cues)
+                    if _contains_term(cue.source_text, entry.source)
+                ]
+                context_indices = sorted({
+                    neighbor
+                    for index in matching
+                    for neighbor in (index - 1, index, index + 1)
+                    if 0 <= neighbor < len(cues)
+                })
+                rows.append({
+                    **_terminology_prompt_row(
+                        entry, " ".join(cues[index].source_text for index in matching),
+                    ),
+                    "context": [cues[index].source_text for index in context_indices],
+                })
+            expected = {entry.source.casefold(): entry for entry in contextual}
+            reviews: dict[str, dict[str, Any]] = {}
+            phase_structure_failures: list[list[str]] = []
+            for structure_attempt in range(2):
+                verdict, provenance = reviewer._request_json([
+                    {"role": "system", "content": "Return one valid JSON object only."},
+                    {"role": "user", "content": "\n".join([
+                        "Independently review each proposed terminology decision for a Simplified Chinese technology interview before subtitles are translated. Do not rewrite captions.",
+                        "Treat both translate and preserve as proposals, not instructions. Preserve English only for a product or company name, acronym, code/API identifier, or a genuinely unsettled term that lacks a clear natural Chinese rendering in this context. A term being recent or emerging is not by itself evidence that Chinese readers should see the English form. Reject preserve when a concise, established or compositionally clear Chinese rendering accurately conveys the source distinction.",
+                        "For translate, reject a target that changes the actor, action, technical distinction, or contextual sense. Judge the supplied rationale against the source context rather than trusting it. Alternatives are candidates, not automatic approvals.",
+                        "Return every source exactly once as {reviews:[{source,pass,fidelity_score,naturalness_score,errors}]}. Pass only when both scores are at least 4 and the exact strategy and target are publication-ready. Do not return replacement wording.",
+                        (
+                            "The previous reviewer response failed deterministic structure validation: "
+                            + json.dumps(phase_structure_failures[-1], ensure_ascii=False)
+                            + ". Review the unchanged term decisions again and return the exact schema."
+                        ) if phase_structure_failures else "",
+                        "Terms: " + json.dumps(rows, ensure_ascii=False),
+                    ])},
+                ], max_tokens=4000)
+                review_attempts.append(provenance)
+                raw_reviews = verdict.get("reviews")
+                structure_errors: list[str] = []
+                if not isinstance(raw_reviews, list):
+                    structure_errors.append("reviews must be an array")
+                    candidate_reviews: list[dict[str, Any]] = []
+                else:
+                    candidate_reviews = [
+                        row for row in raw_reviews if isinstance(row, dict)
+                    ]
+                    if len(candidate_reviews) != len(raw_reviews):
+                        structure_errors.append("every review must be an object")
+                sources = [
+                    str(row.get("source") or "").casefold()
+                    for row in candidate_reviews
+                ]
+                if (
+                    len(sources) != len(expected)
+                    or len(set(sources)) != len(sources)
+                    or set(sources) != set(expected)
+                ):
+                    structure_errors.append(
+                        "review sources must contain every supplied source exactly once"
+                    )
+                for row in candidate_reviews:
+                    source = str(row.get("source") or "")
+                    if type(row.get("pass")) is not bool:
+                        structure_errors.append(f"{source}: pass must be boolean")
+                    for score_name in ("fidelity_score", "naturalness_score"):
+                        if not 1 <= _review_score_out_of_five(row.get(score_name)) <= 5:
+                            structure_errors.append(
+                                f"{source}: {score_name} must be between 1 and 5"
+                            )
+                    if not isinstance(row.get("errors"), list):
+                        structure_errors.append(f"{source}: errors must be an array")
+                if not structure_errors:
+                    reviews = {
+                        str(row["source"]).casefold(): row
+                        for row in candidate_reviews
+                    }
+                    break
+                phase_structure_failures.append(structure_errors)
+                review_structure_failures.append({
+                    "decision_attempt": attempt + 1,
+                    "structure_attempt": structure_attempt + 1,
+                    "errors": structure_errors,
+                })
+            else:
+                raise ValueError(
+                    "terminology reviewer returned invalid structure twice: "
+                    + json.dumps(phase_structure_failures, ensure_ascii=False)
+                )
+            rejected: dict[str, list[str]] = {}
+            for key, entry in expected.items():
+                row = reviews.get(key, {})
+                if (
+                    set(reviews) != set(expected)
+                    or row.get("pass") is not True
+                    or _review_score_out_of_five(row.get("fidelity_score")) < 4
+                    or _review_score_out_of_five(row.get("naturalness_score")) < 4
+                ):
+                    raw_errors = row.get("errors", ["missing independent review"])
+                    rejected[entry.source] = (
+                        [str(value) for value in raw_errors]
+                        if isinstance(raw_errors, list) else [str(raw_errors)]
+                    )
+            if not rejected:
+                return {
+                    "step": "terminology_decision_review",
+                    "attempt": attempt + 1,
+                    "reviewed_sources": sorted(expected),
+                    "review_attempts": review_attempts,
+                    "review_structure_failures": review_structure_failures,
+                    "revision_attempts": revision_attempts,
+                    "decisions": [asdict(entry) for entry in contextual],
+                }
+            last_rejected = rejected
+            if attempt == 1:
+                break
+
+            rejected_entries = [
+                entry for entry in contextual if entry.source in rejected
+            ]
+            revision, revision_provenance = self.writer._request_json([
+                {"role": "system", "content": "Return one valid JSON object only."},
+                {"role": "user", "content": "\n".join([
+                    "Revise only the rejected terminology decisions for Simplified Chinese technology subtitles. Return a decision, not a caption translation.",
+                    "Use translate with a concise natural Chinese target whenever the contextual meaning has an established or compositionally clear Chinese rendering. Preserve only product/company names, acronyms, code/API identifiers, or genuinely unsettled terms without a clear Chinese rendering. Recent or emerging terminology does not automatically stay in English.",
+                    "Return every rejected source exactly once as {terminology:[{source,strategy,target,alternatives,rationale}]}. strategy is translate or preserve. A translate target must contain Chinese; preserve must keep the source English and use an empty alternatives list. Give context evidence in rationale and at most two defensible Chinese alternatives.",
+                    "Rejected decisions: " + json.dumps([
+                        {
+                            **asdict(entry),
+                            "review_errors": rejected[entry.source],
+                            "context": [
+                                cue.source_text for cue in cues
+                                if _contains_term(cue.source_text, entry.source)
+                            ],
+                        } for entry in rejected_entries
+                    ], ensure_ascii=False),
+                ])},
+            ], max_tokens=3000)
+            revision_attempts.append(revision_provenance)
+            expected_revised = {entry.source.casefold() for entry in rejected_entries}
+            raw_revised = revision.get("terminology")
+            returned_sources = {
+                str(row.get("source") or "").casefold()
+                for row in raw_revised if isinstance(row, dict)
+            } if isinstance(raw_revised, list) else set()
+            if returned_sources != expected_revised:
+                raise ValueError(
+                    "terminology decision revision omitted or added sources"
+                )
+            revised = self._parse_terminology(raw_revised, cues)
+            revised_by_source = {
+                entry.source.casefold(): entry for entry in revised
+                if entry.source.casefold() in expected_revised
+            }
+            if set(revised_by_source) != expected_revised:
+                raise ValueError(
+                    "terminology decision revision omitted or added sources"
+                )
+            for entry in rejected_entries:
+                replacement = revised_by_source[entry.source.casefold()]
+                if (
+                    replacement.strategy == TerminologyStrategy.TRANSLATE
+                    and not re.search(r"[\u3400-\u9fff]", replacement.target)
+                ):
+                    raise ValueError(
+                        f"revised translate terminology lacks Chinese target: {entry.source}"
+                    )
+                entry.strategy = replacement.strategy
+                entry.target = replacement.target
+                entry.alternatives = replacement.alternatives
+                entry.rationale = replacement.rationale
+                entry.first_use_explanation = ""
+                entry.notes = replacement.notes
+        raise ValueError(
+            "terminology decision independent review rejected publication: "
+            + json.dumps(last_rejected, ensure_ascii=False)
+        )
+
 
     def ensure_editorial_plan(
         self, metadata: dict[str, Any], cues: list[TranscriptCue], plan: dict[str, Any],
@@ -3476,7 +3884,7 @@ class NaturalSubtitleTranslator:
                 )
             if editorial_mode == "known_tech_interview_clip":
                 repair_contract = (
-                    "Return exactly one continuous 45–180 second WeChat clip and no Bilibili chapters. "
+                    "Return exactly one continuous WeChat clip and no Bilibili chapters. There is no minimum duration: prefer the shortest strong, complete passage at or below 180 seconds. A strong complete passage may extend to 300 seconds; essential_context_justification is optional audit metadata. "
                     "Choose the strongest self-contained technology, AI, engineering, learning, or education insight. "
                     "The selected source words and all visible copy must contain no politics, government, elections, "
                     "geopolitics, war, military, politicians, or advocacy. Non-political comparisons between countries' "
@@ -3490,6 +3898,13 @@ class NaturalSubtitleTranslator:
                         + editorial_guidance.strip()
                         if editorial_guidance and editorial_guidance.strip() else ""
                     )
+                )
+            elif editorial_mode == "conference_highlights":
+                repair_contract = (
+                    "Return 1–5 distinct, non-overlapping, standalone WeChat highlights and no Bilibili chapters. "
+                    "Each clip must be 45–300 seconds and all clips together no more than 900 seconds. "
+                    "Every clip needs its own complete setup, technical idea, and payoff; clips must not form a dependent series. "
+                    "If the transcript contains no qualifying clip, return an empty wechat_lessons list."
                 )
             elif editorial_mode == "technical_coverage":
                 repair_contract = (
@@ -3507,7 +3922,7 @@ class NaturalSubtitleTranslator:
                 repair_contract,
                 "Every Bilibili chapter and WeChat lesson needs exactly three distinct hook_headlines of 8–26 visible characters: complete, evidence-faithful clauses representing a tension or contrarian claim, a concrete technical choice with stakes, and a consequence or outcome claim. Each must earn the next 8 seconds rather than merely label the topic. Never bisect an English term, append a generic 为什么, ask an empty question, or use sensational clickbait. Use framing=split when speaker and slide are visible together; never crop away the speaker pane merely to enlarge the slide.",
                 mandatory_layout,
-                "Keep the existing terminology unless it must be normalized. Terminology fields are source, strategy (translate|preserve|bilingual_once), target, first_use_explanation, notes.",
+                "Keep the existing terminology unless it must be normalized. Terminology fields are source, strategy (translate|preserve), target, alternatives, rationale, notes. For translate, target is the rendering selected from this video's nearby actors/actions; alternatives has at most two genuinely context-supported candidates and rationale states the evidence. Preserve rows use an empty alternatives list. Never emit bilingual_once.",
                 "Contract errors: " + json.dumps(errors, ensure_ascii=False),
                 "Current plan: " + json.dumps(plan, ensure_ascii=False),
                 "Transcript: " + json.dumps(transcript, ensure_ascii=False),
@@ -3581,7 +3996,8 @@ class NaturalSubtitleTranslator:
             elif entry.strategy == TerminologyStrategy.TRANSLATE and entry.target:
                 protected_terms = [
                     item.source for item in terminology
-                    if item.strategy == TerminologyStrategy.PRESERVE
+                    if item is not entry
+                    and len(item.source) > len(entry.source)
                     and entry.source.casefold() in item.source.casefold()
                 ]
                 for cue in cues:
@@ -3628,10 +4044,6 @@ class NaturalSubtitleTranslator:
                     )
                     if entry.source.casefold() == "vertical":
                         replaced = re.sub(r"高薪\s*垂直行业", "高薪的垂直行业", replaced)
-                    elif entry.source.casefold() == "open-source check" and re.search(
-                        r"开源.{0,8}制衡", replaced,
-                    ):
-                        replaced = re.sub(r"\s*[（(]开源制衡[）)]", "", replaced)
                     if replaced != cue.translation:
                         cue.translation = normalize_chinese_subtitle(replaced)
                         enforced.append(entry.source)
@@ -3672,115 +4084,20 @@ class NaturalSubtitleTranslator:
                     enforced.append(entry.source)
         return list(dict.fromkeys(enforced))
 
-    def _repair_terminology(
-        self, cues: list[TranscriptCue], terminology: list[TerminologyEntry], errors: list[str],
-    ) -> dict[str, Any]:
-        affected_terms = [
-            entry for entry in terminology
-            if any(error.startswith(f"term:{entry.source}:") for error in errors)
-        ]
-        affected: dict[str, TranscriptCue] = {}
-        for entry in affected_terms:
-            cue = next(
-                (item for item in cues if _contains_term(item.source_text, entry.source)), None,
-            )
-            if cue:
-                affected[cue.id] = cue
-        forbidden_phrases = ("挽具", "铺好的道路", "人类触摸", "技能登记处")
-        for cue in cues:
-            if any(phrase in cue.translation for phrase in forbidden_phrases):
-                affected[cue.id] = cue
-        if not affected:
-            raise ValueError("; ".join(errors))
-
-        payload = [
-            {
-                "id": cue.id, "source": cue.source_text,
-                "current_translation": cue.translation,
-            }
-            for cue in affected.values()
-        ]
-        prompt = "\n".join([
-            "Repair only these Simplified Chinese subtitle lines so they remain natural and faithful while satisfying the terminology contract.",
-            "A preserve term must appear exactly in English. A bilingual_once term must keep its English source and include the exact first_use_explanation on its first source occurrence. Do not translate code, APIs, products, or unsettled technical terms into literal Chinese.",
-            "For translate terms, rewrite the whole sentence as direct, idiomatic spoken Chinese; do not merely substitute one English token inside the old translated word order. Prefer actor-action phrasing and remove filler or demonstratives that Chinese would normally omit.",
-            "Return {translations:[{id,text}]}; return every supplied id exactly once and no extra ids.",
-            "Contract errors: " + json.dumps(errors, ensure_ascii=False),
-            "Relevant terminology: " + json.dumps([asdict(item) for item in affected_terms], ensure_ascii=False),
-            "Cues: " + json.dumps(payload, ensure_ascii=False),
-        ])
-        expected = set(affected)
-        translations: dict[str, str] = {}
-        provenance: dict[str, Any] | None = None
-        failures: list[str] = []
-        writers = []
-        for writer in (
-            self.directing_writer, self.writer,
-            getattr(self.writer, "fallback", None),
-        ):
-            if writer is not None and all(writer is not existing for existing in writers):
-                writers.append(writer)
-        for repair_writer in writers:
-            try:
-                draft, provenance = repair_writer._request_json([
-                    {"role": "system", "content": "Return one valid JSON object only."},
-                    {"role": "user", "content": prompt},
-                ], max_tokens=2500)
-                candidate = {
-                    str(item.get("id")): str(item.get("text") or "").strip()
-                    for item in draft.get("translations", []) if isinstance(item, dict)
-                }
-                if set(candidate) != expected or any(not value for value in candidate.values()):
-                    missing = sorted(expected - set(candidate))
-                    extra = sorted(set(candidate) - expected)
-                    raise ValueError(
-                        f"terminology repair ids mismatch; missing={missing}, extra={extra}"
-                    )
-                trial_cues = [TranscriptCue(**asdict(cue)) for cue in cues]
-                trial_by_id = {cue.id: cue for cue in trial_cues}
-                for cue_id, proposed in candidate.items():
-                    trial_by_id[cue_id].translation = proposed
-                remaining = terminology_contract_errors(trial_cues, terminology)
-                if remaining:
-                    raise ValueError(
-                        "terminology repair did not satisfy the contract: "
-                        + "; ".join(remaining)
-                    )
-                translations = candidate
-                break
-            except Exception as error:
-                failures.append(f"{type(error).__name__}: {error}")
-        if not translations:
-            # Final bounded fallback: exact-term enforcement is less elegant
-            # than a rewrite, but preserves the source meaning and allows a
-            # transient provider outage to self-heal without aborting the job.
-            enforced = self._enforce_terminology_contract(cues, terminology)
-            remaining = terminology_contract_errors(cues, terminology)
-            if not remaining:
-                return {
-                    "step": "terminology_repair",
-                    "errors": errors,
-                    "fallback": "deterministic_exact_term_enforcement",
-                    "enforced": enforced,
-                    "provider_failures": failures,
-                }
-            raise RuntimeError(
-                "terminology repair providers failed and deterministic fallback "
-                "could not satisfy the contract: " + "; ".join([*failures, *remaining])
-            )
-        for cue_id, cue in affected.items():
-            cue.translation = translations[cue_id]
-        return {
-            "step": "terminology_repair", "errors": errors,
-            "provenance": provenance, "provider_failures": failures,
-        }
 
     @staticmethod
     def _parse_terminology(raw: Any, cues: list[TranscriptCue]) -> list[TerminologyEntry]:
         entries: list[TerminologyEntry] = []
+        source_text = "\n".join(item.source_text for item in cues)
         for item in raw if isinstance(raw, list) else []:
-            source = str(item.get("source") or item.get("term") or "").strip() if isinstance(item, dict) else ""
-            if not isinstance(item, dict) or not source:
+            raw_source = item.get("source") or item.get("term") if isinstance(item, dict) else ""
+            source = raw_source.strip() if isinstance(raw_source, str) else ""
+            if (
+                not isinstance(item, dict)
+                or not source
+                or len(source) > 120
+                or not _contains_term(source_text, source)
+            ):
                 continue
             try:
                 strategy = TerminologyStrategy(str(
@@ -3789,56 +4106,95 @@ class NaturalSubtitleTranslator:
                 ))
             except ValueError:
                 strategy = TerminologyStrategy.PRESERVE
-            target = str(item.get("target") or item.get("translation") or "").strip()
-            explanation = str(item.get("first_use_explanation") or "").strip()
+            raw_target = item.get("target") or item.get("translation")
+            target = raw_target.strip() if isinstance(raw_target, str) else ""
+            if len(target) > 48:
+                target = ""
+            raw_explanation = item.get("first_use_explanation")
+            explanation = (
+                raw_explanation.strip()[:120]
+                if isinstance(raw_explanation, str) else ""
+            )
+            raw_alternatives = item.get("alternatives", item.get("accepted_targets", []))
+            alternatives: list[str] = []
+            if isinstance(raw_alternatives, list):
+                for raw_alternative in raw_alternatives:
+                    if not isinstance(raw_alternative, str):
+                        continue
+                    alternative = re.sub(r"\s+", " ", raw_alternative).strip()
+                    if (
+                        alternative
+                        and alternative != target
+                        and len(alternative) <= 48
+                        and re.search(r"[\u3400-\u9fff]", alternative)
+                        and alternative not in alternatives
+                    ):
+                        alternatives.append(alternative)
+                    if len(alternatives) == 2:
+                        break
+            raw_rationale = item.get("rationale")
+            rationale = (
+                re.sub(r"\s+", " ", raw_rationale).strip()[:240]
+                if isinstance(raw_rationale, str) else ""
+            )
+            if alternatives and not rationale:
+                alternatives = []
             established_target = ESTABLISHED_CHINESE_TERMS.get(source.casefold())
             if established_target:
                 strategy = TerminologyStrategy.TRANSLATE
                 target = established_target
+                alternatives = []
+                explanation = ""
+            elif strategy == TerminologyStrategy.BILINGUAL_ONCE:
+                # Backward-compatible cache migration. The English source is
+                # already visible, so a stable Chinese explanation becomes a
+                # normal translation; names without one remain in English.
+                chinese_target = target or explanation
+                parenthetical = re.search(r"[（(]([^（）()]*[\u3400-\u9fff][^（）()]*)[）)]", chinese_target)
+                if parenthetical:
+                    chinese_target = parenthetical.group(1).strip()
+                if source in PROTECTED_TERMS:
+                    strategy = TerminologyStrategy.PRESERVE
+                    target = ""
+                elif chinese_target and re.search(r"[\u3400-\u9fff]", chinese_target):
+                    strategy = TerminologyStrategy.TRANSLATE
+                    target = chinese_target
+                else:
+                    strategy = TerminologyStrategy.PRESERVE
+                    target = ""
                 explanation = ""
             elif (
                 strategy == TerminologyStrategy.PRESERVE
-                and source == source.casefold()
+                and source not in PROTECTED_TERMS
                 and target
                 and target.casefold() != source.casefold()
                 and re.search(r"[\u3400-\u9fff]", target)
             ):
-                # Planning responses sometimes say mode=translate while an
-                # older parser only reads strategy/choice and caches the row
-                # as preserve. A lowercase ordinary word paired with an
-                # explicit Chinese target is translation vocabulary, not a
-                # product identifier that should be duplicated in brackets.
+                # A row cannot simultaneously preserve an English form and
+                # require a different Chinese target. Except for explicitly
+                # protected product/code names, the supplied Chinese target
+                # makes this a translate decision regardless of capitalization.
                 strategy = TerminologyStrategy.TRANSLATE
                 explanation = ""
-            if strategy == TerminologyStrategy.BILINGUAL_ONCE and not explanation:
-                explanation = target
-            if (
-                strategy == TerminologyStrategy.BILINGUAL_ONCE
-                and explanation
-                and _contains_term(explanation, source)
-                and target
-            ):
-                # Legacy plans sometimes stored the complete rendered label
-                # ("data center（数据中心）") as the explanation. Enforcement
-                # adds the English source itself, so retaining that shape
-                # duplicates the term and can break the caption density gate.
-                explanation = target
             # An incomplete strategy row cannot be enforced downstream. Keep
             # the exact source term instead of failing the whole video or
             # inventing a translation/explanation the model did not supply.
             if strategy == TerminologyStrategy.TRANSLATE and not target:
                 strategy = TerminologyStrategy.PRESERVE
-            if strategy == TerminologyStrategy.BILINGUAL_ONCE and not explanation:
-                strategy = TerminologyStrategy.PRESERVE
+            if strategy != TerminologyStrategy.TRANSLATE:
+                alternatives = []
             entries.append(TerminologyEntry(
                 source=source, strategy=strategy, target=target,
+                alternatives=alternatives, rationale=rationale,
                 first_use_explanation=explanation,
-                notes=str(item.get("notes") or "").strip(),
+                notes=(
+                    str(item.get("notes") or "").strip()[:240]
+                    if isinstance(item.get("notes"), str) else ""
+                ),
             ))
-        source = "\n".join(item.source_text for item in cues)
         known = {item.source.casefold() for item in entries}
         for term, target in ESTABLISHED_CHINESE_TERMS.items():
-            if _contains_term(source, term) and term.casefold() not in known:
+            if _contains_term(source_text, term) and term.casefold() not in known:
                 entries.append(TerminologyEntry(
                     source=term, strategy=TerminologyStrategy.TRANSLATE,
                     target=target,
@@ -3846,14 +4202,12 @@ class NaturalSubtitleTranslator:
                 known.add(term.casefold())
         for term in PROTECTED_TERMS:
             if (
-                _contains_term(source, term)
+                _contains_term(source_text, term)
                 and term.casefold() not in known
                 and not any(_contains_term(entry.source, term) for entry in entries)
             ):
-                strategy = TerminologyStrategy.BILINGUAL_ONCE if term in {"Harness"} else TerminologyStrategy.PRESERVE
                 entries.append(TerminologyEntry(
-                    term, strategy,
-                    first_use_explanation="Agent 的执行与反馈框架" if term == "Harness" else "",
+                    term, TerminologyStrategy.PRESERVE,
                 ))
         return entries
 
@@ -4061,8 +4415,16 @@ def _interview_clip_contract_errors(
         return [*errors, "known-tech interview must contain exactly one WeChat highlight clip"]
     raw = rows[0]
     source_range = _coerce_range(raw, duration)
-    if source_range is None or not INTERVIEW_MIN_SECONDS <= source_range.duration <= INTERVIEW_MAX_SECONDS:
-        errors.append("interview highlight must be a complete 45–180 second source range")
+    if source_range is None or not 0 < source_range.duration <= INTERVIEW_MAX_SECONDS:
+        proposed = (
+            "invalid"
+            if source_range is None else
+            f"start={source_range.start:.3f}, end={source_range.end:.3f}, duration={source_range.duration:.3f}s"
+        )
+        errors.append(
+            "interview highlight must be a positive, complete source range no longer than "
+            f"{INTERVIEW_MAX_SECONDS:.0f}s ({proposed})"
+        )
     title = str(raw.get("title") or "").strip()
     thesis = str(raw.get("thesis") or "").strip()
     speaker_label = str(raw.get("speaker_label") or "").strip()
@@ -4095,11 +4457,72 @@ def _interview_clip_contract_errors(
     return errors
 
 
+def _conference_highlight_contract_errors(
+    plan: dict[str, Any], duration: float, cues: list[TranscriptCue] | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    if plan.get("bilibili_chapters"):
+        errors.append("Bilibili is paused; conference highlights must not include chapters")
+    rows = [
+        row for row in plan.get("wechat_lessons", []) if isinstance(row, dict)
+    ] if isinstance(plan.get("wechat_lessons"), list) else []
+    if not rows:
+        return [*errors, "no_self_contained_conference_highlight"]
+    if not 1 <= len(rows) <= 5:
+        errors.append(f"conference highlights must contain 1–5 clips (received {len(rows)})")
+    ranges: list[SourceRange] = []
+    titles: list[str] = []
+    for index, row in enumerate(rows, start=1):
+        source_range = _coerce_range(row, duration)
+        if source_range is None or not (
+            CONFERENCE_HIGHLIGHT_MIN_SECONDS
+            <= source_range.duration
+            <= CONFERENCE_HIGHLIGHT_MAX_SECONDS
+        ):
+            proposed = "invalid" if source_range is None else (
+                f"start={source_range.start:.3f}, end={source_range.end:.3f}, "
+                f"duration={source_range.duration:.3f}s"
+            )
+            errors.append(
+                f"conference highlight {index} must be 45–300s ({proposed})"
+            )
+            continue
+        ranges.append(source_range)
+        title = str(row.get("title") or "").strip()
+        thesis = str(row.get("thesis") or "").strip()
+        hooks = [str(value).strip() for value in row.get("hook_headlines", [])] \
+            if isinstance(row.get("hook_headlines"), list) else []
+        if not title or not thesis or len(hooks) != 3 or len(set(hooks)) != 3:
+            errors.append(
+                f"conference highlight {index} requires a distinct title, thesis, and three hooks"
+            )
+        titles.append(_normalized_title(title))
+    ordered = sorted(ranges, key=lambda value: value.start)
+    for previous, current in zip(ordered, ordered[1:]):
+        if current.start < previous.end:
+            errors.append(
+                "conference highlights must not overlap "
+                f"({previous.start:.3f}–{previous.end:.3f} and "
+                f"{current.start:.3f}–{current.end:.3f})"
+            )
+    total = sum(value.duration for value in ranges)
+    if total > CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS:
+        errors.append(
+            f"conference highlights total {total:.3f}s; maximum is "
+            f"{CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS:.0f}s"
+        )
+    if len(set(titles)) != len(titles):
+        errors.append("conference highlights must cover distinct ideas with distinct titles")
+    return errors
+
+
 def editorial_plan_contract_errors(
     plan: dict[str, Any], duration: float, cues: list[TranscriptCue] | None = None,
 ) -> list[str]:
     if str(plan.get("editorial_mode") or "") == "known_tech_interview_clip":
         return _interview_clip_contract_errors(plan, duration, cues)
+    if str(plan.get("editorial_mode") or "") == "conference_highlights":
+        return _conference_highlight_contract_errors(plan, duration, cues)
     if "bilibili_chapters" in plan or "wechat_lessons" in plan:
         return _study_plan_contract_errors(plan, duration)
     errors: list[str] = []
@@ -4454,7 +4877,7 @@ def _fit_interview_hook_headline(value: str, font_path: Path) -> tuple[Any, str]
 
 
 _SPOKEN_FILLER_ONLY = re.compile(
-    r"^(?:(?:um+|uh+|erm+|hmm+|mm+|you know|i mean|like|well)[\s,.;:!?-]*)+$",
+    r"^(?:(?:um+|uh+|erm+|hmm+|mm+|you know|i mean|like|well|so)[\s,.;:!?-]*)+$",
     re.IGNORECASE,
 )
 
@@ -4706,10 +5129,72 @@ def hook_contract_errors(
     return errors
 
 
+def _remap_hook_snapshot(
+    hooks: list[HookSpec] | None, cues: list[TranscriptCue], item_id: str,
+) -> list[HookSpec]:
+    """Keep pre-subtitle hook choices while binding them to final card IDs."""
+    if not hooks:
+        return []
+    remapped: list[HookSpec] = []
+    for index, hook in enumerate(hooks, start=1):
+        cue_ids = [
+            cue.id for cue in cues
+            if cue.end > hook.source_range.start
+            and cue.start < hook.source_range.end
+        ]
+        if not cue_ids:
+            raise ValueError(
+                f"{item_id}: frozen hook range has no final subtitle cards"
+            )
+        remapped.append(HookSpec(
+            id=f"{item_id}-hook-{index}", strategy=hook.strategy,
+            headline_zh=hook.headline_zh, promise=hook.promise,
+            source_range=hook.source_range, source_cue_ids=cue_ids,
+            payoff_cue_ids=list(cue_ids), speaker_label=hook.speaker_label,
+            motion=hook.motion, persistent_title=hook.persistent_title,
+            selected=hook.selected,
+        ))
+    return remapped
+
+
+def _snapshot_plan_hooks(
+    plan: dict[str, Any], duration: float, cues: list[TranscriptCue],
+    known_people: list[str] | None = None,
+) -> dict[str, list[HookSpec]]:
+    """Freeze hook text and time windows before subtitle cards are regenerated."""
+    snapshot: dict[str, list[HookSpec]] = {}
+    for key, prefix in (("bilibili_chapters", "bilibili"), ("wechat_lessons", "wechat")):
+        rows = plan.get(key)
+        if not isinstance(rows, list):
+            continue
+        for index, raw in enumerate(rows, start=1):
+            if not isinstance(raw, dict):
+                continue
+            source_range = _coerce_range(raw, duration)
+            if source_range is None:
+                continue
+            speaker_label = str(raw.get("speaker_label") or "")
+            if (
+                not speaker_label and known_people
+                and str(plan.get("editorial_mode") or "")
+                == "known_tech_interview_clip"
+            ):
+                speaker_label = known_people[0]
+            snapshot[f"{prefix}:{index}"] = build_hook_candidates(
+                str(raw.get("title") or "").strip(),
+                str(raw.get("thesis") or "").strip(),
+                source_range, cues, f"snapshot-{prefix}-{index}",
+                raw.get("hook_headlines"), speaker_label,
+                str(raw.get("hook_context") or ""),
+            )
+    return snapshot
+
+
 def build_collection_manifest(
     candidate: Candidate, metadata: dict[str, Any], cues: list[TranscriptCue],
     terminology: list[TerminologyEntry], plan: dict[str, Any], source_media_path: str,
     source_subtitle_path: str, source_media_info: SourceMediaInfo | None = None,
+    hook_snapshot: dict[str, list[HookSpec]] | None = None,
 ) -> VideoCollectionManifest:
     duration = float(metadata.get("duration") or (cues[-1].end if cues else 0))
     contract_errors = editorial_plan_contract_errors(plan, duration, cues)
@@ -4739,7 +5224,9 @@ def build_collection_manifest(
             title = str(raw.get("title") or f"学习章节 {index}").strip()
             thesis = str(raw.get("thesis") or "保留原视频中的完整论证。").strip()
             item_id = f"{collection_id}-chapter-{index}"
-            hook_candidates = build_hook_candidates(
+            hook_candidates = _remap_hook_snapshot(
+                (hook_snapshot or {}).get(f"bilibili:{index}"), cues, item_id,
+            ) or build_hook_candidates(
                 title, thesis, source_range, cues, item_id, raw.get("hook_headlines"),
             )
             items.append(CollectionItem(
@@ -4762,7 +5249,9 @@ def build_collection_manifest(
             title = str(raw.get("title") or f"核心短课 {index}").strip()
             thesis = str(raw.get("thesis") or "解释一个可独立学习的完整观点。").strip()
             item_id = f"{collection_id}-short-{index}"
-            hook_candidates = build_hook_candidates(
+            hook_candidates = _remap_hook_snapshot(
+                (hook_snapshot or {}).get(f"wechat:{index}"), cues, item_id,
+            ) or build_hook_candidates(
                 title, thesis, source_range, cues, item_id, raw.get("hook_headlines"),
                 str(raw.get("speaker_label") or (
                     known_people[0] if editorial_mode == "known_tech_interview_clip" and known_people else ""
@@ -5356,270 +5845,36 @@ def _fit_subtitle_by_pixels(
     return font, _wrap_subtitle_pixels(value, font, text_width)
 
 
-def _desired_subtitle_card_count(english: str, chinese: str, duration: float) -> int:
-    """Apply the shared interview-card timing and density policy."""
-    english_words = len(re.findall(r"\S+", english))
-    chinese_characters = len(re.sub(r"\s+", "", chinese))
-    desired = max(
-        1,
-        math.ceil(duration / INTERVIEW_CAPTION_TARGET_MAX_SECONDS),
-        math.ceil(english_words / INTERVIEW_CAPTION_TARGET_MAX_ENGLISH_WORDS),
-        math.ceil(chinese_characters / INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS),
-    )
-    # Do not request more cards than can receive the policy minimum. If density
-    # still cannot fit, the publication gate rejects the cue instead of making
-    # sub-second flashes.
-    maximum_feasible = max(1, math.floor(duration / INTERVIEW_CAPTION_MIN_SECONDS))
-    return min(maximum_feasible, desired)
-
-
-def _semantic_english_parts(value: str, desired_count: int) -> list[str]:
-    """Partition only at spoken clause boundaries; never cut by character count."""
-    normalized = re.sub(r"\s+", " ", value).strip()
-    words = normalized.split()
-    if desired_count <= 1 or len(words) < 8:
-        return [normalized]
-    boundary_costs: dict[int, float] = {}
-    coordinating = {"and", "but", "or", "so", "while", "whereas", "then", "yet", "maybe"}
-    dependent_clause = {"if", "when", "because", "that"}
-    relative_heads = {
-        "domains", "factor", "given", "idea", "reason", "text", "thing", "way",
-    }
-    coordinated_list_words = {
-        "everything", "expertise", "knowledge", "less", "meetings", "more",
-    }
-    weak_relative = {"where", "which"}
-    spoken_fillers = {"uh", "um"}
-    clean_words = [
-        re.sub(r"^[\"'“‘(\[]+|[^A-Za-z]+$", "", word).casefold()
-        for word in words
-    ]
-
-    def noisy_asr_near(index: int, window: int = 20) -> bool:
-        nearby = clean_words[index:min(len(clean_words), index + window)]
-        return any(
-            left == right and left not in spoken_fillers and left
-            for left, right in zip(nearby, nearby[1:])
+def interview_caption_layout_errors(cues: list[TranscriptCue]) -> list[str]:
+    """Measure the same portrait subtitle panel used by the renderer."""
+    maximum_width = 1080 - 200
+    english_font_path = resolve_font_path()
+    chinese_font_path = _resolve_chinese_subtitle_font_path()
+    errors: list[str] = []
+    for cue in cues:
+        english_font, english = _fit_subtitle_by_pixels(
+            cue.source_text, english_font_path, maximum_width, 28, 20,
+            INTERVIEW_CAPTION_MAX_RENDERED_LINES, stroke_width=1,
         )
+        chinese_font, chinese = _fit_subtitle_by_pixels(
+            cue.translation, chinese_font_path, maximum_width, 44, 34,
+            INTERVIEW_CAPTION_MAX_RENDERED_LINES, stroke_width=2,
+        )
+        if (
+            len(english.splitlines()) > INTERVIEW_CAPTION_MAX_RENDERED_LINES
+            or getattr(english_font, "size", 20) < 20
+        ):
+            errors.append(f"{cue.id} English does not fit the three-line subtitle panel")
+        if (
+            len(chinese.splitlines()) > INTERVIEW_CAPTION_MAX_RENDERED_LINES
+            or getattr(chinese_font, "size", 34) < 34
+        ):
+            errors.append(f"{cue.id} Chinese does not fit the three-line subtitle panel")
+    return errors
 
-    for index in range(1, len(words)):
-        previous = words[index - 1]
-        current = clean_words[index]
-        if re.search(r"[.!?;:][\"'”’)]?$", previous):
-            boundary_costs[index] = 0.0
-        elif (
-            re.search(r",[\"'”’)]?$", previous)
-            and current in {"he", "it", "she", "they", "we", "you"}
-        ):
-            boundary_costs[index] = 0.35
-        elif current == "so" and index + 1 < len(words) and re.sub(
-            r"^[\"'“‘(\[]+|[^A-Za-z]+$", "", words[index + 1],
-        ).casefold() == "that":
-            # The Chinese card can restore the governing action from parent
-            # context.  Keeping this as a candidate is preferable to a
-            # 10–20-second card in disfluent interview ASR.
-            boundary_costs[index] = 0.75
-        elif (
-            current == "to" and index + 2 < len(clean_words)
-            and clean_words[index + 1:index + 3] == ["your", "point"]
-        ):
-            # Spoken "to your point ..." starts a new response move. Keeping
-            # it with the preceding ASR clause can leave that card dangling on
-            # "about" and strand the actual point in the next card.
-            boundary_costs[index] = 0.25
-        elif (
-            current == "and" and index > 0
-            and clean_words[index - 1] == "lo"
-            and index + 1 < len(clean_words)
-            and clean_words[index + 1] == "behold"
-        ):
-            # “lo and behold” is one spoken idiom. Splitting before “and”
-            # produces a meaningless `...well lo` card even though the full
-            # parent cue is valid.
-            continue
-        elif (
-            current == "and"
-            and index <= 5
-            and clean_words[0] in spoken_fillers
-        ):
-            # Do not strand a short interview false start such as
-            # “Um so in coding essenti” before the speaker reaches the first
-            # complete clause. The later conjunction remains available.
-            continue
-        elif (
-            current == "and" and index + 1 < len(words)
-            and clean_words[index + 1] == "if" and noisy_asr_near(index)
-        ):
-            # A boundary immediately before a corrupt repeated ASR fragment
-            # strands the condition and invites literal translationese.  Keep
-            # searching for the earlier action boundary (for example,
-            # "and look for bottlenecks") so the noisy condition retains a
-            # recoverable predicate.
-            continue
-        elif (
-            current == "if" and clean_words[index - 1] == "and"
-            and noisy_asr_near(index)
-        ):
-            continue
-        elif current == "and" and index + 1 < len(clean_words) and (
-            clean_words[index - 1] in coordinated_list_words
-            or clean_words[index + 1] in coordinated_list_words
-        ):
-            # Do not cut a coordinated noun list (“knowledge and expertise”)
-            # or a repeated comparison (“less and less”).
-            continue
-        elif current == "and" and "where when" in " ".join(
-            clean_words[max(0, index - 12):index]
-        ):
-            # Do not cut a still-open relative/time clause immediately before
-            # its main predicate, e.g. “where when they deploy … and they run
-            # into a bug”.
-            continue
-        elif current == "or" and "either" in clean_words[max(0, index - 5):index]:
-            # Keep the two halves of “either … or …” together. A later “or”
-            # can still introduce the next complete alternative.
-            continue
-        elif current == "that" and clean_words[index - 1] in relative_heads:
-            # Keep defining relative clauses with the noun they explain.
-            continue
-        elif current in coordinating:
-            boundary_costs[index] = 0.25
-        elif current == "like" and index >= 6:
-            # In long interview ASR, a later "like" commonly restarts an
-            # example or paraphrase. It is a safer forced boundary than an
-            # arbitrary word-count cut, and the card translator removes the
-            # discourse filler while preserving the following proposition.
-            boundary_costs[index] = 1.25
-        elif current == "just" and index >= 6:
-            # Repeated interview emphasis often introduces a complete final
-            # verdict ("just flat out, we have to do better").  It is safer
-            # than cutting the governing clause after "I don't think".
-            boundary_costs[index] = 1.0
-        elif (
-            current in {"i", "we", "they", "he", "she", "it"}
-            and index >= 6
-            and index + 1 < len(clean_words)
-            and clean_words[index + 1] == current
-        ):
-            # Repeated pronouns commonly mark a fresh clause after broken
-            # interview ASR ("...is probably the best way we we best thing
-            # we can do..."). Cutting at the restart keeps the preceding
-            # claim intact and lets translation remove the duplicated token.
-            boundary_costs[index] = 0.4
-        elif (
-            current == "capture" and index >= 6
-            and clean_words[index - 1] == "of"
-            and "work" in clean_words[max(0, index - 4):index]
-        ):
-            # Spoken list setup: "everyday CRM work of: capture a meeting,
-            # fill records, update tasks."  The ASR omits the colon.
-            boundary_costs[index] = 0.5
-        elif (
-            current == "a" and index >= 3
-            and clean_words[index - 1] == "compact"
-            and index + 1 < len(clean_words)
-            and clean_words[index + 1] == "compact"
-        ):
-            # Preserve the speaker's repeated term while giving the ownership
-            # claim and named attribution separate readable cards.
-            boundary_costs[index] = 0.2
-        elif current == "because" and index >= 3:
-            boundary_costs[index] = 0.75
-        elif current in dependent_clause and index >= 6:
-            boundary_costs[index] = 1.0
-        elif (
-            current == "where" and index + 1 < len(clean_words)
-            and clean_words[index + 1] == "when"
-        ):
-            continue
-        elif current in weak_relative and index >= 5:
-            boundary_costs[index] = 1.5
-        elif current in spoken_fillers:
-            # A hesitation sound is not a semantic boundary. Splitting before
-            # it can strand the preceding contrast (for example “but Linux”)
-            # even though the next words complete that same clause.
-            continue
-    if not boundary_costs:
-        return [normalized]
-    maximum_count = min(desired_count, len(boundary_costs) + 1)
-    for count in range(maximum_count, 1, -1):
-        target = len(words) / count
-        ranked: list[tuple[float, tuple[int, ...]]] = []
-        for cuts in combinations(sorted(boundary_costs), count - 1):
-            bounds = (0, *cuts, len(words))
-            lengths = [bounds[i + 1] - bounds[i] for i in range(count)]
-            if min(lengths) < 3:
-                continue
-            candidate_parts = [
-                " ".join(words[bounds[i]:bounds[i + 1]]).strip()
-                for i in range(count)
-            ]
-            discourse_only = {"and", "but", "like", "so", "uh", "um", "you", "know"}
-            if any(
-                not [
-                    word for word in re.findall(r"[A-Za-z']+", part.casefold())
-                    if word not in discourse_only
-                ]
-                for part in candidate_parts
-            ):
-                continue
-            if any(
-                _semantic_source_part_is_dangling(part)
-                for part in candidate_parts[:-1]
-            ):
-                # A short card is not useful when it visibly ends on "and",
-                # "so", "uh", an article, or another open connector.
-                continue
-            if any(
-                re.match(
-                    r"^(?:and|or)\s+(?:be|have|do)\b",
-                    part.strip(), re.IGNORECASE,
-                )
-                for part in candidate_parts[1:]
-            ):
-                # Coordinated predicates inherit their subject from the
-                # preceding card ("...build weapons / or be deceptive").
-                # They cannot be translated as independent cards without
-                # importing context across the fixed boundary.
-                continue
-            if any(
-                (
-                    candidate_parts[index + 1].casefold().startswith("and the ")
-                    and not re.search(
-                        r"\b(?:is|are|was|were|has|have|does|do|will|can)\b",
-                        candidate_parts[index + 1], re.IGNORECASE,
-                    )
-                )
-                or re.match(
-                    r"^and\s+[A-Z][A-Za-z.'-]+\s+"
-                    r"(?:\w+\s+){0,2}(?:is|are|was|were|has|have|does|do)\b",
-                    candidate_parts[index + 1],
-                )
-                for index in range(count - 1)
-            ):
-                # Keep coordinated subjects and noun phrases together:
-                # "Susan / and Sheldon are ..." and
-                # "the best actor / and the best partner ..." are not two
-                # independently translatable caption cards.
-                continue
-            if any(
-                re.search(r"\bif\b[^.!?]*$", candidate_parts[i], re.IGNORECASE)
-                and candidate_parts[i + 1].casefold().startswith(("where ", "which "))
-                for i in range(count - 1)
-            ):
-                continue
-            balance = sum(abs(length - target) for length in lengths)
-            boundary_penalty = sum(boundary_costs[cut] for cut in cuts)
-            ranked.append((balance + boundary_penalty * 2.5, cuts))
-        if not ranked:
-            continue
-        _, cuts = min(ranked, key=lambda item: item[0])
-        bounds = (0, *cuts, len(words))
-        return [
-            " ".join(words[bounds[index]:bounds[index + 1]]).strip()
-            for index in range(count)
-        ]
-    return [normalized]
+
+
+
 
 
 def _semantic_source_part_is_dangling(value: str) -> bool:
@@ -5690,16 +5945,36 @@ def _semantic_source_part_is_dangling(value: str) -> bool:
 
 def _uppercase_source_entities(value: str) -> set[str]:
     """Return auditable acronym-like entities that must not move across cards."""
-    return set(re.findall(r"\b[A-Z][A-Z0-9.-]{1,}\b", value)) - {"AI", "US", "USA"}
+    return set(re.findall(
+        r"\b([A-Z][A-Z0-9.-]{1,}?)(?:s|es)?\b", value,
+    )) - {"AI", "US", "USA"}
 
 
-def _caption_entity_alignment_errors(source: str, translation: str) -> list[str]:
+def _caption_entity_alignment_errors(
+    source: str, translation: str,
+    terminology: list[TerminologyEntry] | None = None,
+    audio_conflict_entities: set[str] | None = None,
+) -> list[str]:
     """Keep named entities in their fixed source card, allowing known Chinese aliases."""
     errors: list[str] = []
     source_entities = _uppercase_source_entities(source)
     target_entities = _uppercase_source_entities(translation)
     for entity in source_entities:
-        aliases = CAPTION_ENTITY_ALIASES.get(entity, (entity,))
+        if entity in (audio_conflict_entities or set()):
+            continue
+        contextual_targets = tuple(
+            entry.target for entry in (terminology or [])
+            if entry.strategy == TerminologyStrategy.TRANSLATE
+            and entry.target.strip()
+            and (
+                entry.source.casefold() == entity.casefold()
+                or (
+                    _contains_term(entry.source, entity)
+                    and _contains_term(source, entry.source)
+                )
+            )
+        )
+        aliases = (*CAPTION_ENTITY_ALIASES.get(entity, (entity,)), *contextual_targets)
         if not any(alias in translation for alias in aliases):
             errors.append(f"missing:{entity}")
     for entity in target_entities - source_entities:
@@ -5715,47 +5990,45 @@ def _caption_entity_alignment_errors(source: str, translation: str) -> list[str]
 def _semantic_card_translation_errors(
     row: dict[str, Any], translation: str,
     terminology: list[TerminologyEntry],
+    *, require_punctuation: bool = True,
+    audio_conflict_entities: set[str] | None = None,
 ) -> list[str]:
     """Validate one isolated semantic card before it can be locked for rendering."""
     errors: list[str] = []
     source = str(row.get("source") or "")
     duration = max(float(row.get("duration_seconds") or 0.1), 0.1)
-    visible = len(re.sub(r"\s+", "", translation))
+    visible = _subtitle_reading_units(translation)
     if not translation:
         errors.append("empty")
-    if (
-        visible > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS
-        or visible / duration > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
-    ):
+    if visible / duration > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND:
         errors.append("reading_speed")
-    if translation and not re.search(r"[。！？!?]$", translation):
+    if require_punctuation and translation and not re.search(r"[。！？!?]$", translation):
         errors.append("punctuation")
-    errors.extend(_caption_entity_alignment_errors(source, translation))
-    if _contains_term(source, "maybe") and not re.search(
-        r"可能|也许|或许|大约|约有?|差不多", translation,
-    ):
-        errors.append("modality")
-    if (
-        _contains_term(source, "up the stack")
-        and re.search(r"(?:堆栈|技术栈).{0,6}(?:上移|向上)", translation)
-    ):
-        errors.append("literal_industry_stack")
+    errors.extend(_caption_entity_alignment_errors(
+        source, translation, terminology, audio_conflict_entities,
+    ))
     for term in terminology:
+        protected_terms = [
+            other.source for other in terminology
+            if other is not term
+            and len(other.source) > len(term.source)
+            and term.source.casefold() in other.source.casefold()
+        ]
         if (
             term.strategy == TerminologyStrategy.TRANSLATE
             and term.target
-            and _contains_term(source, term.source)
-            and (
-                not _translated_term_present(
-                    term, TranscriptCue(
-                        id=str(row.get("id") or ""), start=0, end=duration,
-                        source_text=source, translation=translation,
-                    ),
-                )
-                or _contains_term(translation, term.source)
-            )
+            and _contains_unprotected_term(source, term.source, protected_terms)
         ):
-            errors.append(f"term:{term.source}")
+            if not _translated_term_present(
+                term, TranscriptCue(
+                    id=str(row.get("id") or ""), start=0, end=duration,
+                    source_text=source, translation=translation,
+                ),
+                allow_alternatives=True,
+            ):
+                errors.append(f"term:{term.source}:missing_target:{term.target}")
+            if _contains_term(translation, term.source):
+                errors.append(f"term:{term.source}:remove_english:{term.source}")
     return errors
 
 
@@ -5770,166 +6043,132 @@ def _review_score_out_of_five(value: object) -> float:
     return score
 
 
-def _coalesce_short_semantic_parts(
-    parts: list[str], duration: float,
-    minimum_seconds: float = INTERVIEW_CAPTION_MIN_SECONDS,
+def _caption_numeric_alignment_errors(
+    source_words: list[SourceWord], start_word: int, end_word: int,
+    translation: str, numeric_conflict_pairs: list[dict[str, Any]],
 ) -> list[str]:
-    """Merge speech fragments only when the real allocator cannot fit the minimum."""
-    merged = list(parts)
-    while len(merged) > 1:
-        durations = _allocate_caption_durations(merged, duration)
-        short_index = next((
-            index for index, allocated in enumerate(durations)
-            if allocated < minimum_seconds - 1e-6
-        ), None)
-        if short_index is None:
-            weights = [max(1, len(re.findall(r"\S+", part))) for part in merged]
-            total = sum(weights)
-            short_index = next((
-                index for index, (part, weight) in enumerate(zip(merged, weights))
-                if duration * weight / total < minimum_seconds
-                and part.casefold().lstrip().startswith(("and ", "or "))
-                and not re.search(r"[.!?][\"'”’)]?$", part.strip())
-            ), None)
-        if short_index is None:
-            break
-        if short_index == 0:
-            merged[1] = f"{merged[0]} {merged[1]}".strip()
-            del merged[0]
-        else:
-            merged[short_index - 1] = (
-                f"{merged[short_index - 1]} {merged[short_index]}".strip()
-            )
-            del merged[short_index]
-    return merged
+    """Enforce Arabic-number ownership while allowing one locally paired ASR value."""
+    pattern = re.compile(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:[%％]|x)?")
 
+    def values(value: str) -> list[str]:
+        return [match.replace("％", "%") for match in pattern.findall(value)]
 
-def _allocate_caption_durations(parts: list[str], duration: float) -> list[float]:
-    """Allocate a complete parent span while honoring hard card bounds.
-
-    Source word timing is not present in ``TranscriptCue``. Word count is the
-    best available speech proxy, but the final allocation is projected into
-    the same minimum/maximum bounds used by validation and rendering.
-    """
-    if not parts:
-        return []
-    count = len(parts)
-    minimum = INTERVIEW_CAPTION_MIN_SECONDS
-    maximum = INTERVIEW_CAPTION_HARD_MAX_SECONDS
-    if duration < count * minimum - 1e-6 or duration > count * maximum + 1e-6:
-        weights = [max(1, len(re.findall(r"\S+", part))) for part in parts]
-        total_weight = sum(weights)
-        return [duration * weight / total_weight for weight in weights]
-
-    weights = [max(1, len(re.findall(r"\S+", part))) for part in parts]
-    allocated = [minimum] * count
-    remaining = duration - count * minimum
-    open_indices = set(range(count))
-    while remaining > 1e-9 and open_indices:
-        total_weight = sum(weights[index] for index in open_indices)
-        consumed = 0.0
-        saturated: set[int] = set()
-        for index in open_indices:
-            share = remaining * weights[index] / total_weight
-            capacity = maximum - allocated[index]
-            addition = min(share, capacity)
-            allocated[index] += addition
-            consumed += addition
-            if capacity - addition <= 1e-9:
-                saturated.add(index)
-        remaining -= consumed
-        open_indices -= saturated
-        if consumed <= 1e-9:
-            break
-    if allocated:
-        allocated[-1] += duration - sum(allocated)
-    return allocated
-
-
-def _retime_existing_semantic_card_groups(cues: list[TranscriptCue]) -> None:
-    """Project stale sibling-card timings into the current hard bounds.
-
-    Older plans allocated time purely by word count and can contain a
-    sub-second final card beside a long sibling. Moving only their shared
-    boundary preserves the ordered bilingual pairs and complete parent span;
-    it does not invent a new English/Chinese alignment.
-    """
-    index = 0
-    while index < len(cues):
-        cue = cues[index]
-        if "-card-" not in cue.id:
-            index += 1
+    pair_by_index = {
+        int(row["source_word_index"]) - 1: row
+        for row in numeric_conflict_pairs
+        if start_word <= int(row["source_word_index"]) - 1 < end_word
+    }
+    occurrences = [
+        (index, number)
+        for index in range(start_word, end_word)
+        for number in values(source_words[index].raw)
+    ]
+    target_counts: dict[str, int] = {}
+    for number in values(translation):
+        target_counts[number] = target_counts.get(number, 0) + 1
+    errors: list[str] = []
+    for index, number in occurrences:
+        if index in pair_by_index:
             continue
-        parent_id = cue.id.rsplit("-card-", 1)[0]
-        end_index = index + 1
-        while (
-            end_index < len(cues)
-            and cues[end_index].id.rsplit("-card-", 1)[0] == parent_id
-            and abs(cues[end_index].start - cues[end_index - 1].end) <= 0.1
-        ):
-            end_index += 1
-        group = cues[index:end_index]
-        if len(group) > 1:
-            start = group[0].start
-            end = group[-1].end
-            durations = _allocate_caption_durations(
-                [item.source_text for item in group], end - start,
+        if target_counts.get(number, 0):
+            target_counts[number] -= 1
+        else:
+            errors.append(f"missing_number:{number}@{index + 1}")
+    for index, number in occurrences:
+        pair = pair_by_index.get(index)
+        if pair is None:
+            continue
+        candidates = [
+            str(pair.get("audio_candidate") or "").replace("％", "%"), number,
+        ]
+        adopted = next((
+            candidate for candidate in candidates
+            if candidate and target_counts.get(candidate, 0)
+        ), "")
+        if adopted:
+            target_counts[adopted] -= 1
+        else:
+            errors.append(
+                f"missing_number:{number}|{candidates[0]}@{index + 1}"
             )
-            if all(
-                INTERVIEW_CAPTION_MIN_SECONDS - 1e-6 <= duration
-                <= INTERVIEW_CAPTION_HARD_MAX_SECONDS + 1e-6
-                for duration in durations
-            ):
-                elapsed = 0.0
-                original_start = group[0].original_start
-                original_end = group[-1].original_end
-                has_original_timeline = (
-                    original_start is not None and original_end is not None
-                    and original_end > original_start
-                )
-                original_scale = (
-                    (original_end - original_start) / max(end - start, 1e-9)
-                    if has_original_timeline else 1.0
-                )
-                for position, (item, duration) in enumerate(
-                    zip(group, durations), start=1,
-                ):
-                    item.start = round(start + elapsed, 3)
-                    if has_original_timeline:
-                        item.original_start = round(
-                            original_start + elapsed * original_scale, 3,
-                        )
-                    elapsed += duration
-                    item.end = end if position == len(group) else round(start + elapsed, 3)
-                    if has_original_timeline:
-                        item.original_end = (
-                            original_end if position == len(group)
-                            else round(original_start + elapsed * original_scale, 3)
-                        )
-        index = end_index
+    for number, count in sorted(target_counts.items()):
+        errors.extend([f"moved_number:{number}"] * count)
+    return errors
 
 
-def _split_overlong_semantic_parts(
-    parts: list[str], duration: float,
-    maximum_seconds: float = INTERVIEW_CAPTION_HARD_MAX_SECONDS,
-) -> list[str]:
-    """Recursively split a defensible long clause after the initial partition."""
-    refined = list(parts)
-    while True:
-        weights = [max(1, len(re.findall(r"\S+", part))) for part in refined]
-        total = sum(weights)
-        changed = False
-        for index, (part, weight) in enumerate(zip(refined, weights)):
-            if duration * weight / total <= maximum_seconds:
-                continue
-            children = _semantic_english_parts(part, 2)
-            if len(children) <= 1:
-                continue
-            refined[index:index + 1] = children
-            changed = True
-            break
-        if not changed:
-            return refined
+def _numeric_audio_conflict_pairs(
+    source_words: list[SourceWord], audio_hypothesis: str,
+) -> list[dict[str, Any]]:
+    """Pair one changed number on each side only inside the same aligned replace span."""
+    hypothesis_words = re.findall(r"\S+", audio_hypothesis)
+    source_norm = [word.normalized for word in source_words]
+    hypothesis_norm = [
+        re.sub(r"[^a-z0-9']+", "", value.casefold().replace("’", "'"))
+        for value in hypothesis_words
+    ]
+
+    def number(value: str) -> str:
+        match = re.search(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:%|x)?", value)
+        return match.group(0) if match else ""
+
+    pairs: list[dict[str, Any]] = []
+    matcher = SequenceMatcher(None, source_norm, hypothesis_norm, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    for opcode_index, (tag, source_start, source_end, audio_start, audio_end) in enumerate(opcodes):
+        if tag != "replace":
+            continue
+        previous_anchor = opcodes[opcode_index - 1] if opcode_index else None
+        next_anchor = opcodes[opcode_index + 1] if opcode_index + 1 < len(opcodes) else None
+        if (
+            previous_anchor is None or previous_anchor[0] != "equal"
+            or previous_anchor[2] - previous_anchor[1] < 2
+            or next_anchor is None or next_anchor[0] != "equal"
+            or next_anchor[2] - next_anchor[1] < 2
+        ):
+            continue
+        source_numbers = [
+            (index, number(source_words[index].raw))
+            for index in range(source_start, source_end)
+            if number(source_words[index].raw)
+        ]
+        audio_numbers = [
+            (index, number(hypothesis_words[index]))
+            for index in range(audio_start, audio_end)
+            if number(hypothesis_words[index])
+        ]
+        if (
+            len(source_numbers) != 1 or len(audio_numbers) != 1
+            or source_numbers[0][1] == audio_numbers[0][1]
+        ):
+            continue
+        source_index, source_value = source_numbers[0]
+        audio_index, audio_value = audio_numbers[0]
+        pairs.append({
+            "source_value": source_value,
+            "audio_candidate": audio_value,
+            "source_word_index": source_index + 1,
+            "audio_word_index": audio_index + 1,
+            "source_context": " ".join(
+                word.raw for word in source_words[
+                    max(0, source_index - 5):min(len(source_words), source_index + 6)
+                ]
+            ),
+            "audio_context": " ".join(
+                hypothesis_words[
+                    max(0, audio_index - 5):min(len(hypothesis_words), audio_index + 6)
+                ]
+            ),
+            "basis": "single-number aligned replacement",
+        })
+    return pairs
+
+
+
+
+
+
+
+
 
 
 _ASR_REPEAT_IGNORE = {
@@ -5945,288 +6184,25 @@ TARGETED_WHISPER_POLICY_VERSION = 6
 TARGETED_WHISPER_CONTEXT_SECONDS = 15.0
 
 
-def interview_asr_suspicions(cues: list[TranscriptCue]) -> list[dict[str, Any]]:
-    """Find caption spans that warrant audio verification, without running ASR."""
-    findings: list[dict[str, Any]] = []
-    for cue in cues:
-        words = [
-            re.sub(r"[^a-z0-9'-]+", "", word.casefold())
-            for word in cue.source_text.split()
-        ]
-        words = [word for word in words if word]
-        reasons: list[str] = []
-        repeated = sorted({
-            left for left, right in zip(words, words[1:])
-            if left == right and left not in _ASR_REPEAT_IGNORE
-        })
-        if repeated:
-            reasons.append("repeated_content_word:" + ",".join(repeated))
-        for index, word in enumerate(words[:-1]):
-            if words[index + 1] != "cycle":
-                continue
-            if word not in _KNOWN_CYCLE_MODIFIERS:
-                reasons.append("unknown_cycle_modifier:" + word)
-        if not reasons:
-            continue
-        findings.append({
-            "cue_id": cue.id,
-            "start": cue.start,
-            "end": cue.end,
-            "source": cue.source_text,
-            "reasons": reasons,
-        })
-    return findings
 
 
-def _whisper_text_for_range(
-    payload: dict[str, Any], start: float, end: float,
-) -> str:
-    words = [
-        word for segment in payload.get("segments", [])
-        if isinstance(segment, dict)
-        for word in segment.get("words", [])
-        if isinstance(word, dict)
-        and start <= (
-            float(word.get("start") or 0) + float(word.get("end") or 0)
-        ) / 2 <= end
-    ]
-    if words:
-        return re.sub(
-            r"\s+", " ", "".join(str(word.get("word") or "") for word in words),
-        ).strip()
-    segments = [
-        str(segment.get("text") or "").strip()
-        for segment in payload.get("segments", [])
-        if isinstance(segment, dict)
-        and float(segment.get("end") or 0) > start
-        and float(segment.get("start") or 0) < end
-        and str(segment.get("text") or "").strip()
-    ]
-    return re.sub(r"\s+", " ", " ".join(segments)).strip()
 
 
-def _whisper_text_aligned_to_source(
-    payload: dict[str, Any], source: str, start: float, end: float,
-) -> str:
-    """Use lexical alignment because semantic-card timestamps are proportional."""
-    window_words = [
-        word for segment in payload.get("segments", [])
-        if isinstance(segment, dict)
-        for word in segment.get("words", [])
-        if isinstance(word, dict)
-        and float(word.get("end") or 0) > start - TARGETED_WHISPER_CONTEXT_SECONDS
-        and float(word.get("start") or 0) < end + TARGETED_WHISPER_CONTEXT_SECONDS
-    ]
-
-    def token(value: object) -> str:
-        return re.sub(r"[^a-z0-9']+", "", str(value or "").casefold())
-
-    source_tokens = [token(word) for word in source.split()]
-    source_tokens = [word for word in source_tokens if word]
-    whisper_tokens = [token(word.get("word")) for word in window_words]
-    matcher = SequenceMatcher(None, source_tokens, whisper_tokens, autojunk=False)
-    blocks = [block for block in matcher.get_matching_blocks() if block.size >= 2]
-    matched = sum(block.size for block in blocks)
-    if not blocks or matched < max(3, math.ceil(len(source_tokens) * 0.4)):
-        return _whisper_text_for_range(payload, start - 0.25, end + 0.05)
-    first = min(block.b for block in blocks)
-    last = max(block.b + block.size for block in blocks)
-    # Recover a misspelled trailing entity (for example Lumenum→Lumentum)
-    # that token-equality alignment intentionally could not match.
-    unmatched_tail = source_tokens[max(block.a + block.size for block in blocks):]
-    for source_token in unmatched_tail[-3:]:
-        candidates = range(last, min(len(whisper_tokens), last + 4))
-        best = max(
-            candidates,
-            key=lambda index: SequenceMatcher(
-                None, source_token, whisper_tokens[index], autojunk=False,
-            ).ratio(),
-            default=-1,
-        )
-        if best >= 0 and SequenceMatcher(
-            None, source_token, whisper_tokens[best], autojunk=False,
-        ).ratio() >= 0.72:
-            last = best + 1
-    return re.sub(
-        r"\s+", " ", "".join(
-            str(word.get("word") or "") for word in window_words[first:last]
-        ),
-    ).strip()
 
 
-def targeted_whisper_caption_audit(
-    media_path: Path, cues: list[TranscriptCue], job: Path,
-    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
-) -> dict[str, Any] | None:
-    """Retranscribe only suspicious caption spans and cache the audio evidence."""
-    findings = interview_asr_suspicions(cues)
-    if not findings:
-        return None
-    runner = runner or subprocess.run
-    whisper = shutil.which("whisper")
-    if not whisper:
-        raise RuntimeError(
-            "suspicious YouTube captions require local Whisper, but whisper is unavailable"
-        )
-    policy_version = TARGETED_WHISPER_POLICY_VERSION
-    try:
-        context_seconds = float(os.environ.get(
-            "VIDEO_FACTORY_WHISPER_CONTEXT_SECONDS",
-            str(TARGETED_WHISPER_CONTEXT_SECONDS),
-        ))
-    except ValueError:
-        context_seconds = TARGETED_WHISPER_CONTEXT_SECONDS
-    context_seconds = max(2.0, min(context_seconds, TARGETED_WHISPER_CONTEXT_SECONDS))
-    source_fingerprint = hashlib.sha256(json.dumps({
-        "media": str(media_path.resolve()),
-        "size": media_path.stat().st_size,
-        "mtime_ns": media_path.stat().st_mtime_ns,
-        "findings": findings,
-        "model": os.environ.get("VIDEO_FACTORY_WHISPER_MODEL", "large-v3-turbo"),
-        "context_seconds": context_seconds,
-    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-    fingerprint = hashlib.sha256(
-        f"{policy_version}:{source_fingerprint}".encode("utf-8")
-    ).hexdigest()
-    workspace_root = job.parents[1] if job.parent.name == "jobs" else job.parent
-    output_dir = (
-        workspace_root / "cache" / "targeted-whisper" / source_fingerprint[:24]
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    audit_path = output_dir / "caption-audit.json"
-    if audit_path.is_file():
-        cached = json.loads(audit_path.read_text(encoding="utf-8"))
-        if cached.get("fingerprint") == fingerprint:
-            return {**cached, "cache_hit": True}
-
-    # Semantic-card timestamps are assigned proportionally to text weight, so a
-    # short child card can drift several seconds from the words it represents.
-    # Keep enough surrounding audio for lexical alignment to find the actual
-    # phrase instead of silently accepting a nearby repeated fragment.
-    padded = sorted((
-        max(0.0, float(row["start"]) - context_seconds),
-        float(row["end"]) + context_seconds,
-    ) for row in findings)
-    merged: list[list[float]] = []
-    for start, end in padded:
-        if merged and start <= merged[-1][1] + 0.2:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    clip_timestamps = ",".join(
-        f"{start:.3f},{end:.3f}" for start, end in merged
-    )
-    command = [
-        whisper, str(media_path), "--model",
-        os.environ.get("VIDEO_FACTORY_WHISPER_MODEL", "large-v3-turbo"),
-        "--language", "en", "--task", "transcribe",
-        "--clip_timestamps", clip_timestamps,
-        "--word_timestamps", "True", "--output_format", "json",
-        "--output_dir", str(output_dir), "--verbose", "False", "--fp16", "False",
-        "--beam_size", os.environ.get("VIDEO_FACTORY_WHISPER_BEAM_SIZE", "1"),
-        "--best_of", "1",
-        "--threads", os.environ.get(
-            "VIDEO_FACTORY_WHISPER_THREADS", str(os.cpu_count() or 4),
-        ),
-    ]
-    raw_path = output_dir / "raw-transcript.json"
-    raw_meta_path = output_dir / "raw-transcript-meta.json"
-    raw_cache_hit = False
-    if raw_path.is_file() and raw_meta_path.is_file():
-        raw_meta = json.loads(raw_meta_path.read_text(encoding="utf-8"))
-        raw_cache_hit = raw_meta.get("command") == command
-    if raw_cache_hit:
-        payload = json.loads(raw_path.read_text(encoding="utf-8"))
-    else:
-        try:
-            whisper_timeout = int(os.environ.get(
-                "VIDEO_FACTORY_WHISPER_TIMEOUT_SECONDS", "900",
-            ))
-        except ValueError:
-            whisper_timeout = 900
-        whisper_timeout = max(120, min(whisper_timeout, 1800))
-        completed = runner(
-            command, capture_output=True, text=True,
-            timeout=whisper_timeout, check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                "targeted Whisper verification failed: "
-                + (completed.stderr or completed.stdout or "unknown error")[-800:]
-            )
-        whisper_path = output_dir / f"{media_path.stem}.json"
-        if not whisper_path.is_file():
-            raise RuntimeError("targeted Whisper verification produced no JSON transcript")
-        payload = json.loads(whisper_path.read_text(encoding="utf-8"))
-        raw_path.write_text(
-            json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8",
-        )
-        raw_meta_path.write_text(json.dumps({
-            "fingerprint": fingerprint,
-            "command": command,
-        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    corrections: list[dict[str, Any]] = []
-    for row in findings:
-        verified = _whisper_text_aligned_to_source(
-            payload, str(row["source"]), float(row["start"]), float(row["end"]),
-        )
-        if len(re.findall(r"\w+", verified)) < 2:
-            raise RuntimeError(
-                f"targeted Whisper could not recover caption {row['cue_id']}"
-            )
-        verified_words = [
-            re.sub(r"[^a-z0-9'-]+", "", word.casefold())
-            for word in verified.split()
-        ]
-        for reason in row.get("reasons", []):
-            if not str(reason).startswith("unknown_cycle_modifier:"):
-                continue
-            original_modifier = str(reason).split(":", 1)[1]
-            cycle_modifiers = {
-                verified_words[index]
-                for index in range(len(verified_words) - 1)
-                if verified_words[index + 1] == "cycle"
-            }
-            resolved = (
-                bool(cycle_modifiers.intersection(_KNOWN_CYCLE_MODIFIERS))
-                or (
-                    original_modifier not in verified_words
-                    and "cycle" in verified_words
-                )
-            )
-            if not resolved:
-                raise RuntimeError(
-                    "targeted Whisper did not resolve ambiguous cycle modifier "
-                    f"for {row['cue_id']}: {verified}"
-                )
-        corrections.append({
-            **row,
-            "verified_source": verified,
-            "changed": re.sub(r"\W+", "", verified).casefold()
-            != re.sub(r"\W+", "", str(row["source"])).casefold(),
-        })
-    audit = {
-        "step": "targeted_whisper_caption_audit",
-        "policy_version": policy_version,
-        "fingerprint": fingerprint,
-        "cache_hit": False,
-        "raw_cache_hit": raw_cache_hit,
-        "model": os.environ.get("VIDEO_FACTORY_WHISPER_MODEL", "large-v3-turbo"),
-        "clip_ranges": merged,
-        "corrections": corrections,
-    }
-    audit_path.write_text(
-        json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
-    )
-    return audit
 
 
-def interview_caption_duration_errors(cues: list[TranscriptCue]) -> list[str]:
+def interview_caption_duration_errors(
+    cues: list[TranscriptCue],
+    terminology: list[TerminologyEntry] | None = None,
+    audio_conflict_entities: set[str] | None = None,
+) -> list[str]:
     """Validate every measurable invariant in the shared caption policy."""
     errors: list[str] = []
     for cue in cues:
         source = re.sub(r"\s+", " ", cue.source_text).strip()
         translation = re.sub(r"\s+", "", cue.translation)
+        reading_units = _subtitle_reading_units(cue.translation)
         words = len(re.findall(r"\S+", source))
         if not source or not translation:
             errors.append(f"{cue.id} is missing bilingual caption text")
@@ -6254,48 +6230,134 @@ def interview_caption_duration_errors(cues: list[TranscriptCue]) -> list[str]:
                 f"{cue.id} has {words} English words, above the "
                 f"{INTERVIEW_CAPTION_MAX_ENGLISH_WORDS}-word maximum"
             )
-        if len(translation) > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS:
-            errors.append(
-                f"{cue.id} has {len(translation)} Chinese characters, above the "
-                f"{INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS}-character maximum"
-            )
         if (
-            len(translation) / max(cue.duration, 0.1)
+            reading_units / max(cue.duration, 0.1)
             > INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
         ):
             errors.append(
                 f"{cue.id} exceeds "
                 f"{INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND:g} "
-                "Chinese characters per second"
+                "subtitle reading units per second"
             )
-        entity_errors = _caption_entity_alignment_errors(source, cue.translation)
-        if entity_errors:
-            errors.append(
-                f"{cue.id} has bilingual entity misalignment: "
-                + ", ".join(entity_errors)
-            )
+    errors.extend(interview_caption_layout_errors(cues))
     return errors
 
 
 def cached_interview_caption_pipeline_complete(
     cues: list[TranscriptCue], trace: list[dict[str, Any]],
+    media_sha256: str = "",
+    terminology: list[TerminologyEntry] | None = None,
 ) -> bool:
     """Identify an immutable plan reviewed under the exact current policy."""
     substantive_ids = {
         cue.id for cue in cues
         if cue.source_text.strip() or cue.translation.strip()
     }
-    if not substantive_ids or interview_caption_duration_errors(cues):
+    if not substantive_ids or interview_caption_duration_errors(cues, terminology):
         return False
-    return any(
-        item.get("step") == "interview_semantic_subtitle_cards"
+    alignments = {
+        str(item.get("fingerprint")): item
+        for item in trace if isinstance(item, dict)
+        and item.get("step") == "interview_source_word_alignment"
+        and item.get("policy_version") == ALIGNMENT_POLICY_VERSION
+        and item.get("fingerprint")
+        and item.get("status") in {"aligned", "audio_alignment_degraded"}
+        and item.get("source_ledger_fingerprint")
+        and item.get("media_sha256") == media_sha256
+    }
+    reviewed = any(
+        item.get("step") == "interview_joint_boundary_translation"
         and item.get("policy_version") == INTERVIEW_CAPTION_POLICY_VERSION
         and item.get("policy_fingerprint") == INTERVIEW_CAPTION_POLICY_FINGERPRINT
+        and item.get("caption_content_fingerprint")
+        == _interview_caption_content_fingerprint(cues)
+        and item.get("terminology_decision_fingerprint")
+        == _terminology_decision_fingerprint(terminology or [])
+        and item.get("strict_source_fingerprint")
+        == _strict_interview_source_fingerprint(cues)
+        and str(item.get("alignment_fingerprint")) in alignments
+        and item.get("source_ledger_fingerprint")
+        == alignments[str(item.get("alignment_fingerprint"))].get(
+            "source_ledger_fingerprint"
+        )
+        and item.get("audio_hypothesis_sha256", "")
+        == alignments[str(item.get("alignment_fingerprint"))].get(
+            "audio_hypothesis_sha256", ""
+        )
         and substantive_ids <= {
             str(cue_id) for cue_id in item.get("reviewed_cue_ids", [])
         }
         for item in trace if isinstance(item, dict)
     )
+    return bool(media_sha256 and alignments and reviewed)
+
+
+def cached_joint_caption_pipeline_complete(
+    cues: list[TranscriptCue], trace: list[dict[str, Any]],
+    terminology: list[TerminologyEntry] | None = None,
+) -> bool:
+    """Validate a non-interview joint-caption cache without audio provenance."""
+    substantive_ids = {cue.id for cue in cues if cue.source_text.strip()}
+    if not substantive_ids or interview_caption_duration_errors(cues, terminology):
+        return False
+    return any(
+        item.get("step") == "joint_caption_scopes_translation"
+        and item.get("policy_version") == INTERVIEW_CAPTION_POLICY_VERSION
+        and item.get("policy_fingerprint") == INTERVIEW_CAPTION_POLICY_FINGERPRINT
+        and item.get("caption_content_fingerprint")
+        == _interview_caption_content_fingerprint(cues)
+        and item.get("terminology_decision_fingerprint")
+        == _terminology_decision_fingerprint(terminology or [])
+        and item.get("strict_source_fingerprint")
+        == _strict_interview_source_fingerprint(cues)
+        and substantive_ids <= {
+            str(cue_id) for cue_id in item.get("reviewed_cue_ids", [])
+        }
+        for item in trace if isinstance(item, dict)
+    )
+
+
+def _caption_plan_ranges(
+    plan: dict[str, Any], duration: float,
+) -> list[SourceRange]:
+    """Return selected atomic intervals without changing any editorial row."""
+    selected: list[SourceRange] = []
+    for key in ("bilibili_chapters", "wechat_lessons"):
+        rows = plan.get(key)
+        if not isinstance(rows, list):
+            continue
+        selected.extend(
+            source_range for raw in rows if isinstance(raw, dict)
+            and (source_range := _coerce_range(raw, duration)) is not None
+        )
+    if not selected:
+        return [SourceRange(0.0, duration)] if duration > 0 else []
+    endpoints = sorted({
+        round(value, 6) for source_range in selected
+        for value in (source_range.start, source_range.end)
+    })
+    atomic: list[SourceRange] = []
+    for start, end in zip(endpoints, endpoints[1:]):
+        if end <= start:
+            continue
+        midpoint = (start + end) / 2
+        if any(row.start <= midpoint < row.end for row in selected):
+            atomic.append(SourceRange(start, end))
+    return atomic
+
+
+def _source_cues_for_plan(
+    cues: list[TranscriptCue], plan: dict[str, Any], duration: float,
+) -> list[TranscriptCue]:
+    ranges = _caption_plan_ranges(plan, duration)
+    return [
+        TranscriptCue(**asdict(cue)) for cue in cues
+        if any(
+            min(cue.end, source_range.end)
+            - max(cue.start, source_range.start) >= 0.01
+            for source_range in ranges
+        )
+    ]
 
 
 def select_caption_incumbent(
@@ -6439,8 +6501,8 @@ def split_bilingual_subtitle_display(
 
     English-only semantic boundaries cannot establish where an existing
     Chinese paragraph carries the corresponding meaning. Segmentation belongs
-    in ``segment_interview_subtitle_cards``, where every fixed source span gets
-    its own translation and fidelity review.
+    in the joint boundary-and-translation engine, where every fixed source span
+    gets its own translation and fidelity review.
     """
     if duration <= 0:
         return []
@@ -6460,6 +6522,9 @@ def merge_dependent_subtitle_cues(
             id=cues[index].id, start=cues[index].start, end=cues[index].end,
             source_text=source, translation=translation, speaker=cues[index].speaker,
             confidence=cues[index].confidence,
+            original_start=cues[index].original_start,
+            original_end=cues[index].original_end,
+            source_tokens=list(cues[index].source_tokens),
         )
         index += 1
         while index < len(cues):
@@ -6491,8 +6556,58 @@ def merge_dependent_subtitle_cues(
             current.translation = normalize_chinese_subtitle(
                 f"{current.translation}{following.translation.strip()}"
             )
+            current.original_end = following.original_end
+            current.source_tokens.extend(following.source_tokens)
             index += 1
         if current.source_text and current.translation:
+            merged.append(current)
+    return merged
+
+
+def merge_interview_source_cues(
+    cues: list[TranscriptCue], maximum_duration: float = 60.0,
+) -> list[TranscriptCue]:
+    """Join provisional JSON3 fragments before the single translation pass."""
+    merged: list[TranscriptCue] = []
+    index = 0
+    while index < len(cues):
+        first = cues[index]
+        current = TranscriptCue(
+            id=first.id, start=first.start, end=first.end,
+            source_text=omit_non_speech_directions(first.source_text),
+            speaker=first.speaker, confidence=first.confidence,
+            original_start=first.original_start, original_end=first.original_end,
+            source_tokens=[
+                row for row in first.source_tokens
+                if omit_non_speech_directions(str(row.get("raw") or "")).strip()
+            ],
+        )
+        index += 1
+        while index < len(cues):
+            following = cues[index]
+            following_source = omit_non_speech_directions(following.source_text)
+            compact = current.source_text.rstrip()
+            next_word = re.search(r"[A-Za-z]", following_source)
+            dependent = bool(SOURCE_DANGLING_END.search(compact)) or bool(
+                compact and compact[-1] not in ".?!。！？"
+                and next_word and next_word.group(0).islower()
+            )
+            if (
+                not following_source
+                or not dependent
+                or following.start - current.end > 0.8
+                or following.end - current.start > maximum_duration
+            ):
+                break
+            current.end = following.end
+            current.original_end = following.original_end
+            current.source_text = f"{current.source_text} {following_source}".strip()
+            current.source_tokens.extend(
+                row for row in following.source_tokens
+                if omit_non_speech_directions(str(row.get("raw") or "")).strip()
+            )
+            index += 1
+        if current.source_text:
             merged.append(current)
     return merged
 
@@ -7061,13 +7176,14 @@ class YouTubeCollectionRenderer:
         self.runner = runner or subprocess.run
 
     def render(self, manifest: VideoCollectionManifest) -> VideoCollectionManifest:
-        # Cached manifests can predate the current translation policy. Apply
-        # deterministic cleanup on every render so rerenders self-heal without
-        # another model call or an editorial rewrite.
-        omit_spoken_fillers(manifest.transcript)
-        enforce_cached_terminology_contract(
-            manifest.transcript, manifest.terminology,
-        )
+        # Legacy non-interview manifests may need deterministic migration.
+        # Reviewed v6 interview cards are immutable at render time; changing
+        # their text here would invalidate the reviewer/content fingerprint.
+        if manifest.editorial_mode != "known_tech_interview_clip":
+            omit_spoken_fillers(manifest.transcript)
+            enforce_cached_terminology_contract(
+                manifest.transcript, manifest.terminology,
+            )
         if terminology_errors := terminology_contract_errors(
             manifest.transcript, manifest.terminology,
         ):
@@ -7321,7 +7437,7 @@ def validate_collection(
         CollectionItemKind.BILIBILI_CHAPTER, CollectionItemKind.WECHAT_SHORT,
     } for item in manifest.items)
     youtube_wechat_mode = manifest.editorial_mode in {
-        "technical_coverage", "known_tech_interview_clip",
+        "technical_coverage", "known_tech_interview_clip", "conference_highlights",
     }
     if study_mode:
         chapters = [item for item in manifest.items if item.kind == CollectionItemKind.BILIBILI_CHAPTER]
@@ -7414,6 +7530,24 @@ def validate_collection(
                 "interview title is entailed by the selected passage"
                 if not entailment_errors else "; ".join(entailment_errors),
             ))
+    elif manifest.editorial_mode == "conference_highlights":
+        chapters = [item for item in manifest.items if item.kind == CollectionItemKind.BILIBILI_CHAPTER]
+        shorts = [item for item in manifest.items if item.kind == CollectionItemKind.WECHAT_SHORT]
+        ranges = sorted(
+            [source_range for item in shorts for source_range in item.source_ranges],
+            key=lambda value: value.start,
+        )
+        overlaps = any(
+            current.start < previous.end
+            for previous, current in zip(ranges, ranges[1:])
+        )
+        total = sum(value.duration for value in ranges)
+        checks.extend([
+            CheckResult("bilibili_paused", not chapters, f"unexpected Bilibili items: {len(chapters)}"),
+            CheckResult("conference_highlight_count", 1 <= len(shorts) <= 5, f"conference highlights: {len(shorts)}; target 1–5"),
+            CheckResult("conference_highlight_distinct_ranges", not overlaps, "source ranges are non-overlapping" if not overlaps else "source ranges overlap"),
+            CheckResult("conference_highlight_total_duration", total <= CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS, f"total duration {total:.2f}s; maximum 900s"),
+        ])
     else:
         mains = [item for item in manifest.items if item.kind == CollectionItemKind.MAIN]
         episodes = [item for item in manifest.items if item.kind == CollectionItemKind.EPISODE]
@@ -7429,8 +7563,15 @@ def validate_collection(
             target = "480–1800"
         elif item.kind == CollectionItemKind.WECHAT_SHORT:
             if manifest.editorial_mode == "known_tech_interview_clip":
-                duration_ok = INTERVIEW_MIN_SECONDS <= item.duration <= INTERVIEW_MAX_SECONDS
-                target = "45–180"
+                duration_ok = 0 < item.duration <= INTERVIEW_MAX_SECONDS
+                target = "prefer <=180; hard maximum 300"
+            elif manifest.editorial_mode == "conference_highlights":
+                duration_ok = (
+                    CONFERENCE_HIGHLIGHT_MIN_SECONDS
+                    <= item.duration
+                    <= CONFERENCE_HIGHLIGHT_MAX_SECONDS
+                )
+                target = "45–300"
             else:
                 duration_ok = 180 <= item.duration <= 360
                 target = "180–360"
@@ -7638,6 +7779,148 @@ def _translation_source_fingerprint(cues: list[TranscriptCue]) -> str:
     return hashlib.sha256("".join(keys).encode()).hexdigest()
 
 
+def _strict_interview_source_fingerprint(cues: list[TranscriptCue]) -> str:
+    """Bind a review to every publishable source character, including fillers."""
+    source = re.sub(
+        r"\s+", " ", " ".join(
+            omit_non_speech_directions(cue.source_text) for cue in cues
+        ),
+    ).strip()
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _interview_caption_content_fingerprint(cues: list[TranscriptCue]) -> str:
+    rows = [{
+        "source": re.sub(r"\s+", " ", cue.source_text).strip(),
+        "translation": re.sub(r"\s+", " ", cue.translation).strip(),
+        "start": round(cue.start, 3), "end": round(cue.end, 3),
+    } for cue in cues]
+    return hashlib.sha256(json.dumps(
+        rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _terminology_decision_fingerprint(
+    terminology: list[TerminologyEntry],
+) -> str:
+    """Bind cached semantic review to the exact terminology decisions it saw."""
+    rows = [{
+        "source": entry.source,
+        "strategy": entry.strategy.value,
+        "target": entry.target,
+        "first_use_explanation": entry.first_use_explanation,
+        "notes": entry.notes,
+        "alternatives": list(entry.alternatives),
+        "rationale": entry.rationale,
+    } for entry in terminology]
+    return hashlib.sha256(json.dumps(
+        rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _compact_translation_trace(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep cache/recovery facts inline while moving verbose attempts to the audit."""
+    compact: list[dict[str, Any]] = []
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        step = str(item.get("step") or "")
+        if step == "interview_joint_boundary_translation":
+            compact.append({
+                key: value for key, value in item.items()
+                if key not in {"attempts"}
+            })
+            continue
+        if step == "joint_caption_scopes_translation":
+            compact.append({
+                key: value for key, value in item.items()
+                if key != "scope_traces"
+            })
+            continue
+        if step in {
+            "interview_joint_boundary_translation_failed",
+            "joint_caption_scopes_translation_failed",
+        }:
+            attempts = item.get("attempts")
+            attempt_rows = attempts if isinstance(attempts, list) else []
+            failed_card_ids: list[str] = []
+            final_errors: Any = None
+            for row in reversed(attempt_rows):
+                if not isinstance(row, dict):
+                    continue
+                if final_errors is None and row.get("errors"):
+                    final_errors = row.get("errors")
+                ids = row.get("failed_card_ids")
+                if isinstance(ids, list):
+                    failed_card_ids.extend(str(value) for value in ids)
+                if final_errors is not None and failed_card_ids:
+                    break
+            compact.append({
+                "step": step,
+                "error": str(item.get("error") or "")[:2000],
+                "attempt_count": len(attempt_rows),
+                "failed_card_ids": list(dict.fromkeys(failed_card_ids)),
+                "final_errors": final_errors,
+            })
+            continue
+        row = dict(item)
+        for verbose_key in (
+            "batches", "failed_cards", "previous_proposal",
+            "translation_attempt_provenance", "review_attempts",
+        ):
+            value = row.get(verbose_key)
+            if isinstance(value, list) and len(json.dumps(value, ensure_ascii=False)) > 8000:
+                row[verbose_key + "_count"] = len(value)
+                row.pop(verbose_key, None)
+        compact.append(row)
+    return compact
+
+
+def _write_translation_audit(
+    job: Path, trace: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "trace": trace,
+    }
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    path = job / "translation-audit.json"
+    path.write_bytes(encoded)
+    return {
+        "asset": path.name,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "schema_version": 1,
+    }
+
+
+def _translation_trace_from_plan(
+    plan_path: Path, payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Load a checksum-bound full audit, falling back to the inline cache trace."""
+    inline = [
+        row for row in payload.get("trace", []) if isinstance(row, dict)
+    ]
+    reference = payload.get("translation_audit")
+    if not isinstance(reference, dict):
+        return inline
+    asset = str(reference.get("asset") or "").strip()
+    expected_sha = str(reference.get("sha256") or "").strip()
+    if not asset or Path(asset).name != asset or not expected_sha:
+        return inline
+    path = plan_path.parent / asset
+    try:
+        encoded = path.read_bytes()
+        if hashlib.sha256(encoded).hexdigest() != expected_sha:
+            return inline
+        audit = json.loads(encoded)
+    except (OSError, json.JSONDecodeError):
+        return inline
+    rows = audit.get("trace") if isinstance(audit, dict) else None
+    return [row for row in rows if isinstance(row, dict)] \
+        if isinstance(rows, list) else inline
+
+
 def _merge_cached_translations(
     current: list[TranscriptCue], cached: list[TranscriptCue],
 ) -> None:
@@ -7690,18 +7973,40 @@ def rebase_interview_clip_timeline(
         local_end = min(media_duration, cue_original_end - offset)
         if local_end <= local_start:
             continue
+        rebased_tokens: list[dict[str, Any]] = []
+        for row in cue.source_tokens:
+            if not isinstance(row, dict):
+                continue
+            try:
+                token_start = float(row["start"])
+                token_end = float(row["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if previous_rebased:
+                token_start += previous_offset
+                token_end += previous_offset
+            token_local_start = max(0.0, token_start - offset)
+            token_local_end = min(media_duration, token_end - offset)
+            if token_local_end <= token_local_start:
+                continue
+            rebased_tokens.append({
+                **row,
+                "start": round(token_local_start, 3),
+                "end": round(token_local_end, 3),
+            })
         cue.start = round(local_start, 3)
         cue.end = round(local_end, 3)
         cue.original_start = round(cue_original_start, 3)
         cue.original_end = round(cue_original_end, 3)
+        cue.source_tokens = rebased_tokens
         rebased_cues.append(cue)
     cues[:] = rebased_cues
 
     local_start = max(0.0, original_start - offset)
     local_end = min(media_duration, original_end - offset)
-    if local_end - local_start < INTERVIEW_MIN_SECONDS:
+    if local_end - local_start <= 0:
         raise ValueError(
-            "downloaded interview interval cannot contain the validated 45-second highlight"
+            "downloaded interview interval cannot contain the validated highlight"
         )
     plan["story_start"] = round(local_start, 3)
     plan["story_end"] = round(local_end, 3)
@@ -7770,7 +8075,7 @@ def _previous_clip_for_local_timeline(
     local_window: dict[str, float], media_duration: float,
 ) -> dict[str, Any]:
     """Mark no-render plans whose selected cues are already clip-local."""
-    if cached_clip.get("rebased") or not cues:
+    if not cues:
         return cached_clip
     original_start = float(local_window["original_start"])
     original_end = float(local_window["original_end"])
@@ -7781,15 +8086,17 @@ def _previous_clip_for_local_timeline(
         min(cue.end, original_end) - max(cue.start, original_start) >= 0.5
         for cue in cues
     )
-    if not fits_local_media or overlaps_original_timeline:
-        return cached_clip
-    return {
-        **cached_clip,
-        "rebased": True,
-        "download_start": float(local_window["download_start"]),
-        "download_end": float(local_window["download_end"]),
-        "media_duration": media_duration,
-    }
+    if overlaps_original_timeline:
+        return {**cached_clip, "rebased": False}
+    if fits_local_media:
+        return {
+            **cached_clip,
+            "rebased": True,
+            "download_start": float(local_window["download_start"]),
+            "download_end": float(local_window["download_end"]),
+            "media_duration": media_duration,
+        }
+    return {**cached_clip, "rebased": False}
 
 
 class YouTubeCollectionFactory:
@@ -7797,11 +8104,13 @@ class YouTubeCollectionFactory:
         self, workspace: Workspace, writer: OpenAICompatibleStoryWriter,
         directing_writer: OpenAICompatibleStoryWriter | None = None,
         subtitle_reviewer: OpenAICompatibleStoryWriter | None = None,
+        runtime_guidance: str = "",
     ) -> None:
         self.workspace = workspace
         self.writer = writer
         self.directing_writer = directing_writer
         self.subtitle_reviewer = subtitle_reviewer
+        self.runtime_guidance = runtime_guidance.strip()
 
     def _approved_interview_hook_pair(
         self, source_video_id: str, lesson: dict[str, Any],
@@ -7899,6 +8208,7 @@ class YouTubeCollectionFactory:
             # media is still archived by acquire() and keeps its full timeline.
             download_media=False,
         )
+        acquired_source_cues = [TranscriptCue(**asdict(cue)) for cue in cues]
         classified_mode, known_people, _ = classify_youtube_editorial(
             str(metadata.get("title") or ""),
             str(metadata.get("channel") or metadata.get("uploader") or ""),
@@ -7908,8 +8218,20 @@ class YouTubeCollectionFactory:
         )
         metadata["known_tech_people"] = known_people
         if editorial_mode == "auto":
-            editorial_mode = classified_mode
-        if editorial_mode not in {"technical_coverage", "known_tech_interview_clip", "study"}:
+            channel_name = str(metadata.get("channel") or metadata.get("uploader") or "").casefold()
+            trusted_long_conference = bool(
+                any(marker in channel_name for marker in TRUSTED_CHANNEL_MARKERS)
+                and float(metadata.get("duration") or 0) > 7200
+                and not metadata.get("chapters")
+                and classified_mode in {"technical_coverage", "known_tech_interview_clip"}
+            )
+            editorial_mode = (
+                "conference_highlights" if trusted_long_conference else classified_mode
+            )
+        if editorial_mode not in {
+            "technical_coverage", "known_tech_interview_clip",
+            "conference_highlights", "study",
+        }:
             raise ValueError(f"YouTube source is not eligible for an editorial route: {editorial_mode}")
         metadata["editorial_mode"] = editorial_mode
         translation_plan, caption_incumbent_trace = select_caption_incumbent(
@@ -7918,9 +8240,11 @@ class YouTubeCollectionFactory:
         )
         translator = NaturalSubtitleTranslator(
             self.writer, self.directing_writer, self.subtitle_reviewer,
+            runtime_guidance=self.runtime_guidance,
         )
         cached_source_clip: dict[str, Any] | None = None
         cached_interview_captions_complete = False
+        cached_joint_captions_complete = False
         if translation_plan is not None:
             cues[:] = rebalance_source_cues(cues)
             cached = json.loads(translation_plan.read_text(encoding="utf-8"))
@@ -7933,17 +8257,21 @@ class YouTubeCollectionFactory:
             cached_cues = [TranscriptCue(**item) for item in cached.get("transcript", [])]
             cached_source_video_id = str(cached.get("source_video_id") or "")
             current_source_video_id = str(metadata.get("id") or "")
-            interview_cache = (
-                editorial_mode == "known_tech_interview_clip"
+            source_selected_cache = (
+                editorial_mode in {"known_tech_interview_clip", "conference_highlights"}
                 and cached_source_video_id
                 and cached_source_video_id == current_source_video_id
             )
+            interview_cache = (
+                editorial_mode == "known_tech_interview_clip"
+                and source_selected_cache
+            )
             if not cached_cues or (
-                not interview_cache
+                not source_selected_cache
                 and _translation_source_fingerprint(cached_cues) != _translation_source_fingerprint(cues)
             ):
                 raise ValueError("translation plan transcript does not match the supplied YouTube subtitles")
-            if interview_cache or all(
+            if source_selected_cache or all(
                 cue.source_text.strip() and cue.translation.strip() for cue in cached_cues
             ):
                 # The reviewed plan may merge adjacent source fragments again to meet
@@ -7954,119 +8282,326 @@ class YouTubeCollectionFactory:
             else:
                 _merge_cached_translations(cues, cached_cues)
             editorial_plan = dict(cached.get("editorial_plan") or {})
-            terminology = translator._parse_terminology(cached.get("terminology", []), cues)
-            trace = list(cached.get("trace") or [])
+            cached_terminology_rows = cached.get("terminology", [])
+            terminology = translator._parse_terminology(cached_terminology_rows, cues)
+            trace = _translation_trace_from_plan(translation_plan, cached)
             if caption_incumbent_trace:
                 trace.append(caption_incumbent_trace)
             cached_interview_captions_complete = (
                 editorial_mode == "known_tech_interview_clip"
-                and cached_interview_caption_pipeline_complete(cues, trace)
+                and cached_interview_caption_pipeline_complete(
+                    cues, trace, media_info.sha256 if media_info else "", terminology,
+                )
+            )
+            cached_joint_captions_complete = (
+                editorial_mode != "known_tech_interview_clip"
+                and cached_joint_caption_pipeline_complete(
+                    cues, trace, terminology,
+                )
             )
             editorial_plan, repairs = translator.ensure_editorial_plan(
-                metadata, cues, editorial_plan, editorial_mode,
+                metadata, acquired_source_cues, editorial_plan, editorial_mode,
             )
             trace.extend(repairs)
-            if cached_term_errors := terminology_contract_errors(cues, terminology):
-                # During generation we still have a language model available,
-                # so repair the whole Chinese clause naturally before the
-                # deterministic replacement fallback. A pure rerender remains
-                # model-free and fails closed if replacement cannot satisfy it.
-                trace.append(translator._repair_terminology(
-                    cues, terminology, cached_term_errors,
-                ))
-            if enforcement_trace := enforce_cached_terminology_contract(cues, terminology):
-                trace.append(enforcement_trace)
-            if dense := fast_translation_cues(cues):
-                trace.append(translator._repair_reading_speed(
-                    dense, terminology=terminology, all_cues=cues,
-                ))
-                NaturalSubtitleTranslator._enforce_terminology_contract(cues, terminology)
-                if remaining := fast_translation_cues(cues):
-                    raise ValueError(
-                        "cached subtitle reading speed repair failed: "
-                        + ", ".join(cue.id for cue in remaining[:10])
+            if interview_cache:
+                selected_rows = editorial_plan.get("wechat_lessons")
+                selected_row = (
+                    selected_rows[0] if isinstance(selected_rows, list)
+                    and selected_rows and isinstance(selected_rows[0], dict) else None
+                )
+                selected = _coerce_range(
+                    selected_row, float(metadata.get("duration") or 0),
+                ) if selected_row else None
+                if cached_source_clip and cached_source_clip.get("original_start") is not None:
+                    selected = SourceRange(
+                        float(cached_source_clip["original_start"]),
+                        float(cached_source_clip["original_end"]),
                     )
-                if term_errors := terminology_contract_errors(cues, terminology):
-                    raise ValueError(
-                        "cached subtitle terminology failed after density repair: "
-                        + "; ".join(term_errors)
+                if selected is None:
+                    raise ValueError("cached interview plan has no valid source range")
+                selected_source_cues = [
+                    TranscriptCue(**asdict(cue)) for cue in acquired_source_cues
+                    if min(cue.end, selected.end) - max(cue.start, selected.start) >= 0.5
+                ]
+                if (
+                    cached_cues
+                    and _strict_interview_source_fingerprint(selected_source_cues)
+                    != _strict_interview_source_fingerprint(cached_cues)
+                ):
+                    if not interview_cache:
+                        raise ValueError(
+                            "cached interview plan no longer matches current YouTube subtitles"
+                        )
+                    cached_interview_captions_complete = False
+                    trace.append({
+                        "step": "cached_interview_source_challenger_rejected",
+                        "reason": (
+                            "cached English differs from the current authoritative "
+                            "YouTube spoken source; rebuild from current subtitles"
+                        ),
+                        "current_source_fingerprint": (
+                            _strict_interview_source_fingerprint(selected_source_cues)
+                        ),
+                        "cached_source_fingerprint": (
+                            _strict_interview_source_fingerprint(cached_cues)
+                        ),
+                    })
+                if not cached_interview_captions_complete:
+                    cues[:] = selected_source_cues
+                    for cue in cues:
+                        cue.translation = ""
+                    # The current authoritative subtitles may have gained or
+                    # lost terms since the cached plan was written. Reparse
+                    # against the challenger source so absent rows are dropped
+                    # and current established/protected terms are restored
+                    # before terminology review and joint translation.
+                    terminology = translator._parse_terminology(
+                        cached_terminology_rows, cues,
                     )
+                    trace.append({
+                        "step": "legacy_interview_caption_challenger",
+                        "reason": "cached captions predate audio-aligned joint translation",
+                    })
+            elif not cached_joint_captions_complete:
+                # Keep the accepted editorial plan byte-for-byte while replacing
+                # only subtitles produced by the retired cue pipeline.
+                cues[:] = _source_cues_for_plan(
+                    acquired_source_cues, editorial_plan,
+                    float(metadata.get("duration") or 0),
+                )
+                for cue in cues:
+                    cue.translation = ""
+                terminology = translator._parse_terminology(
+                    cached_terminology_rows, cues,
+                )
+                trace.append({
+                    "step": "legacy_caption_pipeline_challenger",
+                    "editorial_mode": editorial_mode,
+                    "reason": (
+                        "preserve editorial selection and rebuild subtitles with "
+                        "joint boundary translation"
+                    ),
+                })
         else:
+            translate_kwargs: dict[str, Any] = {"plan_only": True}
             if editorial_guidance and editorial_guidance.strip():
-                terminology, editorial_plan, trace = translator.translate(
-                    metadata, cues, editorial_mode,
-                    editorial_guidance=editorial_guidance,
-                )
-            else:
-                # Preserve the original three-argument seam for adapters and
-                # tests that replace the translator implementation.
-                terminology, editorial_plan, trace = translator.translate(
-                    metadata, cues, editorial_mode,
-                )
+                translate_kwargs["editorial_guidance"] = editorial_guidance
+            terminology, editorial_plan, trace = translator.translate(
+                metadata, cues, editorial_mode, **translate_kwargs,
+            )
             if caption_incumbent_trace:
                 trace.append(caption_incumbent_trace)
+        original_duration = float(metadata.get("duration") or (cues[-1].end if cues else 0))
+        source_clip: dict[str, Any] | None = None
+        selected_interview_range: SourceRange | None = None
+        frozen_hook_snapshot = (
+            {}
+            if editorial_mode == "known_tech_interview_clip"
+            else _snapshot_plan_hooks(
+                editorial_plan, original_duration, acquired_source_cues,
+                [str(value) for value in metadata.get("known_tech_people", [])],
+            )
+        )
         if editorial_mode == "known_tech_interview_clip":
-            if asr_term_corrections := normalize_interview_asr_terms(cues, terminology):
-                trace.append({
-                    "step": "interview_asr_term_normalization",
-                    "corrections": asr_term_corrections,
-                })
+            rows = editorial_plan.get("wechat_lessons")
+            raw_selected = (
+                rows[0] if isinstance(rows, list) and rows
+                and isinstance(rows[0], dict) else None
+            )
+            selected_interview_range = _coerce_range(raw_selected, original_duration)
+            if cached_source_clip and cached_source_clip.get("original_start") is not None:
+                selected_interview_range = SourceRange(
+                    float(cached_source_clip["original_start"]),
+                    float(cached_source_clip["original_end"]),
+                )
+            if selected_interview_range is None:
+                raise ValueError("interview highlight has no valid source range before media acquisition")
+            source_clip = {
+                "original_start": selected_interview_range.start,
+                "original_end": selected_interview_range.end,
+                "rebased": False,
+            }
+            if not cached_interview_captions_complete:
+                trace.append(translator.discover_missing_terminology(
+                    cues, terminology,
+                ))
+                terminology_review = translator.review_terminology_decisions(
+                    cues, terminology,
+                )
+                if terminology_review:
+                    trace.append(terminology_review)
+                translation_audit = _write_translation_audit(job, trace)
+                (job / "translation-plan.json").write_text(json.dumps({
+                    "editorial_mode": editorial_mode,
+                    "source_video_id": str(metadata.get("id") or ""),
+                    "source_clip": source_clip,
+                    "editorial_plan": editorial_plan,
+                    "terminology": [asdict(item) for item in terminology],
+                    "transcript": [asdict(item) for item in cues],
+                    "trace": _compact_translation_trace(trace),
+                    "translation_audit": translation_audit,
+                }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                if not media_asset:
+                    media_asset, media_info, video_evidence, download_window = (
+                        acquirer.acquire_remote_media(
+                            candidate, metadata, url, job,
+                            source_range=selected_interview_range,
+                        )
+                    )
+                    evidence.append(video_evidence)
+                    if download_window is not None:
+                        source_clip = rebase_interview_clip_timeline(
+                            cues, editorial_plan, download_window, media_info.duration,
+                            previous_clip=cached_source_clip,
+                        )
+                        metadata["original_duration"] = original_duration
+                        metadata["duration"] = media_info.duration
+                        metadata["source_clip"] = source_clip
+                        candidate.metadata.update({
+                            "duration": media_info.duration,
+                            "original_duration": original_duration,
+                            "source_clip": source_clip,
+                        })
+                        self.workspace.save_candidate(candidate)
+                elif cached_source_clip and media_info:
+                    clip_provenance = cached_source_clip
+                    local_window, local_is_bounded_clip = _local_interview_media_window(
+                        clip_provenance, media_info.duration, original_duration,
+                    )
+                    if local_is_bounded_clip:
+                        previous_clip = _previous_clip_for_local_timeline(
+                            cues, clip_provenance, local_window, media_info.duration,
+                        )
+                        source_clip = rebase_interview_clip_timeline(
+                            cues, editorial_plan, local_window, media_info.duration,
+                            previous_clip=previous_clip,
+                        )
+                        source_clip["rebased"] = True
+                        source_clip["local_media_full_source"] = False
+                        metadata["original_duration"] = original_duration
+                        metadata["duration"] = media_info.duration
+                        metadata["source_clip"] = source_clip
+                elif (
+                    media_info
+                    and media_info.duration < original_duration - 5.0
+                ):
+                    raise ValueError(
+                        "bounded local interview media requires a translation plan "
+                        "with source_clip provenance; media duration alone cannot prove "
+                        "which original interval it contains"
+                    )
+                media_path = Path(str(media_asset))
+                if not media_path.is_absolute():
+                    media_path = self.workspace.root / media_path
+                cues[:] = merge_interview_source_cues(cues, maximum_duration=60.0)
+                alignment = AudioWordAligner().align(
+                    media_path, cues, job,
+                    media_sha256=media_info.sha256 if media_info else "",
+                )
+                ledger_path = job / "source-word-ledger.json"
+                ledger_path.write_text(json.dumps({
+                    "alignment": alignment.trace(),
+                    "audio_hypothesis": alignment.audio_hypothesis,
+                    "source_words": [asdict(word) for word in alignment.words],
+                }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                alignment_trace = alignment.trace()
+                alignment_trace["ledger_asset"] = ledger_path.name
+                alignment_trace["ledger_sha256"] = hashlib.sha256(
+                    ledger_path.read_bytes()
+                ).hexdigest()
+                trace.append(alignment_trace)
+                try:
+                    trace.append(translator.translate_interview_clip_once(
+                        cues, terminology, alignment.words, alignment.fingerprint,
+                        alignment.audio_hypothesis,
+                    ))
+                except Exception as exc:
+                    failure_trace = {
+                        "step": "interview_joint_boundary_translation_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    if isinstance(exc, InterviewJointTranslationError):
+                        failure_trace["attempts"] = exc.trace
+                    trace.append(failure_trace)
+                    translation_audit = _write_translation_audit(job, trace)
+                    (job / "translation-plan.json").write_text(json.dumps({
+                        "editorial_mode": editorial_mode,
+                        "source_video_id": str(metadata.get("id") or ""),
+                        "source_clip": source_clip,
+                        "editorial_plan": editorial_plan,
+                        "terminology": [asdict(item) for item in terminology],
+                        "transcript": [asdict(item) for item in cues],
+                        "trace": _compact_translation_trace(trace),
+                        "translation_audit": translation_audit,
+                    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    raise
         if editorial_mode == "known_tech_interview_clip" and cached_interview_captions_complete:
             trace.append({
                 "step": "interview_caption_pipeline_reuse",
                 "reason": (
-                    "cached plan already contains reviewed semantic cards; "
-                    "translation and boundaries are immutable during rerender"
+                    "cached plan already contains audio-aligned, independently "
+                    "reviewed joint cards"
                 ),
             })
-        elif editorial_mode == "known_tech_interview_clip":
-            before_merge = list(cues)
-            # Legacy YouTube captions can break one sentence across several
-            # 10–12 second cues (for example, "every" / "layer."). Join the
-            # complete dependency chain before choosing fixed card spans; the
-            # downstream policy immediately repartitions it into <=7.5s cards.
-            merged_cues = merge_dependent_subtitle_cues(
-                cues, maximum_duration=60.0,
-            )
-            if any(
-                cue.source_text.strip() != before_merge[index].source_text.strip()
-                for index, cue in enumerate(merged_cues)
-                if index < len(before_merge)
-            ) or len(merged_cues) != len(before_merge):
-                repair_trace = translator.repair_merged_interview_translations(
-                    before_merge, merged_cues, terminology,
-                )
-                cues[:] = merged_cues
-                if repair_trace:
-                    trace.append(repair_trace)
-                if post_merge_term_errors := terminology_contract_errors(
-                    cues, terminology,
-                ):
-                    trace.append({
-                        **translator._repair_terminology(
-                            cues, terminology, post_merge_term_errors,
-                        ),
-                        "step": "post_merge_terminology_repair",
-                    })
-                if terminology_trace := enforce_cached_terminology_contract(cues, terminology):
-                    trace.append({
-                        **terminology_trace,
-                        "step": "post_merge_terminology_enforcement",
-                    })
-            if subtitle_card_trace := translator.segment_interview_subtitle_cards(
-                cues, terminology,
-            ):
-                trace.append(subtitle_card_trace)
-            if chinese_style_trace := translator.repair_interview_chinese_style(
-                cues, terminology,
-            ):
-                trace.append(chinese_style_trace)
         if editorial_mode == "known_tech_interview_clip":
-            if caption_errors := interview_caption_duration_errors(cues):
+            reviewed_audio_conflicts = set(next((
+                item.get("audio_conflict_entities", [])
+                for item in reversed(trace) if isinstance(item, dict)
+                and item.get("step") == "interview_joint_boundary_translation"
+            ), []))
+            if caption_errors := interview_caption_duration_errors(
+                cues, terminology, reviewed_audio_conflicts,
+            ):
                 raise ValueError(
                     "interview caption policy gate failed; regenerate from the raw "
                     "translation plan instead of reprocessing cached cards: "
                     + "; ".join(caption_errors)
+                )
+        else:
+            if not cached_joint_captions_complete:
+                trace.append(translator.discover_missing_terminology(
+                    cues, terminology,
+                ))
+                terminology_review = translator.review_terminology_decisions(
+                    cues, terminology,
+                )
+                if terminology_review:
+                    trace.append(terminology_review)
+                try:
+                    trace.append(translator.translate_caption_scopes(
+                        cues, terminology, editorial_plan, original_duration,
+                        editorial_mode,
+                    ))
+                except Exception as exc:
+                    failure_trace = {
+                        "step": "joint_caption_scopes_translation_failed",
+                        "editorial_mode": editorial_mode,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    if isinstance(exc, InterviewJointTranslationError):
+                        failure_trace["attempts"] = exc.trace
+                    trace.append(failure_trace)
+                    translation_audit = _write_translation_audit(job, trace)
+                    (job / "translation-plan.json").write_text(json.dumps({
+                        "editorial_mode": editorial_mode,
+                        "source_video_id": str(metadata.get("id") or ""),
+                        "source_clip": source_clip,
+                        "editorial_plan": editorial_plan,
+                        "terminology": [asdict(item) for item in terminology],
+                        "transcript": [asdict(item) for item in cues],
+                        "trace": _compact_translation_trace(trace),
+                        "translation_audit": translation_audit,
+                    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    raise
+            else:
+                trace.append({
+                    "step": "joint_caption_scopes_reuse",
+                    "editorial_mode": editorial_mode,
+                    "reason": "cached cards match the current joint subtitle policy",
+                })
+            if caption_errors := interview_caption_duration_errors(cues, terminology):
+                raise ValueError(
+                    "joint caption policy gate failed: " + "; ".join(caption_errors)
                 )
         if editorial_mode == "known_tech_interview_clip":
             approved_pair: dict[str, Any] | None = None
@@ -8153,58 +8688,13 @@ class YouTubeCollectionFactory:
                     "step": "requested_title_final",
                 })
         if filler_cue_ids := omit_spoken_fillers(cues):
-            trace.append({
-                "step": "omit_spoken_fillers",
-                "cue_ids": filler_cue_ids,
-                "policy": "English source remains visible; Chinese carries substantive meaning only",
-            })
-        source_clip: dict[str, Any] | None = None
-        original_duration = float(metadata.get("duration") or (cues[-1].end if cues else 0))
-        selected_interview_range: SourceRange | None = None
-        if editorial_mode == "known_tech_interview_clip":
-            rows = editorial_plan.get("wechat_lessons")
-            raw_selected = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
-            selected_interview_range = _coerce_range(raw_selected, original_duration)
-            if cached_source_clip and cached_source_clip.get("original_start") is not None:
-                selected_interview_range = SourceRange(
-                    float(cached_source_clip["original_start"]),
-                    float(cached_source_clip["original_end"]),
-                )
-            if selected_interview_range is None:
-                raise ValueError("interview highlight has no valid source range before media acquisition")
-            source_clip = {
-                "original_start": selected_interview_range.start,
-                "original_end": selected_interview_range.end,
-                "rebased": False,
-            }
-        audio_verified_ids = {
-            str(row.get("cue_id") or "")
-            for item in trace if isinstance(item, dict)
-            and item.get("step") == "targeted_whisper_caption_audit"
-            and item.get("policy_version") == TARGETED_WHISPER_POLICY_VERSION
-            for row in item.get("corrections", []) if isinstance(row, dict)
-        }
-        unverified_cues = [
-            cue for cue in cues if cue.id not in audio_verified_ids
-        ]
-        pending_asr_suspicions = (
-            interview_asr_suspicions(unverified_cues)
-            if editorial_mode == "known_tech_interview_clip" else []
-        )
-        if pending_asr_suspicions and not any(
-            item.get("step") == "targeted_whisper_pending"
-            for item in trace if isinstance(item, dict)
-        ):
-            trace.append({
-                "step": "targeted_whisper_pending",
-                "cue_ids": [row["cue_id"] for row in pending_asr_suspicions],
-                "reasons": {
-                    row["cue_id"]: row["reasons"] for row in pending_asr_suspicions
-                },
-                "policy": "verify only suspicious spans after selected media is local",
-            })
-
+            raise ValueError(
+                "filler cleanup changed independently reviewed joint cards; "
+                "regenerate so filler omission occurs before review: "
+                + ", ".join(filler_cue_ids)
+            )
         def persist_translation_plan() -> None:
+            translation_audit = _write_translation_audit(job, trace)
             (job / "translation-plan.json").write_text(json.dumps({
                 "editorial_mode": editorial_mode,
                 "source_video_id": str(metadata.get("id") or ""),
@@ -8212,7 +8702,8 @@ class YouTubeCollectionFactory:
                 "editorial_plan": editorial_plan,
                 "terminology": [asdict(item) for item in terminology],
                 "transcript": [asdict(item) for item in cues],
-                "trace": trace,
+                "trace": _compact_translation_trace(trace),
+                "translation_audit": translation_audit,
             }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
         # Preserve the expensive editorial and translation work before remote
@@ -8240,7 +8731,7 @@ class YouTubeCollectionFactory:
                     "source_clip": source_clip,
                 })
                 self.workspace.save_candidate(candidate)
-        elif source_clip is not None:
+        elif source_clip is not None and not source_clip.get("rebased"):
             # Rendering from a supplied local source keeps original timestamps;
             # render=False plans remain reusable for a future bounded download.
             if media_asset and cached_source_clip:
@@ -8273,35 +8764,10 @@ class YouTubeCollectionFactory:
             else:
                 source_clip["local_media_full_source"] = bool(media_asset)
 
-        if editorial_mode == "known_tech_interview_clip" and media_asset:
-            media_path = Path(str(media_asset))
-            if not media_path.is_absolute():
-                media_path = self.workspace.root / media_path
-            whisper_audit = targeted_whisper_caption_audit(
-                media_path, unverified_cues, job,
-            )
-            if whisper_audit:
-                trace.append(whisper_audit)
-                repair_trace = translator.repair_audio_verified_cards(
-                    cues, terminology, whisper_audit,
-                )
-                if repair_trace:
-                    trace.append(repair_trace)
-                if errors := terminology_contract_errors(cues, terminology):
-                    raise ValueError(
-                        "audio-verified captions violate terminology contract: "
-                        + "; ".join(errors)
-                    )
-                if errors := interview_caption_duration_errors(cues):
-                    raise ValueError(
-                        "audio-verified caption policy gate failed: "
-                        + "; ".join(errors)
-                    )
-
         persist_translation_plan()
         manifest = build_collection_manifest(
             candidate, metadata, cues, terminology, editorial_plan, media_asset, subtitle_asset,
-            media_info,
+            media_info, frozen_hook_snapshot,
         )
         if render:
             YouTubeCollectionRenderer(self.workspace).render(manifest)
@@ -8311,12 +8777,15 @@ class YouTubeCollectionFactory:
         path = self.workspace.save_collection_manifest(manifest)
         job_manifest = job / "collection-manifest.json"
         shutil.copy2(path, job_manifest)
+        translation_audit = _write_translation_audit(job, trace)
         result = {
             "status": "completed", "source_type": "youtube", "candidate": candidate.id,
             "editorial_mode": editorial_mode,
             "collection_manifest": str(job_manifest), "collection_id": manifest.id,
             "items": [{"id": item.id, "title": item.title, "duration": item.duration} for item in manifest.items],
-            "translation_trace": trace, "checks": [item.to_dict() for item in checks],
+            "translation_trace": _compact_translation_trace(trace),
+            "translation_audit": translation_audit,
+            "checks": [item.to_dict() for item in checks],
             "publishable": all(item.passed for item in checks),
             "evidence_ids": [item.id for item in evidence], "completed_at": now_iso(),
         }
