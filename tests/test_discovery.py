@@ -20,6 +20,7 @@ from video_factory.discovery import (
     evaluate_candidate, extract_source_video_url, select_adoption_candidates, select_parallel_candidates,
     XDiscoveryAdapter, _roundup_primary_source,
     _retryable_adoption_error,
+    _youtube_translation_plan_requires_refresh,
 )
 from video_factory.openrouter import DISCOUNTS_READER, ENDPOINTS_API, MODELS_API, parse_discounted_models
 from video_factory.models import ContentType, TopicType
@@ -77,6 +78,25 @@ class FakeFactory:
 
 
 class DiscoveryTest(unittest.TestCase):
+    def test_empty_or_mismatched_youtube_plan_requires_refresh(self) -> None:
+        for message in (
+            "translation plan transcript does not match the supplied YouTube subtitles",
+            "interview joint translation has no source words",
+            "selected editorial ranges contain no subtitle source words",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    _youtube_translation_plan_requires_refresh(ValueError(message))
+                )
+        self.assertFalse(
+            _youtube_translation_plan_requires_refresh(ValueError("temporary decode error"))
+        )
+        self.assertFalse(
+            _youtube_translation_plan_requires_refresh(RuntimeError(
+                "selected editorial ranges contain no subtitle source words"
+            ))
+        )
+
     def test_adoption_policy_is_separate_from_source_quality(self) -> None:
         body = (
             "Acme AI industry weekly digest contains background, history, and several references. "

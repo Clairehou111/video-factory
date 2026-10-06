@@ -338,6 +338,20 @@ def _rerender_requires_full_regeneration(error: BaseException) -> bool:
     ))
 
 
+_STALE_YOUTUBE_PLAN_ERROR_MARKERS = (
+    "translation plan transcript does not match",
+    "interview joint translation has no source words",
+    "selected editorial ranges contain no subtitle source words",
+)
+
+
+def _youtube_translation_plan_requires_refresh(error: BaseException) -> bool:
+    """Detect recovered plans that cannot map onto the authoritative subtitles."""
+    return isinstance(error, ValueError) and any(
+        marker in str(error) for marker in _STALE_YOUTUBE_PLAN_ERROR_MARKERS
+    )
+
+
 def _retryable_adoption_error(error: BaseException) -> bool:
     """Keep temporary source outages out of the human-repair queue.
 
@@ -3665,13 +3679,7 @@ class ResourceDiscoveryService:
                     retry_mode == "full_generation"
                     and (
                         isinstance(error, ContentAgentError)
-                        or (
-                            isinstance(error, ValueError)
-                            and any(marker in str(error) for marker in (
-                                "translation plan transcript does not match",
-                                "interview joint translation has no source words",
-                            ))
-                        )
+                        or _youtube_translation_plan_requires_refresh(error)
                     )
                 )
                 retryable_error = _retryable_adoption_error(error)
