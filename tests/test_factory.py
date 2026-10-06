@@ -13,7 +13,8 @@ from video_factory.agent import ContentAgentError
 from video_factory.editorial import repair_fragmented_radar_hook
 from video_factory.factory import (
     CompositeCopyReviewer, GenerateOptions, VideoFactory,
-    _browser_capture_needs_card_fallback, static_radar_target_duration,
+    _browser_capture_needs_card_fallback, github_target_duration,
+    static_radar_target_duration,
 )
 from video_factory.models import (
     AttentionStrategy, Candidate, ColdOpenBeat, ContentType, EditorialBrief, Evidence, EvidenceShot,
@@ -164,6 +165,18 @@ class VideoFactoryTest(unittest.TestCase):
         self.assertEqual(static_radar_target_duration(ContentType.EXPLAINER, "news_zh"), 8.5)
         self.assertEqual(static_radar_target_duration(ContentType.FLASH, "x"), 14.0)
         self.assertEqual(static_radar_target_duration(ContentType.DEEP_DIVE, "news"), 20.0)
+
+    def test_github_radar_target_matches_static_quality_gate(self) -> None:
+        self.assertEqual(
+            github_target_duration(GenerateOptions(render_profile="radar_v2")), 14.0,
+        )
+        self.assertEqual(github_target_duration(GenerateOptions()), 20.0)
+        self.assertEqual(
+            github_target_duration(GenerateOptions(
+                render_profile="radar_v2", duration=12.5,
+            )),
+            12.5,
+        )
 
     def test_ready_hook_incumbent_survives_a_weaker_policy_regeneration(self) -> None:
         with TemporaryDirectory() as temp:

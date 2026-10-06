@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
+from .agent import ContentAgentError
 from .factory import GenerateOptions, VideoFactory
 from .models import ContentType, InformationRenderProfile, TopicType
 from .observability import Observability
@@ -318,6 +319,7 @@ def _rerender_requires_full_regeneration(error: BaseException) -> bool:
     """Identify cached manifests whose material contract cannot be repaired by rerendering."""
     message = f"{type(error).__name__}: {error}".casefold()
     return any(marker in message for marker in (
+        "manifest cannot be rerendered",
         "does not cite an archived image asset",
         "unidentifiedimageerror",
         "cannot identify image file",
@@ -3647,14 +3649,23 @@ class ResourceDiscoveryService:
                     retry_mode == "deterministic_rerender"
                     and _rerender_requires_full_regeneration(error)
                 )
+                retry_fresh_plan = (
+                    retry_mode == "full_generation"
+                    and isinstance(error, ContentAgentError)
+                )
                 retryable_error = _retryable_adoption_error(error)
                 attempts.append({
                     "attempt": attempt, "mode": retry_mode,
                     "status": "failed", "error": f"{type(error).__name__}: {error}",
                     "retryable": retryable_error,
-                    **({"recovery": "discard_invalid_manifest_and_regenerate"} if discard_cached_manifest else {}),
+                    **(
+                        {"recovery": "discard_invalid_manifest_and_regenerate"}
+                        if discard_cached_manifest else
+                        {"recovery": "retry_fresh_content_plan"}
+                        if retry_fresh_plan else {}
+                    ),
                 })
-                if discard_cached_manifest:
+                if discard_cached_manifest or retry_fresh_plan:
                     manifest = None
                 else:
                     possible = getattr(error, "manifest", None)
@@ -3668,7 +3679,7 @@ class ResourceDiscoveryService:
                 if isinstance(error, (NameError, UnboundLocalError, SyntaxError, ImportError)):
                     attempts[-1]["recovery"] = "stop_non_retryable_internal_error"
                     break
-                if not retryable_error and not discard_cached_manifest and (
+                if not retryable_error and not discard_cached_manifest and not retry_fresh_plan and (
                     manifest is None or not manifest.is_file()
                 ):
                     attempts[-1]["recovery"] = "stop_non_retryable_generation_failure"

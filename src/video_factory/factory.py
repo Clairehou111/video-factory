@@ -92,6 +92,15 @@ def static_radar_target_duration(content_type: ContentType, discovery_channel: s
     return 14.0
 
 
+def github_target_duration(options: GenerateOptions) -> float:
+    """Keep the GitHub writing brief inside the active render profile's gate."""
+    if options.duration is not None:
+        return options.duration
+    if options.render_profile == InformationRenderProfile.RADAR_V2.value:
+        return static_radar_target_duration(ContentType.EXPLAINER, options.discovery_channel)
+    return 20.0
+
+
 class CompositeCopyReviewer:
     """Require agreement from independent directing and Chinese-copy critics."""
 
@@ -2000,7 +2009,7 @@ class VideoFactory:
         runtime_guidance = str(runtime_policy.get("narrative_guidance") or "").strip()
         packet = StoryWriterPacket(
             ingest.candidate, evidence, TopicType.GITHUB_PROJECT, ContentType.EXPLAINER,
-            options.duration or 20.0, editorial_direction=" ".join(filter(None, (
+            github_target_duration(options), editorial_direction=" ".join(filter(None, (
                 visual_context,
                 (
                     "Nightly audit validated this reusable narrative correction: "

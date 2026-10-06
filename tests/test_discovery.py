@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from video_factory.agent import ContentAgentError
 from video_factory.discovery import (
     AdoptionPolicy, ChannelConfig, DiscoveryCandidate, DiscoveryChannel, ResourceDiscoveryConfig,
     GitHubDiscoveryAdapter, OpenRouterDiscountDiscoveryAdapter, RSSDiscoveryAdapter,
@@ -2138,6 +2139,98 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             )
             factory.rerender.assert_called_once_with(manifest)
             self.assertEqual(len(factory.generate_calls), 1)
+
+    def test_manifest_content_validation_failure_regenerates_instead_of_rerendering_again(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            job = workspace.root / "jobs" / "failed-copy-manifest"
+            job.mkdir(parents=True)
+            manifest = job / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            source_url = "https://github.com/example/agent-desk"
+            (job / "result.json").write_text(json.dumps({
+                "url": source_url, "status": "failed", "manifest": str(manifest),
+            }), encoding="utf-8")
+            item = DiscoveryCandidate(
+                id="github-agent-desk", channel=DiscoveryChannel.GITHUB,
+                url=source_url, title="Agent desk", publisher="example",
+                published_at=NOW.isoformat(), eligible=True, status="needs_human",
+                topic_type=TopicType.MODEL_OR_PRODUCT,
+                content_type=ContentType.EXPLAINER,
+            )
+            factory = FakeFactory([{
+                "status": "completed", "publishable": True, "video": "final.mp4",
+            }])
+            factory.rerender = MagicMock(side_effect=ValueError(
+                "manifest cannot be rerendered: mobile reading load is too high; "
+                "explainer duration is above the hard maximum",
+            ))
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+
+            result = service._adopt(
+                item, ResourceDiscoveryConfig(retry_backoff_seconds=[0, 0]), "auto", None,
+            )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(
+                [attempt["mode"] for attempt in result["attempts"]],
+                ["deterministic_rerender", "full_generation"],
+            )
+            self.assertEqual(
+                result["attempts"][0]["recovery"],
+                "discard_invalid_manifest_and_regenerate",
+            )
+            factory.rerender.assert_called_once_with(manifest)
+            self.assertEqual(len(factory.generate_calls), 1)
+
+    def test_content_plan_contract_failure_retries_a_fresh_plan_not_the_old_manifest(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            job = workspace.root / "jobs" / "failed-copy-manifest"
+            job.mkdir(parents=True)
+            manifest = job / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            source_url = "https://github.com/example/agent-desk"
+            (job / "result.json").write_text(json.dumps({
+                "url": source_url, "status": "failed", "manifest": str(manifest),
+            }), encoding="utf-8")
+            item = DiscoveryCandidate(
+                id="github-agent-desk", channel=DiscoveryChannel.GITHUB,
+                url=source_url, title="Agent desk", publisher="example",
+                published_at=NOW.isoformat(), eligible=True, status="needs_human",
+                topic_type=TopicType.MODEL_OR_PRODUCT,
+                content_type=ContentType.EXPLAINER,
+            )
+            factory = FakeFactory([
+                ContentAgentError("browser target spans Markdown table cells", []),
+                {"status": "completed", "publishable": True, "video": "final.mp4"},
+            ])
+            factory.rerender = MagicMock(side_effect=ValueError(
+                "manifest cannot be rerendered: mobile reading load is too high",
+            ))
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+
+            result = service._adopt(
+                item, ResourceDiscoveryConfig(retry_backoff_seconds=[0, 0, 0]),
+                "auto", None,
+            )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(
+                [attempt["mode"] for attempt in result["attempts"]],
+                ["deterministic_rerender", "full_generation", "full_generation"],
+            )
+            self.assertEqual(
+                result["attempts"][1]["recovery"], "retry_fresh_content_plan",
+            )
+            factory.rerender.assert_called_once_with(manifest)
+            self.assertEqual(len(factory.generate_calls), 2)
 
     def test_internal_programming_error_is_not_retried_three_times(self) -> None:
         with TemporaryDirectory() as temp:

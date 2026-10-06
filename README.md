@@ -28,7 +28,7 @@ video-factory --workspace workspace discovery-skip <candidate-id> \
   --reason 'source page is no longer available'
 ```
 
-候选池由可信账号、组织、媒体、官网种子、垂直 RSS 与开放主题查询组成。候选必须在标题/摘要/正文明确命中 IT、软件、AI、计算硬件或 AI 相关机器人/自动驾驶主题。每个候选记录 quality/adoption 分、分项、门槛、类别与未采用原因；候选、淘汰理由、去重、生产尝试和阻塞状态写入 SQLite 与 `workspace/discovery/` 审计 JSON，不会绕过人工发布审批。
+候选池由可信账号、组织、媒体、官网种子、垂直 RSS 与开放主题查询组成。候选必须在标题/摘要/正文明确命中 IT、软件、AI、计算硬件或 AI 相关机器人/自动驾驶主题。每个候选记录 quality/adoption 分、分项、门槛、类别与未采用原因；候选、淘汰理由、去重、生产尝试和阻塞状态写入 SQLite 与 `workspace/discovery/` 审计 JSON，不会绕过人工发布审批。重试先复用可修复的 manifest；若确定性校验明确报告该 manifest 无法重渲染，则丢弃旧 manifest，并在下一次有界尝试中重新调用策划生成，避免反复渲染同一份不合格内容。
 
 ### 发现 → 生成 → 发布队列
 
