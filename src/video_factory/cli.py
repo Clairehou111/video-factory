@@ -51,6 +51,7 @@ from .self_audit import ProblemLedger, ProblemObservation, SelfAuditService, loa
 from .self_audit_runtime import (
     OpenRouterGeminiAuditModel, RepositoryCandidateVerifier, ReviewBranchExecutor,
 )
+from .workspace_cleanup import WorkspaceCleanup
 
 
 def _workspace(path: str) -> Workspace:
@@ -59,11 +60,29 @@ def _workspace(path: str) -> Workspace:
     return workspace
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="video-factory")
     parser.add_argument("--workspace", default="workspace", help="本地资产与清单目录")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("init", help="初始化本地工作区")
+    cleanup = subcommands.add_parser(
+        "cleanup", help="预览或删除超过保留期且没有引用的失败任务",
+    )
+    cleanup.add_argument(
+        "--retention-days", type=_positive_int, default=14,
+        help="完整保留失败任务的天数（默认：14）",
+    )
+    cleanup.add_argument(
+        "--apply", action="store_true",
+        help="实际删除；不提供此选项时只输出预览",
+    )
     archive = subcommands.add_parser("archive-asset", help="归档并哈希一份原始资产")
     archive.add_argument("file")
     archive.add_argument("--category", required=True)
@@ -342,6 +361,12 @@ def main() -> None:
             sys.exit(1)
     elif args.command == "init":
         print(f"initialized {workspace.root}")
+    elif args.command == "cleanup":
+        cleaner = WorkspaceCleanup(workspace, retention_days=args.retention_days)
+        result = cleaner.apply() if args.apply else cleaner.plan()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get("errors"):
+            sys.exit(1)
     elif args.command == "dashboard":
         dashboard_discovery_config = ResourceDiscoveryConfig.from_path(
             Path(args.discovery_config).resolve() if args.discovery_config else None

@@ -312,3 +312,14 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
 `workspace/` 是运行时资产库，默认不进入版本控制。
+
+工作区清理默认只做预览。它只把超过 14 天、没有发布/自审引用、也不是当前候选重试恢复点的失败任务列为候选；不会删除成功或运行中的任务、近期失败任务、原始资产、清单、成片、缓存、发现历史、数据库或日志。确认预览后显式执行：
+
+```bash
+video-factory --workspace workspace cleanup
+video-factory --workspace workspace cleanup --apply
+# 可选：覆盖失败任务完整保留期
+video-factory --workspace workspace cleanup --retention-days 30 --apply
+```
+
+`--apply` 会在删除前重新计算引用保护，并输出逐项删除结果与实际释放字节数。删除是永久的；建议始终先保存 dry-run JSON。
