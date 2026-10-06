@@ -2496,6 +2496,7 @@ class NaturalSubtitleTranslator:
             internal_attempt: int = 0, minimum_card_count: int = 0,
             mandatory_split_ranges: tuple[tuple[int, int], ...] = (),
             required_boundaries: tuple[int, ...] = (),
+            freeze_boundaries: bool = False,
         ) -> tuple[list[tuple[int, int, str]], dict[str, Any]]:
             window = words[start_word:end_word]
             duration = max(0.1, window[-1].end - window[0].start)
@@ -2506,6 +2507,8 @@ class NaturalSubtitleTranslator:
                 1, minimum_card_count, len(required_boundaries) + 1,
                 math.ceil(duration / INTERVIEW_CAPTION_HARD_MAX_SECONDS),
             )
+            if freeze_boundaries:
+                maximum_count = minimum_count = len(required_boundaries) + 1
             if minimum_count > maximum_count:
                 raise ValueError(
                     "joint translation window cannot satisfy both minimum duration "
@@ -2552,8 +2555,10 @@ class NaturalSubtitleTranslator:
             numeric_occurrences: dict[str, list[int]] = {}
             for absolute_index in range(start_word, end_word):
                 match = re.search(
-                    r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:%|x)?",
+                    r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*"
+                    r"(?:st|nd|rd|th)?(?:%|x)?(?![A-Za-z0-9])",
                     words[absolute_index].raw,
+                    re.IGNORECASE,
                 )
                 if match and absolute_index not in paired_source_number_indices:
                     numeric_occurrences.setdefault(match.group(0), []).append(
@@ -2564,6 +2569,38 @@ class NaturalSubtitleTranslator:
                 "source_word_start_indices": indices,
                 "word_count": 1,
             } for entity, indices in sorted(numeric_occurrences.items()))
+            translated_term_ownership: list[dict[str, Any]] = []
+            for entry in terminology:
+                if entry.strategy != TerminologyStrategy.TRANSLATE or not entry.target:
+                    continue
+                width = max(1, len(re.findall(r"\S+", entry.source)))
+                indices = [
+                    index + 1
+                    for index in range(max(0, len(window) - width + 1))
+                    if _contains_term(
+                        " ".join(word.raw for word in window[index:index + width]),
+                        entry.source,
+                    )
+                ]
+                if indices:
+                    translated_term_ownership.append({
+                        "source": entry.source, "required_target": entry.target,
+                        "source_word_start_indices": indices, "word_count": width,
+                    })
+            fixed_card_rows: list[dict[str, Any]] = []
+            if freeze_boundaries:
+                left = 0
+                for relative_end in [
+                    *(boundary - start_word for boundary in required_boundaries),
+                    len(window),
+                ]:
+                    fixed_card_rows.append({
+                        "end_word": relative_end,
+                        "source": " ".join(
+                            word.raw for word in window[left:relative_end]
+                        ),
+                    })
+                    left = relative_end
             prompt = "\n".join([
                 "Create publication-ready bilingual cards for this ordered technology-video speech passage. Choose English word boundaries and write the matching natural Simplified Chinese in the same response. This is the only normal-path translation pass.",
                 "Return {cards:[{end_word,text}]}. end_word is an exclusive cumulative index into Source words beginning at 1. It must increase strictly and the final value must equal the supplied word count. Never rewrite, omit, duplicate, or reorder an English word.",
@@ -2573,6 +2610,9 @@ class NaturalSubtitleTranslator:
                 "Entity ownership is strict: a product, acronym, company, API, or number may appear in Chinese only when that same card's English word range contains it. Numeric tokens explicitly listed as audio conflicts below are the exception: use the strongly supported nearby audible value on that same semantic card. If a rejected Chinese card moved an entity from a neighbor, either move the English boundary to include the entity or remove it from that Chinese card; never repeat it on both cards.",
                 "The Entity ownership table below is deterministic evidence. Each listed entity may appear only in a Chinese card whose inclusive source range contains one of its word indices. If feedback says moved:X, remove X from the wrong Chinese card or move the boundary over X. If feedback says missing:X, preserve X in its owner card.",
                 "Use the terminology decision and its evidence. alternatives are candidates for the independent reviewer, not a whitelist. A longer phrase owns nested shorter terms. Keep one rendering consistent across the passage.",
+                "Translated terminology ownership: " + json.dumps(
+                    translated_term_ownership, ensure_ascii=False,
+                ) + ". For every listed occurrence, put required_target verbatim in the Chinese card that owns the source phrase; never shift it to a neighbor.",
                 f"Return {minimum_count}–{maximum_count} cards; aim for {target_count}. Every card must last {INTERVIEW_CAPTION_MIN_SECONDS:g}–{INTERVIEW_CAPTION_HARD_MAX_SECONDS:g} seconds, contain no more than {INTERVIEW_CAPTION_MAX_ENGLISH_WORDS} English words, remain below {INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND:g} reading units per second, and fit the measured three-line panel. A CJK glyph, a Latin word, or punctuation is one reading unit, so do not count every letter of an English product name separately. For each end_word, the display cut occurs at the midpoint between the previous word's end and the next word's start; calculate durations from the supplied times and avoid sub-{INTERVIEW_CAPTION_MIN_SECONDS:g}-second cards. Aim for {INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS} reading units, but use rendered fit and reading speed rather than a raw hard ceiling.",
                 "Previous and next source are context only. Never import their claims into this window.",
                 "Audio ASR is conflict evidence only and never replaces the authoritative Source words. When Source contains an obvious transcription ambiguity, use the nearby audio hypothesis plus surrounding actions to translate the most supported audible meaning while leaving the returned English boundaries unchanged. Do not invent a correction when the audio evidence is also uncertain.",
@@ -2588,6 +2628,9 @@ class NaturalSubtitleTranslator:
                 "Fixed required end_word boundaries: " + json.dumps([
                     boundary - start_word for boundary in required_boundaries
                 ]) + ". Include every listed value exactly as an end_word. These deterministic boundaries are supplied only after repeated failure to split a rejected overlong card.",
+                "Fixed card translation rows: " + json.dumps(
+                    fixed_card_rows, ensure_ascii=False,
+                ) + ". When this list is non-empty, return exactly these end_word values and translate each row's source only into its matching Chinese text. Do not move a clause, entity, number, or terminology target into an earlier or later row.",
                 "Source entities absent or contradicted in audio ASR (the semantic reviewer decides their meaning; do not mechanically copy them into Chinese): "
                 + json.dumps(sorted(audio_conflict_entities), ensure_ascii=False),
                 "Numeric conflict evidence: " + json.dumps({
@@ -2631,6 +2674,7 @@ class NaturalSubtitleTranslator:
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
                         required_boundaries=required_boundaries,
+                        freeze_boundaries=freeze_boundaries,
                     )
                 raise ValueError(
                     f"joint translation returned invalid card count for words "
@@ -2653,6 +2697,7 @@ class NaturalSubtitleTranslator:
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
                         required_boundaries=required_boundaries,
+                        freeze_boundaries=freeze_boundaries,
                     )
                 raise ValueError(
                     f"joint translation returned invalid word boundaries: {ends}"
@@ -2660,6 +2705,28 @@ class NaturalSubtitleTranslator:
             absolute_boundaries = {
                 start_word + value for value in ends[:-1]
             }
+            expected_frozen_ends = [
+                *(boundary - start_word for boundary in required_boundaries),
+                len(window),
+            ]
+            if freeze_boundaries and ends != expected_frozen_ends:
+                if internal_attempt < 3:
+                    return request_window(
+                        start_word, end_word, previous_source, next_source,
+                        rejection + (
+                            "\nDeterministic frozen-boundary failure: return exactly "
+                            + json.dumps(expected_frozen_ends)
+                        ),
+                        repair_round, internal_attempt=internal_attempt + 1,
+                        minimum_card_count=minimum_count,
+                        mandatory_split_ranges=mandatory_split_ranges,
+                        required_boundaries=required_boundaries,
+                        freeze_boundaries=True,
+                    )
+                raise ValueError(
+                    "joint translation changed frozen source boundaries: "
+                    + json.dumps(ends)
+                )
             missing_required = sorted(
                 boundary for boundary in required_boundaries
                 if boundary not in absolute_boundaries
@@ -2677,6 +2744,7 @@ class NaturalSubtitleTranslator:
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
                         required_boundaries=required_boundaries,
+                        freeze_boundaries=freeze_boundaries,
                     )
                 raise ValueError(
                     "joint translation omitted fixed source boundaries: "
@@ -2699,6 +2767,7 @@ class NaturalSubtitleTranslator:
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
                         required_boundaries=required_boundaries,
+                        freeze_boundaries=freeze_boundaries,
                     )
                 if repair_round > 0 and not required_boundaries:
                     forced: list[int] = []
@@ -2735,6 +2804,7 @@ class NaturalSubtitleTranslator:
                             minimum_card_count=max(minimum_count, len(forced) + 1),
                             mandatory_split_ranges=mandatory_split_ranges,
                             required_boundaries=tuple(forced),
+                            freeze_boundaries=False,
                         )
                 raise ValueError(
                     "joint translation did not split rejected source ranges: "
@@ -2753,6 +2823,7 @@ class NaturalSubtitleTranslator:
                             minimum_card_count=minimum_count,
                             mandatory_split_ranges=mandatory_split_ranges,
                             required_boundaries=required_boundaries,
+                            freeze_boundaries=freeze_boundaries,
                         )
                     raise ValueError("joint translation returned an empty Chinese card")
                 spans.append((start_word + left, start_word + right, text_value))
@@ -2797,6 +2868,7 @@ class NaturalSubtitleTranslator:
                         minimum_card_count=stricter_minimum,
                         mandatory_split_ranges=mandatory_split_ranges,
                         required_boundaries=required_boundaries,
+                        freeze_boundaries=freeze_boundaries,
                     )
             return spans, provenance
 
@@ -3164,6 +3236,113 @@ class NaturalSubtitleTranslator:
                     errors = [str(value) for value in raw_errors] \
                         if isinstance(raw_errors, list) else [str(raw_errors)]
                     problems.setdefault(index, []).extend(errors)
+            if repair_round == 4 and problems:
+                # The translator has already had three movable-boundary repairs
+                # plus one exact-card retranslation. Ask the independent reviewer
+                # to adjudicate its remaining rejections once, so tentative or
+                # self-contradictory review prose cannot block a valid sequence.
+                failed_rows = [{
+                    "id": cards[index].id,
+                    "source": cards[index].source_text,
+                    "chinese": cards[index].translation,
+                    "prior_errors": errors,
+                    "previous": ({
+                        "source": cards[index - 1].source_text,
+                        "chinese": cards[index - 1].translation,
+                    } if index else None),
+                    "next": ({
+                        "source": cards[index + 1].source_text,
+                        "chinese": cards[index + 1].translation,
+                    } if index + 1 < len(cards) else None),
+                } for index, errors in sorted(problems.items())]
+                expected_ids = {row["id"] for row in failed_rows}
+                adjudication_attempts: list[dict[str, Any]] = []
+                adjudication_structure_failures: list[list[str]] = []
+                for adjudication_attempt in range(2):
+                    adjudication, adjudication_provenance = reviewer._request_json([
+                        {"role": "system", "content": "Return one valid JSON object only."},
+                        {"role": "user", "content": "\n".join([
+                            "Independently adjudicate the remaining subtitle review rejections after bounded repair. Do not rewrite any text.",
+                            "Judge only whether each prior error identifies a material omission, invention, changed actor/modality/scope, misplaced entity, misleading cut, or incomprehensible Chinese. A sentence may continue across cards. Dismiss preferences, optional connective wording, tentative 'may affect' concerns, and an error that says the translation has no problem.",
+                            "Return every id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. pass=true means the unchanged card and its boundary are publication-ready and errors must be empty. pass=false requires concise material errors. Both scores must be 1–5.",
+                            (
+                                "The previous adjudication response failed deterministic structure validation: "
+                                + json.dumps(
+                                    adjudication_structure_failures[-1],
+                                    ensure_ascii=False,
+                                )
+                            ) if adjudication_structure_failures else "",
+                            "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                            "Prior rejected rows: " + json.dumps(
+                                failed_rows, ensure_ascii=False,
+                            ),
+                        ])},
+                    ], max_tokens=min(5000, 600 + 260 * len(failed_rows)))
+                    adjudication_attempts.append(adjudication_provenance)
+                    raw_rows = adjudication.get("reviews")
+                    candidate_rows = (
+                        [row for row in raw_rows if isinstance(row, dict)]
+                        if isinstance(raw_rows, list) else []
+                    )
+                    structure_errors: list[str] = []
+                    ids = [str(row.get("id") or "") for row in candidate_rows]
+                    if (
+                        not isinstance(raw_rows, list)
+                        or len(candidate_rows) != len(raw_rows)
+                        or len(ids) != len(expected_ids)
+                        or len(set(ids)) != len(ids)
+                        or set(ids) != expected_ids
+                    ):
+                        structure_errors.append(
+                            "adjudication must review every failed id exactly once"
+                        )
+                    for row in candidate_rows:
+                        if type(row.get("pass")) is not bool:
+                            structure_errors.append("adjudication pass must be boolean")
+                        if not isinstance(row.get("errors"), list):
+                            structure_errors.append("adjudication errors must be an array")
+                        for score_name in ("fidelity_score", "naturalness_score"):
+                            if not 1 <= _review_score_out_of_five(row.get(score_name)) <= 5:
+                                structure_errors.append(
+                                    f"adjudication {score_name} must be between 1 and 5"
+                                )
+                    if not structure_errors:
+                        by_adjudicated_id = {
+                            str(row["id"]): row for row in candidate_rows
+                        }
+                        retained: dict[int, list[str]] = {}
+                        for index, prior_errors in problems.items():
+                            row = by_adjudicated_id[cards[index].id]
+                            if (
+                                row.get("pass") is True
+                                and _review_score_out_of_five(row.get("fidelity_score")) >= 4
+                                and _review_score_out_of_five(row.get("naturalness_score")) >= 4
+                                and not row.get("errors")
+                            ):
+                                continue
+                            raw_errors = row.get("errors")
+                            retained[index] = (
+                                [str(value) for value in raw_errors]
+                                if isinstance(raw_errors, list) and raw_errors
+                                else prior_errors
+                            )
+                        problems = retained
+                        break
+                    adjudication_structure_failures.append(structure_errors)
+                else:
+                    raise ValueError(
+                        "final subtitle adjudication returned invalid structure twice: "
+                        + json.dumps(
+                            adjudication_structure_failures, ensure_ascii=False,
+                        )
+                    )
+                provenance["final_rejection_adjudication"] = {
+                    "attempts": adjudication_attempts,
+                    "structure_failures": adjudication_structure_failures,
+                    "remaining_card_ids": [
+                        cards[index].id for index in sorted(problems)
+                    ],
+                }
             return cards, problems, provenance
 
         def initial_windows() -> list[tuple[int, int]]:
@@ -3331,6 +3510,7 @@ class NaturalSubtitleTranslator:
                         tuple(spans[index][1] for index in range(start, end - 1))
                         if repair_round == 3 else ()
                     ),
+                    freeze_boundaries=repair_round == 3,
                 )
                 repaired.extend(replacement)
                 repair_traces.append({
@@ -3935,10 +4115,32 @@ class NaturalSubtitleTranslator:
                 entry.rationale = replacement.rationale
                 entry.first_use_explanation = ""
                 entry.notes = replacement.notes
-        raise ValueError(
-            "terminology decision independent review rejected publication: "
-            + json.dumps(last_rejected, ensure_ascii=False)
-        )
+        rejected_keys = {source.casefold() for source in last_rejected}
+        discarded_sources = [
+            entry.source for entry in contextual
+            if entry.source.casefold() in rejected_keys
+        ]
+        terminology[:] = [
+            entry for entry in terminology
+            if entry.source.casefold() not in rejected_keys
+        ]
+        return {
+            "step": "terminology_decision_review",
+            "attempt": 2,
+            "reviewed_sources": sorted(
+                entry.source.casefold() for entry in contextual
+            ),
+            "review_attempts": review_attempts,
+            "review_structure_failures": review_structure_failures,
+            "revision_attempts": revision_attempts,
+            "dropped_sources": dropped_sources,
+            "discarded_after_rejection": discarded_sources,
+            "final_rejections": last_rejected,
+            "decisions": [
+                asdict(entry) for entry in contextual
+                if entry.source.casefold() not in rejected_keys
+            ],
+        }
 
 
     def ensure_editorial_plan(
@@ -6181,10 +6383,17 @@ def _caption_numeric_alignment_errors(
     translation: str, numeric_conflict_pairs: list[dict[str, Any]],
 ) -> list[str]:
     """Enforce Arabic-number ownership while allowing one locally paired ASR value."""
-    pattern = re.compile(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)*(?:[%％]|x)?")
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])(\d+(?:[.,]\d+)*)"
+        r"(?:st|nd|rd|th)?([%％]|x)?(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
 
     def values(value: str) -> list[str]:
-        return [match.replace("％", "%") for match in pattern.findall(value)]
+        return [
+            (match.group(1) + (match.group(2) or "")).replace("％", "%")
+            for match in pattern.finditer(value)
+        ]
 
     pair_by_index = {
         int(row["source_word_index"]) - 1: row
@@ -6224,6 +6433,26 @@ def _caption_numeric_alignment_errors(
             errors.append(
                 f"missing_number:{number}|{candidates[0]}@{index + 1}"
             )
+    # A translated English month is commonly and unambiguously rendered as
+    # its numeric Chinese month (September -> 9月). Consume only target values
+    # that are attached to 月 and only when that month name occurs in this
+    # exact source card, so an unrelated invented number remains an error.
+    month_numbers = {
+        name: str(index) for index, name in enumerate((
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+        ), start=1)
+    }
+    source_text = " ".join(word.raw for word in source_words[start_word:end_word])
+    source_months = {
+        number for name, number in month_numbers.items()
+        if re.search(rf"\b{re.escape(name)}\b", source_text, re.IGNORECASE)
+    }
+    translated_months = re.findall(r"(?<!\d)(1[0-2]|0?[1-9])\s*月", translation)
+    for number in translated_months:
+        canonical = str(int(number))
+        if canonical in source_months and target_counts.get(canonical, 0):
+            target_counts[canonical] -= 1
     for number, count in sorted(target_counts.items()):
         errors.extend([f"moved_number:{number}"] * count)
     return errors

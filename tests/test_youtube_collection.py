@@ -2246,6 +2246,39 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(trace["dropped_sources"], ["deconlict"])
         self.assertEqual(terminology, [])
 
+    def test_repeatedly_rejected_optional_terminology_is_discarded(self) -> None:
+        class Writer:
+            def _request_json(self, messages, max_tokens):
+                return {"terminology": [{
+                    "source": "dark tokens", "strategy": "translate",
+                    "target": "暗黑代币", "alternatives": [],
+                    "rationale": "The speakers use it as a market label.",
+                }]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, max_tokens):
+                return {"reviews": [{
+                    "source": "dark tokens", "pass": False,
+                    "fidelity_score": 2, "naturalness_score": 2,
+                    "errors": ["target is ambiguous in this context"],
+                }]}, {"model": "independent-reviewer"}
+
+        cues = [TranscriptCue(
+            "cue-1", 0, 5, "The market calls these dark tokens.", "",
+        )]
+        terminology = [TerminologyEntry(
+            "dark tokens", TerminologyStrategy.TRANSLATE, target="暗色代币",
+            rationale="The speakers use it as a market label.",
+        )]
+
+        trace = NaturalSubtitleTranslator(
+            Writer(), subtitle_reviewer=Reviewer(),
+        ).review_terminology_decisions(cues, terminology)
+
+        self.assertEqual(trace["discarded_after_rejection"], ["dark tokens"])
+        self.assertIn("dark tokens", trace["final_rejections"])
+        self.assertEqual(terminology, [])
+
     def test_malformed_terminology_review_retries_without_revising_decision(self) -> None:
         class MustNotRevise:
             def _request_json(self, *args, **kwargs):
@@ -2535,10 +2568,12 @@ class YouTubeCollectionTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
                 self.fixed = False
+                self.prompts: list[str] = []
 
             def _request_json(self, messages, **kwargs):
                 self.calls += 1
                 prompt = messages[-1]["content"]
+                self.prompts.append(prompt)
                 fixed = json.loads(
                     prompt.split("Fixed required end_word boundaries: ", 1)[1]
                     .split(". Include every listed value", 1)[0]
@@ -2578,12 +2613,73 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertTrue(writer.fixed)
         self.assertEqual(writer.calls, 5)
+        self.assertIn("Fixed card translation rows: [", writer.prompts[-1])
+        self.assertIn(
+            "translate each row's source only into its matching Chinese text",
+            writer.prompts[-1],
+        )
         self.assertEqual(trace["repair_rounds"], 3)
         self.assertEqual(trace["attempts"][-1]["kind"], "validation_and_review")
         self.assertTrue(any(
             item["kind"] == "fixed_boundary_semantic_repair"
             for item in trace["attempts"]
         ))
+
+    def test_final_independent_adjudication_can_dismiss_nonmaterial_rejection(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                return {"cards": [
+                    {"end_word": 10, "text": "第一部分忠实表达。"},
+                    {"end_word": 20, "text": "第二部分继续说明。"},
+                    {"end_word": 30, "text": "第三部分完成论点。"},
+                ]}, {"model": "writer", "call": self.calls}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.adjudicated = False
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Prior rejected rows: " in prompt:
+                    self.adjudicated = True
+                    rows = json.loads(prompt.split("Prior rejected rows: ", 1)[1])
+                    return {"reviews": [{
+                        "id": row["id"], "pass": True,
+                        "fidelity_score": 5, "naturalness_score": 5,
+                        "errors": [],
+                    } for row in rows]}, {"model": "adjudicator"}
+                if "Sequence: " in prompt:
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": index != 1,
+                    "fidelity_score": 5 if index != 1 else 3,
+                    "naturalness_score": 5 if index != 1 else 3,
+                    "errors": [] if index != 1 else [
+                        "可能需要增加一个可选连接词。",
+                    ],
+                } for index, row in enumerate(rows)]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 31))
+        cues = [TranscriptCue("cue-1", 0, 18, source)]
+        writer = Writer()
+        reviewer = Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertTrue(reviewer.adjudicated)
+        self.assertEqual(writer.calls, 5)
+        final_review = trace["attempts"][-1]["review_provenance"]
+        self.assertEqual(
+            final_review["final_rejection_adjudication"]["remaining_card_ids"],
+            [],
+        )
 
     def test_joint_interview_translation_retries_invalid_initial_structure(self) -> None:
         class Writer:
@@ -2909,6 +3005,46 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertIn("missing_number:93@4", errors)
         self.assertIn("moved_number:94", errors)
+
+    def test_numeric_ownership_ignores_corrupt_alphanumeric_fragments(self) -> None:
+        words = source_words_from_cues([
+            TranscriptCue(
+                "cue-1", 0, 4,
+                "He worked there when it was a 10erson startup.",
+            ),
+        ])
+
+        errors = _caption_numeric_alignment_errors(
+            words, 0, len(words), "他在那里工作时，那还是家十人初创公司。", [],
+        )
+
+        self.assertNotIn("missing_number:10@8", errors)
+        self.assertFalse(any(error.startswith("missing_number:10") for error in errors))
+
+    def test_numeric_ownership_accepts_english_month_as_numeric_chinese_month(self) -> None:
+        words = source_words_from_cues([
+            TranscriptCue(
+                "cue-1", 0, 4,
+                "The conference is September 23rd and 24th.",
+            ),
+        ])
+
+        errors = _caption_numeric_alignment_errors(
+            words, 0, len(words), "大会在 9 月 23 日和 24 日举行。", [],
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_numeric_ownership_still_rejects_unrelated_numeric_month(self) -> None:
+        words = source_words_from_cues([
+            TranscriptCue("cue-1", 0, 3, "The conference is in autumn.")
+        ])
+
+        errors = _caption_numeric_alignment_errors(
+            words, 0, len(words), "大会在 9 月举行。", [],
+        )
+
+        self.assertIn("moved_number:9", errors)
 
     def test_numeric_audio_exception_is_bound_to_one_source_occurrence(self) -> None:
         class Writer:
