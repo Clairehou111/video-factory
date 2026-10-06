@@ -1306,7 +1306,17 @@ def _translated_term_present(
     targets = [entry.target]
     if allow_alternatives:
         targets.extend(entry.alternatives)
-    return any(target and target in cue.translation for target in targets)
+    compact_translation = re.sub(r"\s+", "", cue.translation)
+    return any(
+        target and (
+            target in cue.translation
+            or (
+                re.search(r"[\u3400-\u9fff]", target)
+                and re.sub(r"\s+", "", target) in compact_translation
+            )
+        )
+        for target in targets
+    )
 
 
 def _accepted_terminology_targets(
@@ -2686,6 +2696,65 @@ class NaturalSubtitleTranslator:
                     f"{start_word}:{end_word}"
                 )
             ends = [row.get("end_word") if isinstance(row, dict) else None for row in rows]
+            partial_coverage = (
+                not freeze_boundaries
+                and internal_attempt < 4
+                and all(type(value) is int for value in ends)
+                and bool(ends)
+                and 0 < ends[-1] < len(window)
+                and all(left < right for left, right in zip((0, *ends[:-1]), ends))
+                and all(
+                    isinstance(row, dict) and str(row.get("text") or "").strip()
+                    for row in rows
+                )
+            )
+            if partial_coverage:
+                covered = int(ends[-1])
+                prefix_spans: list[tuple[int, int, str]] = []
+                prefix_left = 0
+                for row, prefix_right in zip(rows, ends):
+                    prefix_spans.append((
+                        start_word + prefix_left,
+                        start_word + int(prefix_right),
+                        str(row["text"]).strip(),
+                    ))
+                    prefix_left = int(prefix_right)
+                tail_start = start_word + covered
+                tail_spans, tail_provenance = request_window(
+                    tail_start, end_word,
+                    " ".join(
+                        word.raw for word in words[
+                            max(start_word, tail_start - 16):tail_start
+                        ]
+                    ),
+                    next_source,
+                    rejection + (
+                        "\nDeterministic partial-coverage recovery: the previous "
+                        f"response stopped at end_word {covered} of {len(window)}. "
+                        "Translate only the supplied remaining Source words and cover "
+                        "their final word exactly."
+                    ),
+                    repair_round,
+                    internal_attempt=internal_attempt + 1,
+                    minimum_card_count=max(0, minimum_count - len(prefix_spans)),
+                    mandatory_split_ranges=tuple(
+                        (left, right) for left, right in mandatory_split_ranges
+                        if left >= tail_start
+                    ),
+                    required_boundaries=tuple(
+                        boundary for boundary in required_boundaries
+                        if boundary > tail_start
+                    ),
+                    freeze_boundaries=False,
+                )
+                return prefix_spans + tail_spans, {
+                    **provenance,
+                    "partial_coverage_recovery": {
+                        "covered_words": covered,
+                        "total_words": len(window),
+                        "tail_provenance": tail_provenance,
+                    },
+                }
             if (
                 any(type(value) is not int for value in ends)
                 or ends[-1] != len(window)
@@ -3282,6 +3351,7 @@ class NaturalSubtitleTranslator:
                         {"role": "user", "content": "\n".join([
                             "Independently adjudicate the remaining subtitle review rejections after bounded repair. Do not rewrite any text.",
                             "Judge only whether each prior error identifies a material omission, invention, changed actor/modality/scope, misplaced entity, misleading cut, or incomprehensible Chinese. A sentence may continue across cards. Dismiss preferences, optional connective wording, tentative 'may affect' concerns, and an error that says the translation has no problem.",
+                            "A prior error may itself contradict its claimed referent or actor. Resolve pronouns from the complete previous/current/next causal context. If you retain the error, state exactly one supported referent and one concrete semantic mismatch; do not repeat incompatible alternatives from the prior prose.",
                             "English is authoritative but may contain ASR spelling or spacing artifacts. Use each row's audio_hypothesis and context to judge spoken meaning; do not demand literal Chinese for a broken fragment, an English spelling correction, or removal of a natural implicit Chinese head noun when no factual claim was added.",
                             "Return every id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. pass=true means the unchanged card and its boundary are publication-ready and errors must be empty. pass=false requires concise material errors. Both scores must be 1–5.",
                             (
@@ -3432,7 +3502,7 @@ class NaturalSubtitleTranslator:
         last_problems: dict[int, list[str]] = {}
         final_cards: list[TranscriptCue] = []
         review_provenance: dict[str, Any] | None = None
-        for repair_round in range(6):
+        for repair_round in range(7):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
                 attempts.append({
@@ -3458,7 +3528,7 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
-            if repair_round == 5:
+            if repair_round == 6:
                 break
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
@@ -3562,7 +3632,7 @@ class NaturalSubtitleTranslator:
         if last_problems:
             raise InterviewJointTranslationError(
                 "interview joint translation exhausted three movable-boundary repairs "
-                "and two fixed-boundary semantic repairs: "
+                "and three fixed-boundary semantic repairs: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:
@@ -6421,7 +6491,11 @@ def _semantic_card_translation_errors(
                 allow_alternatives=True,
             ):
                 errors.append(f"term:{term.source}:missing_target:{term.target}")
-            if _contains_term(translation, term.source):
+            same_written_form = (
+                re.sub(r"\s+", "", term.source).casefold()
+                == re.sub(r"\s+", "", term.target).casefold()
+            )
+            if not same_written_form and _contains_term(translation, term.source):
                 errors.append(f"term:{term.source}:remove_english:{term.source}")
     return errors
 

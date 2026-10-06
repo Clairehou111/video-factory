@@ -2013,6 +2013,26 @@ class YouTubeCollectionTest(unittest.TestCase):
             ),
         )
 
+    def test_semantic_card_accepts_equivalent_term_spacing_and_identity(self) -> None:
+        row = {
+            "id": "card", "source": "Token usage includes dark tokens.",
+            "duration_seconds": 5.0,
+        }
+        terms = [
+            TerminologyEntry(
+                "token", TerminologyStrategy.TRANSLATE, target="token",
+            ),
+            TerminologyEntry(
+                "dark tokens", TerminologyStrategy.TRANSLATE, target="暗token",
+            ),
+        ]
+
+        errors = _semantic_card_translation_errors(
+            row, "token 用量包含暗 token。", terms,
+        )
+
+        self.assertFalse(any(error.startswith("term:") for error in errors))
+
 
 
 
@@ -2565,6 +2585,46 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertGreaterEqual(len(cues), 5)
         self.assertEqual(trace["repair_rounds"], 1)
         self.assertFalse(interview_caption_duration_errors(cues))
+
+    def test_initial_joint_translation_recovers_only_an_omitted_tail(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.window_sizes: list[int] = []
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                size = int(re.search(
+                    r"exact source window contains (\d+) words", prompt,
+                ).group(1))
+                self.window_sizes.append(size)
+                return {"cards": [{
+                    "end_word": 4,
+                    "text": "前半句。" if size == 8 else "后半句。",
+                }]}, {"model": "writer", "window_size": size}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    return {"pass": True, "issues": []}, {"model": "global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = "one two three four five six seven eight"
+        cues = [TranscriptCue("cue-1", 0, 6, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(writer.window_sizes, [8, 4])
+        self.assertEqual(" ".join(cue.source_text for cue in cues), source)
+        recovery = trace["attempts"][0]["windows"][0]["provenance"]
+        self.assertEqual(recovery["partial_coverage_recovery"]["covered_words"], 4)
 
     def test_joint_repair_freezes_boundaries_after_repeated_semantic_drift(self) -> None:
         class Writer:
