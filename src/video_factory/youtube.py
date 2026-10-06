@@ -3534,15 +3534,21 @@ class NaturalSubtitleTranslator:
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
             for index in failed:
-                start = max(0, index - 1)
-                end = min(len(spans), index + 2)
+                if repair_round >= 3:
+                    # Once English boundaries are frozen, passing neighbors are
+                    # read-only context. Rewriting them caused already-correct
+                    # cards to regress while repairing a different card.
+                    start, end = index, index + 1
+                else:
+                    start = max(0, index - 1)
+                    end = min(len(spans), index + 2)
                 moved_entities = {
                     match.group(1)
                     for error in last_problems[index]
                     for match in [re.search(r"moved:([A-Za-z0-9._+-]+)", error)]
                     if match
                 }
-                for entity in moved_entities:
+                for entity in moved_entities if repair_round < 3 else ():
                     owners = [
                         owner for owner, card in enumerate(final_cards)
                         if _contains_term(card.source_text, entity)

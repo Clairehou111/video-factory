@@ -2641,7 +2641,16 @@ class YouTubeCollectionTest(unittest.TestCase):
                     prompt.split("Fixed required end_word boundaries: ", 1)[1]
                     .split(". Include every listed value", 1)[0]
                 )
-                self.fixed = bool(fixed)
+                fixed_rows = json.loads(
+                    prompt.split("Fixed card translation rows: ", 1)[1]
+                    .split(". When this list", 1)[0]
+                )
+                self.fixed = bool(fixed_rows)
+                if fixed_rows:
+                    return {"cards": [{
+                        "end_word": row["end_word"],
+                        "text": "修复后的失败卡。",
+                    } for row in fixed_rows]}, {"model": "writer", "call": self.calls}
                 return {"cards": [
                     {"end_word": 10, "text": "第一部分忠实表达。"},
                     {"end_word": 20, "text": "第二部分忠实表达。"},
@@ -2681,6 +2690,11 @@ class YouTubeCollectionTest(unittest.TestCase):
             "translate each row's source only into its matching Chinese text",
             writer.prompts[-1],
         )
+        fixed_rows = json.loads(
+            writer.prompts[-1].split("Fixed card translation rows: ", 1)[1]
+            .split(". When this list", 1)[0]
+        )
+        self.assertEqual(len(fixed_rows), 1)
         self.assertEqual(trace["repair_rounds"], 3)
         self.assertEqual(trace["attempts"][-1]["kind"], "validation_and_review")
         self.assertTrue(any(
@@ -2695,6 +2709,16 @@ class YouTubeCollectionTest(unittest.TestCase):
 
             def _request_json(self, messages, **kwargs):
                 self.calls += 1
+                prompt = messages[-1]["content"]
+                fixed_rows = json.loads(
+                    prompt.split("Fixed card translation rows: ", 1)[1]
+                    .split(". When this list", 1)[0]
+                )
+                if fixed_rows:
+                    return {"cards": [{
+                        "end_word": row["end_word"],
+                        "text": "修复后的失败卡。",
+                    } for row in fixed_rows]}, {"model": "writer", "call": self.calls}
                 return {"cards": [
                     {"end_word": 10, "text": "第一部分忠实表达。"},
                     {"end_word": 20, "text": "第二部分继续说明。"},
