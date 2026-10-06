@@ -2737,7 +2737,7 @@ class NaturalSubtitleTranslator:
                 if boundary not in absolute_boundaries
             )
             if missing_required:
-                if repair_round > 0 and internal_attempt < 3:
+                if repair_round > 0 and internal_attempt < 5:
                     return request_window(
                         start_word, end_word, previous_source, next_source,
                         rejection + (
@@ -2774,7 +2774,7 @@ class NaturalSubtitleTranslator:
                         required_boundaries=required_boundaries,
                         freeze_boundaries=freeze_boundaries,
                     )
-                if repair_round > 0 and not required_boundaries:
+                if repair_round > 0 and internal_attempt < 5:
                     forced: list[int] = []
                     for left, right in unsplit:
                         candidates = list(range(left + 1, right))
@@ -2798,6 +2798,9 @@ class NaturalSubtitleTranslator:
                             - midpoint
                         )))
                     if forced:
+                        combined_required = tuple(sorted(set((
+                            *required_boundaries, *forced,
+                        ))))
                         return request_window(
                             start_word, end_word, previous_source, next_source,
                             rejection + (
@@ -2806,9 +2809,11 @@ class NaturalSubtitleTranslator:
                                 + json.dumps(forced)
                             ),
                             repair_round, internal_attempt=internal_attempt + 1,
-                            minimum_card_count=max(minimum_count, len(forced) + 1),
+                            minimum_card_count=max(
+                                minimum_count, len(combined_required) + 1,
+                            ),
                             mandatory_split_ranges=mandatory_split_ranges,
-                            required_boundaries=tuple(forced),
+                            required_boundaries=combined_required,
                             freeze_boundaries=False,
                         )
                 raise ValueError(

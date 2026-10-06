@@ -2522,6 +2522,7 @@ class YouTubeCollectionTest(unittest.TestCase):
         class Writer:
             def __init__(self) -> None:
                 self.prompts: list[str] = []
+                self.fixed_attempts = 0
 
             def _request_json(self, messages, **kwargs):
                 prompt = messages[-1]["content"]
@@ -2532,7 +2533,9 @@ class YouTubeCollectionTest(unittest.TestCase):
                 )
                 ends = [8, 25, 33] if len(self.prompts) == 1 else [8, 25, 29, 33]
                 if fixed:
-                    ends = sorted(set([8, *fixed, 25, 29, 33]))
+                    self.fixed_attempts += 1
+                    if self.fixed_attempts > 1:
+                        ends = sorted(set([8, *fixed, 25, 29, 33]))
                 return {"cards": [
                     {"end_word": end, "text": "这段内容完整表达。"}
                     for index, end in enumerate(ends, start=1)
@@ -2557,7 +2560,7 @@ class YouTubeCollectionTest(unittest.TestCase):
             writer, subtitle_reviewer=Reviewer(),
         ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
 
-        self.assertEqual(len(writer.prompts), 5)
+        self.assertEqual(len(writer.prompts), 6)
         self.assertIn("Deterministic self-healing selected fixed internal boundaries", writer.prompts[-1])
         self.assertGreaterEqual(len(cues), 5)
         self.assertEqual(trace["repair_rounds"], 1)
