@@ -1245,6 +1245,7 @@ def terminology_contract_errors(
                         "in Chinese translation"
                     )
         if entry.strategy == TerminologyStrategy.PRESERVE:
+            preserved_form = entry.target.strip() or entry.source
             protected_terms = [
                 item.source for item in terminology
                 if item is not entry
@@ -1255,8 +1256,12 @@ def terminology_contract_errors(
                 source_owns_term = _contains_unprotected_term(
                     item.source_text, entry.source, protected_terms,
                 )
-                target_has_term = _contains_unprotected_term(
-                    item.translation, entry.source, protected_terms,
+                target_has_term = (
+                    preserved_form in item.translation
+                    if entry.target.strip()
+                    else _contains_unprotected_term(
+                        item.translation, entry.source, protected_terms,
+                    )
                 )
                 if source_owns_term and not target_has_term:
                     errors.append(
@@ -4333,12 +4338,20 @@ class NaturalSubtitleTranslator:
             if first is None:
                 continue
             if entry.strategy == TerminologyStrategy.PRESERVE:
-                if not _contains_term(combined_target, entry.source):
+                preserved_form = entry.target.strip() or entry.source
+                target_is_present = (
+                    preserved_form in combined_target
+                    if entry.target.strip()
+                    else _contains_term(combined_target, preserved_form)
+                )
+                if not target_is_present:
                     if entry.source == "Skill" and "技能" in first.translation:
                         first.translation = first.translation.replace("技能", "Skill", 1)
                     else:
-                        first.translation = f"{first.translation.rstrip('。')}（{entry.source}）。"
-                    combined_target += "\n" + entry.source
+                        first.translation = (
+                            f"{first.translation.rstrip('。')}（{preserved_form}）。"
+                        )
+                    combined_target += "\n" + preserved_form
                     enforced.append(entry.source)
             elif entry.strategy == TerminologyStrategy.TRANSLATE and entry.target:
                 protected_terms = [
@@ -4355,18 +4368,26 @@ class NaturalSubtitleTranslator:
                     protected: dict[str, str] = {}
                     protected_translation = cue.translation
                     for preserve_index, preserve_entry in enumerate(terminology):
+                        preserved_form = (
+                            preserve_entry.target.strip() or preserve_entry.source
+                        )
+                        preserved_present = (
+                            preserved_form in protected_translation
+                            if preserve_entry.target.strip()
+                            else _contains_term(protected_translation, preserved_form)
+                        )
                         if (
                             preserve_entry.strategy != TerminologyStrategy.PRESERVE
                             or entry.source.casefold() not in preserve_entry.source.casefold()
-                            or not _contains_term(protected_translation, preserve_entry.source)
+                            or not preserved_present
                         ):
                             continue
                         marker = f"__VF_PRESERVE_{preserve_index}__"
                         protected_translation = re.sub(
-                            re.escape(preserve_entry.source), marker,
+                            re.escape(preserved_form), marker,
                             protected_translation, flags=re.IGNORECASE,
                         )
-                        protected[marker] = preserve_entry.source
+                        protected[marker] = preserved_form
                     replaced = re.sub(
                         (
                             rf"(?<![A-Za-z0-9]){re.escape(entry.source)}(?:s|es)?(?![A-Za-z0-9])"

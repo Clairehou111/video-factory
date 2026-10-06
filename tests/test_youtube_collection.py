@@ -3397,6 +3397,27 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertTrue(any("one" in error and "missing" in error for error in errors))
         self.assertTrue(any("two" in error and "moved" in error for error in errors))
 
+    def test_preserved_term_uses_reviewed_publication_spelling(self) -> None:
+        terminology = [TerminologyEntry(
+            "crowd strike", TerminologyStrategy.PRESERVE, target="CrowdStrike",
+            rationale="The source captions split the company name.",
+        )]
+
+        self.assertEqual(terminology_contract_errors([
+            TranscriptCue(
+                "owner", 0, 4, "The callout is for crowd strike.",
+                "这里标注的是 CrowdStrike。",
+            ),
+        ], terminology), [])
+        self.assertTrue(any(
+            "missing" in error for error in terminology_contract_errors([
+                TranscriptCue(
+                    "owner", 0, 4, "The callout is for crowd strike.",
+                    "这里标注的是 crowd strike。",
+                ),
+            ], terminology)
+        ))
+
     def test_longer_preserved_phrase_owns_nested_short_term(self) -> None:
         terminology = [
             TerminologyEntry("runtime", TerminologyStrategy.PRESERVE, target="runtime"),
