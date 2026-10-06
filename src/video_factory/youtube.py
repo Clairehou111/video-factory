@@ -3503,7 +3503,7 @@ class NaturalSubtitleTranslator:
         last_problems: dict[int, list[str]] = {}
         final_cards: list[TranscriptCue] = []
         review_provenance: dict[str, Any] | None = None
-        for repair_round in range(9):
+        for repair_round in range(12):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
                 attempts.append({
@@ -3529,7 +3529,7 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
-            if repair_round == 8:
+            if repair_round == 11:
                 break
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
@@ -3639,7 +3639,7 @@ class NaturalSubtitleTranslator:
         if last_problems:
             raise InterviewJointTranslationError(
                 "interview joint translation exhausted three movable-boundary repairs "
-                "and five fixed-boundary semantic repairs: "
+                "and eight fixed-boundary semantic repairs: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:
