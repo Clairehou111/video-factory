@@ -6558,6 +6558,16 @@ def _caption_numeric_alignment_errors(
     target_counts: dict[str, int] = {}
     for number in values(translation):
         target_counts[number] = target_counts.get(number, 0) + 1
+    # A damaged token such as ``10erson`` is not a required source number: the
+    # translator may naturally spell it out as 十人. If it chooses Arabic
+    # digits based on the same visible prefix, consume that target occurrence
+    # so the optional repair is not misclassified as an invented number.
+    for source_word in source_words[start_word:end_word]:
+        fragment = re.fullmatch(
+            r"(\d+)[a-z]{3,}", source_word.raw.strip(".,!?;:'\""), re.IGNORECASE,
+        )
+        if fragment and target_counts.get(fragment.group(1), 0):
+            target_counts[fragment.group(1)] -= 1
     errors: list[str] = []
     for index, number in occurrences:
         if index in pair_by_index:

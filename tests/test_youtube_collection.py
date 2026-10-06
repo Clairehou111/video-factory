@@ -3139,6 +3139,9 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertNotIn("missing_number:10@8", errors)
         self.assertFalse(any(error.startswith("missing_number:10") for error in errors))
+        self.assertNotIn("moved_number:10", _caption_numeric_alignment_errors(
+            words, 0, len(words), "他在那里工作时，那还是家 10 人初创公司。", [],
+        ))
 
         semantic_errors = _semantic_card_translation_errors({
             "id": "cue-1", "source": "It was a 10erson startup.",
