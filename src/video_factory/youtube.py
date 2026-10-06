@@ -2495,6 +2495,7 @@ class NaturalSubtitleTranslator:
             next_source: str, rejection: str, repair_round: int,
             internal_attempt: int = 0, minimum_card_count: int = 0,
             mandatory_split_ranges: tuple[tuple[int, int], ...] = (),
+            required_boundaries: tuple[int, ...] = (),
         ) -> tuple[list[tuple[int, int, str]], dict[str, Any]]:
             window = words[start_word:end_word]
             duration = max(0.1, window[-1].end - window[0].start)
@@ -2502,7 +2503,7 @@ class NaturalSubtitleTranslator:
                 len(window), math.floor(duration / INTERVIEW_CAPTION_MIN_SECONDS),
             ))
             minimum_count = max(
-                1, minimum_card_count,
+                1, minimum_card_count, len(required_boundaries) + 1,
                 math.ceil(duration / INTERVIEW_CAPTION_HARD_MAX_SECONDS),
             )
             if minimum_count > maximum_count:
@@ -2584,6 +2585,9 @@ class NaturalSubtitleTranslator:
                     ],
                 } for left, right in mandatory_split_ranges], ensure_ascii=False)
                 + ". Every listed rejected range must contain at least one new end_word strictly inside it; adding a boundary only in a neighboring card does not repair the failure.",
+                "Fixed required end_word boundaries: " + json.dumps([
+                    boundary - start_word for boundary in required_boundaries
+                ]) + ". Include every listed value exactly as an end_word. These deterministic boundaries are supplied only after repeated failure to split a rejected overlong card.",
                 "Source entities absent or contradicted in audio ASR (the semantic reviewer decides their meaning; do not mechanically copy them into Chinese): "
                 + json.dumps(sorted(audio_conflict_entities), ensure_ascii=False),
                 "Numeric conflict evidence: " + json.dumps({
@@ -2626,6 +2630,7 @@ class NaturalSubtitleTranslator:
                         repair_round, internal_attempt=internal_attempt + 1,
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
+                        required_boundaries=required_boundaries,
                     )
                 raise ValueError(
                     f"joint translation returned invalid card count for words "
@@ -2647,6 +2652,7 @@ class NaturalSubtitleTranslator:
                         repair_round, internal_attempt=internal_attempt + 1,
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
+                        required_boundaries=required_boundaries,
                     )
                 raise ValueError(
                     f"joint translation returned invalid word boundaries: {ends}"
@@ -2654,6 +2660,28 @@ class NaturalSubtitleTranslator:
             absolute_boundaries = {
                 start_word + value for value in ends[:-1]
             }
+            missing_required = sorted(
+                boundary for boundary in required_boundaries
+                if boundary not in absolute_boundaries
+            )
+            if missing_required:
+                if repair_round > 0 and internal_attempt < 3:
+                    return request_window(
+                        start_word, end_word, previous_source, next_source,
+                        rejection + (
+                            "\nDeterministic boundary failure: include these exact "
+                            "absolute source boundaries: "
+                            + json.dumps(missing_required)
+                        ),
+                        repair_round, internal_attempt=internal_attempt + 1,
+                        minimum_card_count=minimum_count,
+                        mandatory_split_ranges=mandatory_split_ranges,
+                        required_boundaries=required_boundaries,
+                    )
+                raise ValueError(
+                    "joint translation omitted fixed source boundaries: "
+                    + json.dumps(missing_required)
+                )
             unsplit = [
                 (left, right) for left, right in mandatory_split_ranges
                 if not any(left < boundary < right for boundary in absolute_boundaries)
@@ -2670,7 +2698,44 @@ class NaturalSubtitleTranslator:
                         repair_round, internal_attempt=internal_attempt + 1,
                         minimum_card_count=minimum_count,
                         mandatory_split_ranges=mandatory_split_ranges,
+                        required_boundaries=required_boundaries,
                     )
+                if repair_round > 0 and not required_boundaries:
+                    forced: list[int] = []
+                    for left, right in unsplit:
+                        candidates = list(range(left + 1, right))
+                        if not candidates:
+                            continue
+                        midpoint = (words[left].start + words[right - 1].end) / 2
+                        viable = [
+                            boundary for boundary in candidates
+                            if (
+                                (words[boundary - 1].end + words[boundary].start) / 2
+                                - words[left].start
+                            ) >= INTERVIEW_CAPTION_MIN_SECONDS
+                            and (
+                                words[right - 1].end
+                                - (words[boundary - 1].end + words[boundary].start) / 2
+                            ) >= INTERVIEW_CAPTION_MIN_SECONDS
+                        ]
+                        pool = viable or candidates
+                        forced.append(min(pool, key=lambda boundary: abs(
+                            (words[boundary - 1].end + words[boundary].start) / 2
+                            - midpoint
+                        )))
+                    if forced:
+                        return request_window(
+                            start_word, end_word, previous_source, next_source,
+                            rejection + (
+                                "\nDeterministic self-healing selected fixed internal "
+                                "boundaries after repeated noncompliance: "
+                                + json.dumps(forced)
+                            ),
+                            repair_round, internal_attempt=internal_attempt + 1,
+                            minimum_card_count=max(minimum_count, len(forced) + 1),
+                            mandatory_split_ranges=mandatory_split_ranges,
+                            required_boundaries=tuple(forced),
+                        )
                 raise ValueError(
                     "joint translation did not split rejected source ranges: "
                     + json.dumps(unsplit)
@@ -2687,6 +2752,7 @@ class NaturalSubtitleTranslator:
                             repair_round, internal_attempt=internal_attempt + 1,
                             minimum_card_count=minimum_count,
                             mandatory_split_ranges=mandatory_split_ranges,
+                            required_boundaries=required_boundaries,
                         )
                     raise ValueError("joint translation returned an empty Chinese card")
                 spans.append((start_word + left, start_word + right, text_value))
@@ -2730,6 +2796,7 @@ class NaturalSubtitleTranslator:
                         retry_feedback, repair_round, internal_attempt=1,
                         minimum_card_count=stricter_minimum,
                         mandatory_split_ranges=mandatory_split_ranges,
+                        required_boundaries=required_boundaries,
                     )
             return spans, provenance
 
@@ -3167,7 +3234,7 @@ class NaturalSubtitleTranslator:
         last_problems: dict[int, list[str]] = {}
         final_cards: list[TranscriptCue] = []
         review_provenance: dict[str, Any] | None = None
-        for repair_round in range(4):
+        for repair_round in range(5):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
                 attempts.append({
@@ -3193,7 +3260,7 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
-            if repair_round == 3:
+            if repair_round == 4:
                 break
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
@@ -3260,6 +3327,10 @@ class NaturalSubtitleTranslator:
                     repair_round + 1,
                     minimum_card_count=(end - start + 1 if requires_extra_card else 0),
                     mandatory_split_ranges=mandatory_split_ranges,
+                    required_boundaries=(
+                        tuple(spans[index][1] for index in range(start, end - 1))
+                        if repair_round == 3 else ()
+                    ),
                 )
                 repaired.extend(replacement)
                 repair_traces.append({
@@ -3279,12 +3350,17 @@ class NaturalSubtitleTranslator:
             repaired.extend(spans[cursor:])
             spans = repaired
             attempts.append({
-                "round": repair_round + 1, "kind": "local_joint_repair",
+                "round": repair_round + 1,
+                "kind": (
+                    "fixed_boundary_semantic_repair"
+                    if repair_round == 3 else "local_joint_repair"
+                ),
                 "windows": repair_traces,
             })
         if last_problems:
             raise InterviewJointTranslationError(
-                "interview joint translation exhausted three local repair rounds: "
+                "interview joint translation exhausted three movable-boundary repairs "
+                "and one fixed-boundary semantic repair: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:
@@ -3534,12 +3610,14 @@ class NaturalSubtitleTranslator:
         existing = {entry.source.casefold() for entry in terminology}
         transcript = [{"id": cue.id, "text": cue.source_text} for cue in cues]
         failures: list[str] = []
+        discovery_attempts: list[dict[str, Any]] = []
         for attempt in range(2):
             response, provenance = self.writer._request_json([
                 {"role": "system", "content": "Return one valid JSON object only."},
                 {"role": "user", "content": "\n".join([
                     "Inspect only this already-selected English subtitle passage for missing terminology needed by a Simplified Chinese translation. Do not select a clip, write a title, propose a hook, summarize, or translate captions.",
                     "Return at most 8 source phrases that occur verbatim in the passage, are absent from Existing terminology, and need one video-level decision because they are a technical compound, an emerging term, or context-sensitive vocabulary whose inconsistent translation could change meaning. Do not return ordinary words merely to fill the quota.",
+                    "Do not propose apparent ASR corruption, misspellings, broken fragments, or invented normalized phrases. If a phrase is not a stable term exactly present in the selected passage, omit it; the independent subtitle reviewer will handle its sentence meaning later.",
                     "For each row choose translate or preserve. translate requires a concise natural Chinese target; preserve is only for a product/company name, acronym, code/API identifier, or a genuinely unsettled term without a clear Chinese rendering. Include at most two defensible Chinese alternatives and a concise rationale citing the actor/action/context.",
                     "Return {terminology:[{source,strategy,target,alternatives,rationale}]}. Return an empty array when nothing is missing.",
                     "Existing terminology: " + json.dumps(
@@ -3555,6 +3633,10 @@ class NaturalSubtitleTranslator:
             raw = response.get("terminology")
             if not isinstance(raw, list) or len(raw) > 8:
                 failures.append("terminology must be an array with at most 8 rows")
+                discovery_attempts.append({
+                    "attempt": attempt + 1, "validation_error": failures[-1],
+                    "provenance": provenance,
+                })
                 continue
             raw_sources = [
                 str(row.get("source") or "").strip()
@@ -3562,6 +3644,10 @@ class NaturalSubtitleTranslator:
             ]
             if len(raw_sources) != len(raw) or len({value.casefold() for value in raw_sources}) != len(raw):
                 failures.append("every row needs one unique source")
+                discovery_attempts.append({
+                    "attempt": attempt + 1, "validation_error": failures[-1],
+                    "provenance": provenance,
+                })
                 continue
             invalid_sources = [
                 source for source in raw_sources
@@ -3573,6 +3659,10 @@ class NaturalSubtitleTranslator:
                     "sources must occur in the passage and must not duplicate existing terms: "
                     + json.dumps(invalid_sources, ensure_ascii=False)
                 )
+                discovery_attempts.append({
+                    "attempt": attempt + 1, "validation_error": failures[-1],
+                    "rejected_sources": invalid_sources, "provenance": provenance,
+                })
                 continue
             parsed = self._parse_terminology(raw, cues)
             returned = {source.casefold() for source in raw_sources}
@@ -3590,8 +3680,17 @@ class NaturalSubtitleTranslator:
                 failures.append(
                     "every row needs a valid strategy, target, and contextual rationale"
                 )
+                discovery_attempts.append({
+                    "attempt": attempt + 1, "validation_error": failures[-1],
+                    "provenance": provenance,
+                })
                 continue
             terminology.extend(additions)
+            discovery_attempts.append({
+                "attempt": attempt + 1, "added_sources": [
+                    entry.source for entry in additions
+                ], "provenance": provenance,
+            })
             return {
                 "step": "selected_subtitle_terminology_discovery",
                 "attempt": attempt + 1,
@@ -3599,12 +3698,24 @@ class NaturalSubtitleTranslator:
                 "added_sources": [entry.source for entry in additions],
                 "decisions": [asdict(entry) for entry in additions],
                 "earlier_failures": failures,
+                "attempts": discovery_attempts,
                 "provenance": provenance,
             }
-        raise ValueError(
-            "selected subtitle terminology discovery failed deterministic validation: "
-            + "; ".join(failures)
-        )
+        # This discovery pass is optional enrichment. Invalid model proposals
+        # must never become terminology, but they also must not block the fixed
+        # clip: card-level semantic review still judges the actual translation.
+        return {
+            "step": "selected_subtitle_terminology_discovery",
+            "attempt": len(discovery_attempts),
+            "existing_sources": sorted(existing),
+            "added_sources": [],
+            "decisions": [],
+            "earlier_failures": failures,
+            "discarded_invalid_proposals": True,
+            "attempts": discovery_attempts,
+            "provenance": discovery_attempts[-1].get("provenance")
+            if discovery_attempts else None,
+        }
 
     def review_terminology_decisions(
         self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
@@ -3628,6 +3739,7 @@ class NaturalSubtitleTranslator:
         review_structure_failures: list[dict[str, Any]] = []
         revision_attempts: list[dict[str, Any]] = []
         last_rejected: dict[str, list[str]] = {}
+        dropped_sources: list[str] = []
         for attempt in range(2):
             rows: list[dict[str, Any]] = []
             for entry in contextual:
@@ -3657,6 +3769,7 @@ class NaturalSubtitleTranslator:
                         "Independently review each proposed terminology decision for a Simplified Chinese technology interview before subtitles are translated. Do not rewrite captions.",
                         "Treat both translate and preserve as proposals, not instructions. Preserve English only for a product or company name, acronym, code/API identifier, or a genuinely unsettled term that lacks a clear natural Chinese rendering in this context. A term being recent or emerging is not by itself evidence that Chinese readers should see the English form. Reject preserve when a concise, established or compositionally clear Chinese rendering accurately conveys the source distinction.",
                         "For translate, reject a target that changes the actor, action, technical distinction, or contextual sense. Judge the supplied rationale against the source context rather than trusting it. Alternatives are candidates, not automatic approvals.",
+                        "If the exact source is an apparent ASR corruption, misspelling, or broken fragment rather than a stable term, reject it and make the first error exactly drop:not_a_stable_term. Use that marker only when the source itself should not be a video-level terminology decision; sentence-level meaning remains for the subtitle reviewer.",
                         "Return every source exactly once as {reviews:[{source,pass,fidelity_score,naturalness_score,errors}]}. Pass only when both scores are at least 4 and the exact strategy and target are publication-ready. Do not return replacement wording.",
                         (
                             "The previous reviewer response failed deterministic structure validation: "
@@ -3719,6 +3832,7 @@ class NaturalSubtitleTranslator:
                     + json.dumps(phase_structure_failures, ensure_ascii=False)
                 )
             rejected: dict[str, list[str]] = {}
+            dropped_keys: set[str] = set()
             for key, entry in expected.items():
                 row = reviews.get(key, {})
                 if (
@@ -3732,6 +3846,24 @@ class NaturalSubtitleTranslator:
                         [str(value) for value in raw_errors]
                         if isinstance(raw_errors, list) else [str(raw_errors)]
                     )
+                    if rejected[entry.source] and rejected[entry.source][0] == "drop:not_a_stable_term":
+                        dropped_keys.add(key)
+            if dropped_keys:
+                dropped_sources.extend(
+                    expected[key].source for key in sorted(dropped_keys)
+                )
+                terminology[:] = [
+                    entry for entry in terminology
+                    if entry.source.casefold() not in dropped_keys
+                ]
+                contextual = [
+                    entry for entry in contextual
+                    if entry.source.casefold() not in dropped_keys
+                ]
+                rejected = {
+                    source: errors for source, errors in rejected.items()
+                    if source.casefold() not in dropped_keys
+                }
             if not rejected:
                 return {
                     "step": "terminology_decision_review",
@@ -3740,6 +3872,7 @@ class NaturalSubtitleTranslator:
                     "review_attempts": review_attempts,
                     "review_structure_failures": review_structure_failures,
                     "revision_attempts": revision_attempts,
+                    "dropped_sources": dropped_sources,
                     "decisions": [asdict(entry) for entry in contextual],
                 }
             last_rejected = rejected

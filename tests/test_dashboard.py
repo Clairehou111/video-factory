@@ -1,4 +1,6 @@
 import hashlib
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -402,6 +404,117 @@ class DashboardTest(unittest.TestCase):
             rows = PublishDashboard(workspace).discovery_failures()
 
             self.assertEqual([row["candidate_id"] for row in rows], ["youtube-active"])
+
+    def test_discovery_retries_are_serial_background_tasks_with_visible_logs(self) -> None:
+        class SerialDiscoveryService:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                self.finished = threading.Event()
+
+            def adopt_candidate(self, candidate_id, config):
+                self.calls.append(candidate_id)
+                if candidate_id == "youtube-one":
+                    self.first_started.set()
+                    self.release_first.wait(timeout=5)
+                if candidate_id == "youtube-two":
+                    self.finished.set()
+                return {
+                    "status": "blocked", "last_error": f"validation failed for {candidate_id}",
+                    "attempts": [{"status": "failed"}],
+                }
+
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            rows = []
+            for candidate_id in ("youtube-one", "youtube-two"):
+                workspace.save_discovery_candidate({
+                    "id": candidate_id, "channel": "youtube",
+                    "url": f"https://youtube.com/watch?v={candidate_id}",
+                    "title": candidate_id, "eligible": True,
+                    "status": "needs_human", "metadata": {},
+                })
+                rows.append({
+                    "candidate_id": candidate_id, "channel": "youtube",
+                    "title": candidate_id, "status": "needs_human",
+                })
+            workspace.save_discovery_state({
+                "channels": {}, "generated_events": [], "history": [],
+                "skipped_ids": [], "needs_human_candidates": rows,
+            })
+            service = SerialDiscoveryService()
+            dashboard = PublishDashboard(workspace, discovery_service=service)
+
+            first = dashboard.retry_discovery("youtube-one")
+            second = dashboard.retry_discovery("youtube-two")
+            self.assertEqual(first["status"], "queued")
+            self.assertEqual(second["status"], "queued")
+            self.assertTrue(service.first_started.wait(timeout=2))
+            self.assertEqual(service.calls, ["youtube-one"])
+
+            visible = {row["candidate_id"]: row for row in dashboard.discovery_failures()}
+            self.assertEqual(visible["youtube-one"]["status"], "running")
+            self.assertEqual(visible["youtube-two"]["status"], "queued")
+            self.assertIn("Generation started", str(visible["youtube-one"]["retry_task"]["logs"]))
+
+            service.release_first.set()
+            self.assertTrue(service.finished.wait(timeout=2))
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                visible = {row["candidate_id"]: row for row in dashboard.discovery_failures()}
+                if visible["youtube-two"]["retry_task"]["status"] == "failed":
+                    break
+                time.sleep(0.01)
+
+            self.assertEqual(service.calls, ["youtube-one", "youtube-two"])
+            self.assertEqual(visible["youtube-one"]["retry_task"]["status"], "failed")
+            self.assertEqual(visible["youtube-two"]["retry_task"]["status"], "failed")
+            self.assertIn("validation failed", visible["youtube-two"]["last_error"])
+            self.assertTrue(list((workspace.root / "discovery" / "retry-tasks").glob("*.json")))
+
+    def test_successful_discovery_retry_remains_visible_with_terminal_status(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            candidate = {
+                "id": "youtube-success", "channel": "youtube",
+                "url": "https://youtube.com/watch?v=success",
+                "title": "Successful retry", "eligible": True,
+                "status": "needs_human", "metadata": {},
+            }
+            workspace.save_discovery_candidate(candidate)
+            workspace.save_discovery_state({
+                "channels": {}, "generated_events": [], "history": [],
+                "skipped_ids": [], "needs_human_candidates": [{
+                    "candidate_id": candidate["id"], "channel": "youtube",
+                    "title": candidate["title"], "status": "needs_human",
+                }],
+            })
+
+            class SuccessfulDiscoveryService:
+                def adopt_candidate(self, candidate_id, config):
+                    generated = workspace.load_discovery_candidate(candidate_id)
+                    generated["status"] = "generated"
+                    workspace.save_discovery_candidate(generated)
+                    return {"status": "generated", "attempts": [{"status": "generated"}]}
+
+            dashboard = PublishDashboard(
+                workspace, discovery_service=SuccessfulDiscoveryService(),
+            )
+            dashboard.retry_discovery(candidate["id"])
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                rows = dashboard.discovery_failures()
+                if rows and rows[0].get("retry_task", {}).get("status") == "succeeded":
+                    break
+                time.sleep(0.01)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "succeeded")
+            self.assertFalse(rows[0]["retry_eligible"])
+            self.assertIn("Generation completed", str(rows[0]["retry_task"]["logs"]))
 
 
 if __name__ == "__main__":

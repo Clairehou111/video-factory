@@ -2390,6 +2390,27 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(options.youtube_subtitles, str(subtitles))
             self.assertEqual(options.youtube_translation_plan, str(translation_plan))
 
+    def test_failed_manifest_scan_ignores_result_removed_by_cleanup(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            jobs = workspace.root / "jobs"
+            removed = jobs / "removed-during-scan"
+            removed.mkdir(parents=True)
+            (removed / "result.json").symlink_to(removed / "already-deleted.json")
+            valid = jobs / "valid-failed-job"
+            valid.mkdir(parents=True)
+            manifest = valid / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            source_url = "https://youtube.com/watch?v=race123"
+            (valid / "result.json").write_text(json.dumps({
+                "url": source_url, "status": "failed", "manifest": str(manifest),
+            }), encoding="utf-8")
+
+            service = ResourceDiscoveryService(workspace)
+
+            self.assertEqual(service._latest_failed_manifest(source_url), manifest)
+
     def test_adoption_reuses_completed_direct_generation_without_duplicate_render(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))

@@ -2192,6 +2192,60 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(trace["added_sources"], [])
         self.assertEqual(terminology, [])
 
+    def test_selected_subtitle_discovery_discards_repeated_invalid_optional_proposals(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, max_tokens):
+                self.calls += 1
+                return {"terminology": [{
+                    "source": "invented normalized phrase",
+                    "strategy": "translate", "target": "虚构短语",
+                    "alternatives": [], "rationale": "not in the fixed passage",
+                }]}, {"call": self.calls}
+
+        writer = Writer()
+        terminology: list[TerminologyEntry] = []
+        trace = NaturalSubtitleTranslator(writer).discover_missing_terminology(
+            [TranscriptCue("cue-1", 0, 4, "The model runs locally.", "")],
+            terminology,
+        )
+
+        self.assertEqual(writer.calls, 2)
+        self.assertTrue(trace["discarded_invalid_proposals"])
+        self.assertEqual(trace["added_sources"], [])
+        self.assertEqual(len(trace["attempts"]), 2)
+        self.assertEqual(terminology, [])
+
+    def test_independent_terminology_review_can_drop_asr_corruption(self) -> None:
+        class Writer:
+            def _request_json(self, *args, **kwargs):
+                raise AssertionError("dropped ASR corruption must not be revised")
+
+        class Reviewer:
+            def _request_json(self, messages, max_tokens):
+                return {"reviews": [{
+                    "source": "deconlict", "pass": False,
+                    "fidelity_score": 1, "naturalness_score": 1,
+                    "errors": ["drop:not_a_stable_term"],
+                }]}, {"model": "independent-reviewer"}
+
+        cues = [TranscriptCue(
+            "cue-1", 0, 5, "These controls deconlict agent permissions.", "",
+        )]
+        terminology = [TerminologyEntry(
+            "deconlict", TerminologyStrategy.TRANSLATE, target="消除冲突",
+            rationale="The transcript uses it as an action.",
+        )]
+
+        trace = NaturalSubtitleTranslator(
+            Writer(), subtitle_reviewer=Reviewer(),
+        ).review_terminology_decisions(cues, terminology)
+
+        self.assertEqual(trace["dropped_sources"], ["deconlict"])
+        self.assertEqual(terminology, [])
+
     def test_malformed_terminology_review_retries_without_revising_decision(self) -> None:
         class MustNotRevise:
             def _request_json(self, *args, **kwargs):
@@ -2430,6 +2484,106 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(len(cues), 4)
         self.assertEqual(trace["repair_rounds"], 1)
         self.assertFalse(interview_caption_duration_errors(cues))
+
+    def test_joint_repair_fixes_boundary_after_repeated_unsplit_responses(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                self.prompts.append(prompt)
+                fixed = json.loads(
+                    prompt.split("Fixed required end_word boundaries: ", 1)[1]
+                    .split(". Include every listed value", 1)[0]
+                )
+                ends = [8, 25, 33] if len(self.prompts) == 1 else [8, 25, 29, 33]
+                if fixed:
+                    ends = sorted(set([8, *fixed, 25, 29, 33]))
+                return {"cards": [
+                    {"end_word": end, "text": "这段内容完整表达。"}
+                    for index, end in enumerate(ends, start=1)
+                ]}, {"model": "writer", "call": len(self.prompts)}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 34))
+        cues = [TranscriptCue("cue-1", 0, 18, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(len(writer.prompts), 5)
+        self.assertIn("Deterministic self-healing selected fixed internal boundaries", writer.prompts[-1])
+        self.assertGreaterEqual(len(cues), 5)
+        self.assertEqual(trace["repair_rounds"], 1)
+        self.assertFalse(interview_caption_duration_errors(cues))
+
+    def test_joint_repair_freezes_boundaries_after_repeated_semantic_drift(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.fixed = False
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                fixed = json.loads(
+                    prompt.split("Fixed required end_word boundaries: ", 1)[1]
+                    .split(". Include every listed value", 1)[0]
+                )
+                self.fixed = bool(fixed)
+                return {"cards": [
+                    {"end_word": 10, "text": "第一部分忠实表达。"},
+                    {"end_word": 20, "text": "第二部分忠实表达。"},
+                    {"end_word": 30, "text": "第三部分忠实表达。"},
+                ]}, {"model": "writer", "call": self.calls}
+
+        class Reviewer:
+            def __init__(self, writer) -> None:
+                self.writer = writer
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    return {"pass": True, "issues": []}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": self.writer.fixed or index != 1,
+                    "fidelity_score": 5 if self.writer.fixed or index != 1 else 2,
+                    "naturalness_score": 5 if self.writer.fixed or index != 1 else 3,
+                    "errors": [] if self.writer.fixed or index != 1 else [
+                        "跨卡边界语义错位：中文提前使用了下一卡的含义。",
+                    ],
+                } for index, row in enumerate(rows)]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 31))
+        cues = [TranscriptCue("cue-1", 0, 18, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(writer),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertTrue(writer.fixed)
+        self.assertEqual(writer.calls, 5)
+        self.assertEqual(trace["repair_rounds"], 3)
+        self.assertEqual(trace["attempts"][-1]["kind"], "validation_and_review")
+        self.assertTrue(any(
+            item["kind"] == "fixed_boundary_semantic_repair"
+            for item in trace["attempts"]
+        ))
 
     def test_joint_interview_translation_retries_invalid_initial_structure(self) -> None:
         class Writer:

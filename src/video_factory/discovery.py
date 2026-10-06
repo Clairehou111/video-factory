@@ -35,6 +35,18 @@ from .youtube import (
 )
 
 
+def _recent_job_results(jobs: Path) -> list[Path]:
+    """Return newest job results while tolerating concurrent cleanup."""
+    dated: list[tuple[float, Path]] = []
+    for path in jobs.glob("*/result.json"):
+        try:
+            dated.append((path.stat().st_mtime, path))
+        except OSError:
+            # Manual cleanup may unlink a failed job between glob() and stat().
+            continue
+    return [path for _, path in sorted(dated, key=lambda row: row[0], reverse=True)]
+
+
 class DiscoveryChannel(StrEnum):
     X = "x"
     GITHUB = "github"
@@ -3745,7 +3757,7 @@ class ResourceDiscoveryService:
         jobs = self.workspace.root / "jobs"
         if not jobs.is_dir():
             return None, None
-        results = sorted(jobs.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        results = _recent_job_results(jobs)
         for result_path in results[:12]:
             try:
                 payload = json.loads(result_path.read_text(encoding="utf-8"))
@@ -3772,7 +3784,7 @@ class ResourceDiscoveryService:
         jobs = self.workspace.root / "jobs"
         if not jobs.is_dir():
             return None
-        results = sorted(jobs.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        results = _recent_job_results(jobs)
         for result_path in results[:12]:
             try:
                 payload = json.loads(result_path.read_text(encoding="utf-8"))
@@ -3789,7 +3801,7 @@ class ResourceDiscoveryService:
         jobs = self.workspace.root / "jobs"
         if not jobs.is_dir():
             return None
-        results = sorted(jobs.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        results = _recent_job_results(jobs)
         for path in results[:30]:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -3813,11 +3825,7 @@ class ResourceDiscoveryService:
         jobs = self.workspace.root / "jobs"
         if not jobs.is_dir():
             return None
-        results = sorted(
-            jobs.glob("*/result.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
+        results = _recent_job_results(jobs)
         ignored_checks = {
             "music_license_record", "editorial_safety_review", "rights_review",
         }

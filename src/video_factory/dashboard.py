@@ -5,8 +5,9 @@ import json
 import mimetypes
 import secrets
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -113,6 +114,126 @@ class PublishDashboard:
         self.discovery_config = discovery_config or ResourceDiscoveryConfig()
         self.csrf_token = secrets.token_urlsafe(32)
         self._publish_lock = threading.RLock()
+        self._retry_lock = threading.RLock()
+        self._retry_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dashboard-discovery-retry",
+        )
+        self._active_retry_ids: set[str] = set()
+        self._retry_instance = secrets.token_hex(8)
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    def _retry_task_path(self, candidate_id: str) -> Path:
+        digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:24]
+        return self.workspace.root / "discovery" / "retry-tasks" / f"{digest}.json"
+
+    def _save_retry_task(self, task: dict[str, Any]) -> None:
+        path = self._retry_task_path(str(task["candidate_id"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{threading.get_ident()}.tmp")
+        temporary.write_text(
+            json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _load_retry_task(self, candidate_id: str) -> dict[str, Any] | None:
+        path = self._retry_task_path(candidate_id)
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if task.get("candidate_id") != candidate_id:
+            return None
+        if (
+            task.get("status") in {"queued", "running"}
+            and task.get("instance") != self._retry_instance
+        ):
+            now = self._now_iso()
+            task["status"] = "interrupted"
+            task["updated_at"] = now
+            task["finished_at"] = now
+            task["last_error"] = "Dashboard restarted before the retry returned a result"
+            task.setdefault("logs", []).append({
+                "at": now, "message": "Retry interrupted by Dashboard restart",
+            })
+            self._save_retry_task(task)
+        return task
+
+    def _recent_retry_tasks(self) -> list[dict[str, Any]]:
+        directory = self.workspace.root / "discovery" / "retry-tasks"
+        if not directory.is_dir():
+            return []
+        cutoff = datetime.now(UTC) - timedelta(minutes=15)
+        recent: list[dict[str, Any]] = []
+        for path in directory.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                candidate_id = str(payload.get("candidate_id") or "")
+                if not candidate_id:
+                    continue
+                task = self._load_retry_task(candidate_id)
+                if not task:
+                    continue
+                if task.get("status") in {"queued", "running"}:
+                    recent.append(task)
+                    continue
+                updated = datetime.fromisoformat(
+                    str(task.get("updated_at") or "").replace("Z", "+00:00")
+                )
+                if task.get("status") == "succeeded" and updated >= cutoff:
+                    recent.append(task)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        return recent
+
+    def _update_retry_task(
+        self, candidate_id: str, status: str, message: str, **values: Any,
+    ) -> dict[str, Any]:
+        with self._retry_lock:
+            task = self._load_retry_task(candidate_id) or {
+                "candidate_id": candidate_id, "logs": [],
+                "created_at": self._now_iso(), "instance": self._retry_instance,
+            }
+            now = self._now_iso()
+            task.update(values)
+            task["status"] = status
+            task["updated_at"] = now
+            task.setdefault("logs", []).append({"at": now, "message": message})
+            task["logs"] = task["logs"][-20:]
+            self._save_retry_task(task)
+            return dict(task)
+
+    def _run_discovery_retry(self, candidate_id: str) -> None:
+        self._update_retry_task(
+            candidate_id, "running", "Generation started", started_at=self._now_iso(),
+            stage="generation",
+        )
+        try:
+            result = self.discovery_service.adopt_candidate(
+                candidate_id, self.discovery_config,
+            )
+            generated = result.get("status") == "generated"
+            final_status = "succeeded" if generated else "failed"
+            last_error = str(result.get("last_error") or "")[-2000:]
+            self._update_retry_task(
+                candidate_id, final_status,
+                "Generation completed" if generated else "Generation stopped at a validation gate",
+                stage="completed" if generated else "validation",
+                finished_at=self._now_iso(), last_error=last_error,
+                result_status=str(result.get("status") or ""),
+                attempts=len(result.get("attempts") or []),
+            )
+        except Exception as error:
+            self._update_retry_task(
+                candidate_id, "failed", "Retry process raised an exception",
+                stage="internal_error", finished_at=self._now_iso(),
+                last_error=f"{type(error).__name__}: {str(error)[-1900:]}",
+            )
+        finally:
+            with self._retry_lock:
+                self._active_retry_ids.discard(candidate_id)
 
     def discovery_failures(self) -> list[dict[str, Any]]:
         """Return only actionable discovery failures; history stays in state artifacts."""
@@ -139,17 +260,45 @@ class PublishDashboard:
                 failure.setdefault("last_error", str(pending.get("last_error") or ""))
                 failure.setdefault("retry_eligible", True)
                 rows[str(candidate_id)] = failure
+        for task in self._recent_retry_tasks():
+            candidate_id = str(task["candidate_id"])
+            if candidate_id in rows:
+                continue
+            try:
+                candidate = self.workspace.load_discovery_candidate(candidate_id)
+            except (KeyError, OSError, ValueError, TypeError):
+                candidate = {}
+            rows[candidate_id] = {
+                "candidate_id": candidate_id,
+                "channel": str(candidate.get("channel") or "discovery"),
+                "title": str(candidate.get("title") or candidate_id),
+                "url": str(candidate.get("url") or ""),
+                "status": str(task.get("status") or ""),
+            }
         active: list[dict[str, Any]] = []
         for candidate_id, row in rows.items():
             try:
                 candidate = self.workspace.load_discovery_candidate(candidate_id)
             except (KeyError, OSError, ValueError, TypeError):
                 candidate = {}
+            task = self._load_retry_task(candidate_id)
             status = str(candidate.get("status") or row.get("status") or "")
-            if status in {"generated", "skipped", "resolved", "not_selected", "not_adopted"}:
+            if (
+                status in {"generated", "skipped", "resolved", "not_selected", "not_adopted"}
+                and not (task and task.get("status") == "succeeded")
+            ):
                 continue
             row["status"] = status or "needs_human"
             row["candidate_id"] = candidate_id
+            if task:
+                row["retry_task"] = task
+                if task.get("status") in {"queued", "running", "succeeded"}:
+                    row["status"] = str(task["status"])
+                    row["retry_eligible"] = False
+                elif task.get("status") in {"failed", "interrupted"}:
+                    row["last_error"] = str(
+                        task.get("last_error") or row.get("last_error") or ""
+                    )
             active.append(row)
         active.sort(
             key=lambda row: str(row.get("last_failed_at") or row.get("recorded_at") or ""),
@@ -158,11 +307,27 @@ class PublishDashboard:
         return active
 
     def retry_discovery(self, candidate_id: str) -> dict[str, Any]:
-        if not candidate_id.strip():
+        candidate_id = candidate_id.strip()
+        if not candidate_id:
             raise ValueError("candidate_id is required")
-        return self.discovery_service.adopt_candidate(
-            candidate_id.strip(), self.discovery_config,
-        )
+        # Validate before accepting work so a typo cannot create a phantom task.
+        self.workspace.load_discovery_candidate(candidate_id)
+        with self._retry_lock:
+            if candidate_id in self._active_retry_ids:
+                return self._load_retry_task(candidate_id) or {
+                    "candidate_id": candidate_id, "status": "running",
+                }
+            now = self._now_iso()
+            task = {
+                "candidate_id": candidate_id, "status": "queued",
+                "stage": "queued", "created_at": now, "updated_at": now,
+                "instance": self._retry_instance,
+                "logs": [{"at": now, "message": "Retry queued"}],
+            }
+            self._active_retry_ids.add(candidate_id)
+            self._save_retry_task(task)
+            self._retry_executor.submit(self._run_discovery_retry, candidate_id)
+            return dict(task)
 
     def skip_discovery(self, candidate_id: str, reason: str) -> dict[str, Any]:
         return self.discovery_service.skip(candidate_id.strip(), reason)
@@ -611,7 +776,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.dashboard.retry_discovery(
                     str(payload.get("candidate_id") or ""),
                 )
-                self._json(HTTPStatus.OK, result)
+                self._json(HTTPStatus.ACCEPTED, result)
                 return
             if path == "/api/discovery-skip":
                 result = self.server.dashboard.skip_discovery(
@@ -724,12 +889,12 @@ DASHBOARD_HTML = """<!doctype html>
 let csrf='';const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(message){const el=document.querySelector('#toast');el.textContent=message;el.style.display='block';setTimeout(()=>el.style.display='none',5000)}
 async function load(){const r=await fetch('/api/queue',{cache:'no-store'});const data=await r.json();csrf=data.csrf_token;for(const k of ['total','ready','attention'])document.querySelector('#'+k).textContent=data.summary[k];const grid=document.querySelector('#grid');if(!data.items.length){grid.innerHTML='<div class="empty">队列已清空。下一轮发现与生成完成后，新成片会自动出现在这里。</div>';return}grid.innerHTML=data.items.map(x=>`<article class="card">${x.video_available?`<video controls preload="metadata" src="${esc(x.media_url)}"></video>`:'<div class="missing">成片文件已被清理，需重新生成后才能发布</div>'}<div class="meta"><span>${x.sequence_label?`<span class="pill">短片 ${esc(x.sequence_label)}</span> `:''}<span class="pill">${esc(x.editorial_mode||'news')}</span></span><span class="state">${esc(x.item_state)}</span></div><h2>${esc(x.display_title||x.title)}</h2><div class="source">${x.source_url?`来源：<a href="${esc(x.source_url)}" target="_blank" rel="noreferrer">${esc(x.source_title||x.source_url)}</a>`:'来源已归档'}</div>${x.failed_checks.length?`<div class="checks">未通过：${esc(x.failed_checks.join('、'))}</div>`:''}${x.last_error?`<div class="checks">上次错误：${esc(x.last_error)}</div>`:''}${x.can_publish?`<label class="schedule">定时发布（北京时间，至少提前 2 小时；留空则立即发布）<input type="datetime-local" value="${esc((x.schedule_at||'').replace(' ','T'))}"></label>`:''}<button ${(x.can_publish||x.can_review)?'':'disabled'} data-action="${x.can_review?'review':x.requires_login?'login':'publish'}" data-review-check="${esc(x.review_check)}" data-batch="${esc(x.batch_id)}" data-item="${esc(x.item_id)}">${esc(x.action_label)}</button></article>`).join('');grid.querySelectorAll('button:not(:disabled)').forEach(b=>b.addEventListener('click',handleAction))}
-async function loadFailures(){const r=await fetch('/api/discovery-failures',{cache:'no-store'});const data=await r.json();csrf=data.csrf_token||csrf;document.querySelector('#failure-count').textContent=data.items.length?`(${data.items.length})`:'';const grid=document.querySelector('#failure-grid');if(!data.items.length){grid.innerHTML='<div class="empty">当前没有需要处理的失败来源。</div>';return}grid.innerHTML=data.items.map(x=>`<article class="card"><div class="meta"><span class="pill">${esc(x.channel||'discovery')}</span><span class="state">${esc(x.status)}</span></div><h2>${esc(x.title||x.candidate_id)}</h2><div class="source"><a href="${esc(x.url)}" target="_blank" rel="noreferrer">打开来源</a> · score ${esc(x.score||'—')} · attempts ${esc(x.attempts||0)}</div><div>${esc(x.stage||'generation')} / ${esc(x.category||'unknown')}</div>${x.cue_id?`<div>字幕卡：${esc(x.cue_id)}</div>`:''}${x.source_range?`<div>范围：${esc(x.source_range.start)}–${esc(x.source_range.end)}s (${esc(x.source_range.duration)}s)</div>`:''}<div class="checks">${esc(x.last_error||x.reason||'未记录详细错误')}</div>${x.next_retry_at?`<div class="source">下次重试：${esc(x.next_retry_at)}</div>`:''}<div class="actions"><button data-retry="${esc(x.candidate_id)}">Retry Now</button><button class="skip" data-skip="${esc(x.candidate_id)}">Skip</button></div></article>`).join('');grid.querySelectorAll('[data-retry]').forEach(b=>b.addEventListener('click',retryFailure));grid.querySelectorAll('[data-skip]').forEach(b=>b.addEventListener('click',skipFailure))}
-async function retryFailure(e){const id=e.currentTarget.dataset.retry;e.currentTarget.disabled=true;try{const r=await fetch('/api/discovery-retry',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({candidate_id:id})});const data=await r.json();if(!r.ok)throw new Error(data.error||'重试失败');toast('已执行重试：'+(data.status||'完成'));await Promise.all([load(),loadFailures()])}catch(err){toast(err.message);e.currentTarget.disabled=false}}
+async function loadFailures(){const r=await fetch('/api/discovery-failures',{cache:'no-store'});const data=await r.json();csrf=data.csrf_token||csrf;document.querySelector('#failure-count').textContent=data.items.length?`(${data.items.length})`:'';const grid=document.querySelector('#failure-grid');if(!data.items.length){grid.innerHTML='<div class="empty">当前没有需要处理的失败来源。</div>';return}grid.innerHTML=data.items.map(x=>{const task=x.retry_task||{};const busy=['queued','running'].includes(task.status);const done=task.status==='succeeded';const logs=(task.logs||[]).map(row=>`${row.at||''}  ${row.message||''}`).join('\\n');const actions=done?'<div class="source">已生成，稍后会从失败来源列表移除。</div>':`<div class="actions"><button ${busy?'disabled':''} data-retry="${esc(x.candidate_id)}">${busy?'Retry '+esc(task.status):'Retry Now'}</button><button class="skip" ${busy?'disabled':''} data-skip="${esc(x.candidate_id)}">Skip</button></div>`;return `<article class="card"><div class="meta"><span class="pill">${esc(x.channel||'discovery')}</span><span class="state">${esc(task.status||x.status)}</span></div><h2>${esc(x.title||x.candidate_id)}</h2><div class="source"><a href="${esc(x.url)}" target="_blank" rel="noreferrer">打开来源</a> · score ${esc(x.score||'—')} · attempts ${esc(task.attempts??x.attempts??0)}</div><div>${esc(task.stage||x.stage||'generation')} / ${esc(x.category||'unknown')}</div>${task.started_at?`<div class="source">开始：${esc(task.started_at)}</div>`:''}${x.cue_id?`<div>字幕卡：${esc(x.cue_id)}</div>`:''}${x.source_range?`<div>范围：${esc(x.source_range.start)}–${esc(x.source_range.end)}s (${esc(x.source_range.duration)}s)</div>`:''}<div class="checks">${esc(task.last_error||x.last_error||x.reason||'未记录详细错误')}</div>${logs?`<div class="checks">${esc(logs)}</div>`:''}${x.next_retry_at?`<div class="source">下次重试：${esc(x.next_retry_at)}</div>`:''}${actions}</article>`}).join('');grid.querySelectorAll('[data-retry]:not(:disabled)').forEach(b=>b.addEventListener('click',retryFailure));grid.querySelectorAll('[data-skip]:not(:disabled)').forEach(b=>b.addEventListener('click',skipFailure))}
+async function retryFailure(e){const id=e.currentTarget.dataset.retry;e.currentTarget.disabled=true;e.currentTarget.textContent='Retry queued';try{const r=await fetch('/api/discovery-retry',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({candidate_id:id})});const data=await r.json();if(!r.ok)throw new Error(data.error||'重试失败');toast('已加入重试队列');await loadFailures()}catch(err){toast(err.message);e.currentTarget.disabled=false;e.currentTarget.textContent='Retry Now'}}
 async function skipFailure(e){const id=e.currentTarget.dataset.skip;const reason=prompt('请输入跳过原因（必填）');if(!reason||!reason.trim())return;try{const r=await fetch('/api/discovery-skip',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({candidate_id:id,reason:reason.trim()})});const data=await r.json();if(!r.ok)throw new Error(data.error||'跳过失败');toast('已跳过该来源');await loadFailures()}catch(err){toast(err.message)}}
 async function handleAction(e){const b=e.currentTarget;if(b.dataset.action==='review')return reviewOne(b);if(b.dataset.action==='login')return loginOne(b);return publishOne(e)}
 async function reviewOne(b){const rights=b.dataset.reviewCheck==='rights_review';const message=rights?'确认你已完整观看这段访谈，并核对来源署名、片段范围与本次复用依据？此操作只解除 rights_review 门禁，不会发布。':'确认你已完整观看：内容仅从 AI 安全、可解释性与防御研究角度呈现，不提供滥用操作指导？此操作只解除安全人工审核门禁，不会发布。';if(!confirm(message))return;b.disabled=true;b.textContent='正在记录审核…';try{const r=await fetch('/api/review',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({batch_id:b.dataset.batch,item_id:b.dataset.item})});const data=await r.json();if(!r.ok)throw new Error(data.error||'审核记录失败');toast('人工审核已记录；请再次确认后发布');await load()}catch(err){toast(err.message);b.disabled=false;b.textContent='重试审核'}}
 async function loginOne(b){if(!confirm('视频号登录已失效。现在打开受管登录流程，登录成功后继续发布这一条视频？'))return;b.disabled=true;b.textContent='等待视频号登录…';try{const r=await fetch('/api/login-and-publish',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({batch_id:b.dataset.batch,item_id:b.dataset.item})});const data=await r.json();if(!r.ok)throw new Error(data.error||'登录恢复失败');toast(data.published?'登录已恢复，发布完成':'登录或发布未完成：'+(data.error||data.item_state));await load()}catch(err){toast(err.message);b.disabled=false;b.textContent='重试登录恢复'}}
 async function publishOne(e){const b=e.currentTarget;const input=b.closest('.card').querySelector('.schedule input');const raw=input?input.value:'';const schedule=raw?raw.replace('T',' '):null;const action=schedule?`定时到 ${schedule}（北京时间）`:'立即发布';if(!confirm(`确认已完整审核这条视频、标题和来源，并${action}到视频号？`))return;b.disabled=true;b.textContent='正在检查账号并提交…';try{const r=await fetch('/api/publish',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Factory-CSRF':csrf},body:JSON.stringify({batch_id:b.dataset.batch,item_id:b.dataset.item,schedule_at:schedule})});const data=await r.json();if(!r.ok)throw new Error(data.error||'发布失败');toast(data.published?(schedule?'定时发布已提交':'发布完成'):data.requires_login?'登录已失效；请点击登录并继续发布':'提交未成功：'+(data.error||data.item_state));await load()}catch(err){toast(err.message);b.disabled=false;b.textContent='重试发布'}}
-document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.hidden=x.id!==b.dataset.panel)}));Promise.all([load(),loadFailures()]).catch(err=>toast('队列加载失败：'+err.message));setInterval(()=>Promise.all([load(),loadFailures()]),60000);
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.hidden=x.id!==b.dataset.panel)}));Promise.all([load(),loadFailures()]).catch(err=>toast('队列加载失败：'+err.message));setInterval(loadFailures,5000);setInterval(load,60000);
 </script></body></html>"""
