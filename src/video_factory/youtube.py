@@ -2606,7 +2606,7 @@ class NaturalSubtitleTranslator:
                 "Return {cards:[{end_word,text}]}. end_word is an exclusive cumulative index into Source words beginning at 1. It must increase strictly and the final value must equal the supplied word count. Never rewrite, omit, duplicate, or reorder an English word.",
                 f"This exact source window contains {len(window)} words. The final card's end_word MUST be exactly {len(window)}; {len(window) - 1} or any smaller value is invalid and omits source evidence.",
                 "A sentence may continue across adjacent cards. Cut at a natural speech or semantic boundary without stranding a preposition, noun phrase, condition, or entity. Chinese must preserve actors, actions, negation, uncertainty, entities, cause-effect, scope, and numbers except where the supplied audio-conflict evidence strongly supports a different audible number. Remove hesitation and duplicated speech noise without inventing facts.",
-                "Do not translate discourse fillers or sound descriptions. Omit um/uh/erm/hmm, filler uses of like/well/so, you know, and I mean from Chinese while preserving the substantive clause. Never render [laughter], coughing, throat clearing, music, applause, breathing, or similar caption metadata in Chinese.",
+                "Do not translate discourse fillers, emphatic sound interjections, or sound descriptions. Omit um/uh/erm/hmm, filler uses of like/well/so, you know, I mean, and an emphatic 'boom' from Chinese while preserving the substantive clause. Never render [laughter], coughing, throat clearing, music, applause, breathing, or similar caption metadata in Chinese.",
                 "Entity ownership is strict: a product, acronym, company, API, or number may appear in Chinese only when that same card's English word range contains it. Numeric tokens explicitly listed as audio conflicts below are the exception: use the strongly supported nearby audible value on that same semantic card. If a rejected Chinese card moved an entity from a neighbor, either move the English boundary to include the entity or remove it from that Chinese card; never repeat it on both cards.",
                 "The Entity ownership table below is deterministic evidence. Each listed entity may appear only in a Chinese card whose inclusive source range contains one of its word indices. If feedback says moved:X, remove X from the wrong Chinese card or move the boundary over X. If feedback says missing:X, preserve X in its owner card.",
                 "Use the terminology decision and its evidence. alternatives are candidates for the independent reviewer, not a whitelist. A longer phrase owns nested shorter terms. Keep one rendering consistent across the passage.",
@@ -3077,6 +3077,7 @@ class NaturalSubtitleTranslator:
                         {"role": "user", "content": "\n".join([
                             "Independently review this ordered bilingual subtitle partition. Do not rewrite it. Context rows are read-only and must not appear in the response. A sentence may continue naturally across cards; do not require every card to be a standalone proposition.",
                             "Reject only material omissions, inventions, changed modality or scope, misplaced entities, misleading cuts, incomprehensible Chinese, or a contextual term unsupported by the actual actor and actions. Accept faithful natural paraphrases. A preference, optional nuance, or stylistic suggestion is not enough to fail a card. alternatives are candidates, not automatic approvals.",
+                            "The supplied English is the authoritative publishable wording and may contain ASR spelling or spacing artifacts. Never demand that Chinese preserve a broken fragment literally or that English be corrected. Use nearby audio and context to judge the spoken meaning. Natural Chinese may make an implicit head noun or relation explicit when it does not add a new factual claim.",
                             "Reject Chinese that translates discourse fillers or sound metadata. Their omission is intentional and is not a semantic omission.",
                             "Return every core id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. Pass only when both scores are at least 4.",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
@@ -3161,7 +3162,11 @@ class NaturalSubtitleTranslator:
                         {"role": "user", "content": "\n".join([
                             "Check only cross-partition consistency in this already locally reviewed bilingual subtitle sequence. Do not rewrite it.",
                             "Check consistent contextual terminology, entity ownership, adjacent boundary meaning, and cross-card duplication or omission. Return {pass,issues:[{ids,errors}]}. pass=true requires an empty issues array. Every issue id must come from Sequence.",
+                            "The English sequence is authoritative and may retain ASR spelling/spacing artifacts. Do not reject faithful Chinese for resolving an obvious spoken form such as 'verse' meaning 'versus', for preserving the exact English name spelling, or for adding a grammatically implicit head noun without a new factual claim. Audio ASR is read-only meaning evidence and never changes the English rows.",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                            "Audio ASR hypothesis: " + audio_evidence_for_window(
+                                spans[0][0], spans[-1][1],
+                            ),
                             (
                                 "The previous global response failed deterministic structure validation: "
                                 + json.dumps(global_failures[-1], ensure_ascii=False)
@@ -3254,6 +3259,9 @@ class NaturalSubtitleTranslator:
                         "source": cards[index + 1].source_text,
                         "chinese": cards[index + 1].translation,
                     } if index + 1 < len(cards) else None),
+                    "audio_hypothesis": audio_evidence_for_window(
+                        spans[index][0], spans[index][1],
+                    ),
                 } for index, errors in sorted(problems.items())]
                 expected_ids = {row["id"] for row in failed_rows}
                 adjudication_attempts: list[dict[str, Any]] = []
@@ -3264,6 +3272,7 @@ class NaturalSubtitleTranslator:
                         {"role": "user", "content": "\n".join([
                             "Independently adjudicate the remaining subtitle review rejections after bounded repair. Do not rewrite any text.",
                             "Judge only whether each prior error identifies a material omission, invention, changed actor/modality/scope, misplaced entity, misleading cut, or incomprehensible Chinese. A sentence may continue across cards. Dismiss preferences, optional connective wording, tentative 'may affect' concerns, and an error that says the translation has no problem.",
+                            "English is authoritative but may contain ASR spelling or spacing artifacts. Use each row's audio_hypothesis and context to judge spoken meaning; do not demand literal Chinese for a broken fragment, an English spelling correction, or removal of a natural implicit Chinese head noun when no factual claim was added.",
                             "Return every id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. pass=true means the unchanged card and its boundary are publication-ready and errors must be empty. pass=false requires concise material errors. Both scores must be 1–5.",
                             (
                                 "The previous adjudication response failed deterministic structure validation: "
@@ -3501,6 +3510,9 @@ class NaturalSubtitleTranslator:
                         for error in last_problems[index]
                     )
                 )
+                freeze_semantic_boundaries = (
+                    repair_round >= 3 and not requires_extra_card
+                )
                 replacement, provenance = request_window(
                     word_start, word_end, previous, following, rejection,
                     repair_round + 1,
@@ -3508,9 +3520,9 @@ class NaturalSubtitleTranslator:
                     mandatory_split_ranges=mandatory_split_ranges,
                     required_boundaries=(
                         tuple(spans[index][1] for index in range(start, end - 1))
-                        if repair_round >= 3 else ()
+                        if freeze_semantic_boundaries else ()
                     ),
-                    freeze_boundaries=repair_round >= 3,
+                    freeze_boundaries=freeze_semantic_boundaries,
                 )
                 repaired.extend(replacement)
                 repair_traces.append({
@@ -5304,6 +5316,11 @@ def omit_spoken_fillers_from_translation(source: str, translation: str) -> str:
         cleaned = re.sub(r"(?:你知道(?:吗)?|大家知道)[，,、。.!？?\s]*", "", cleaned)
     if re.search(r"\bi mean\b", lowered):
         cleaned = re.sub(r"(?:我是说|我的意思是)[，,、。.!？?\s]*", "", cleaned)
+    if re.match(r"^\s*boom\b", lowered):
+        cleaned = re.sub(
+            r"^(?:boom|砰(?:的?一声|一下)?|嘭(?:的?一声|一下)?)[，,、。.!！？?\s]*",
+            "", cleaned, flags=re.IGNORECASE,
+        )
     if re.search(r"\b(?:um+|uh+|erm+|hmm+|mm+)\b[\s,.;:!?-]*$", lowered):
         cleaned = re.sub(r"[，,、。.!？?\s]*(?:嗯+|呃+|额+|啊+|唔+|呢)[，,、。.!？?\s]*$", "", cleaned)
     cleaned = re.sub(r"[，,、]+(?=[。.!！？?])", "", cleaned)

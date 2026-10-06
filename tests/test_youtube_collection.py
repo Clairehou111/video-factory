@@ -4754,6 +4754,14 @@ class YouTubeCollectionTest(unittest.TestCase):
             "这是我们刚才讨论的图表。",
         )
 
+    def test_spoken_boom_interjection_is_not_published_in_chinese(self) -> None:
+        self.assertEqual(
+            omit_spoken_fillers_from_translation(
+                "Boom, here it is right here.", "boom，就在这里。",
+            ),
+            "就在这里。",
+        )
+
     def test_wechat_hook_keeps_interview_source_chronological(self) -> None:
         hook = HookSpec(
             "hook-1", HookStrategy.CONTRARIAN, "团队扩展不能只靠工具",
