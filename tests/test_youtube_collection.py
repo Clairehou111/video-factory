@@ -2704,11 +2704,13 @@ class YouTubeCollectionTest(unittest.TestCase):
         class Reviewer:
             def __init__(self) -> None:
                 self.adjudicated = False
+                self.adjudication_prompt = ""
 
             def _request_json(self, messages, **kwargs):
                 prompt = messages[-1]["content"]
                 if "Prior rejected rows: " in prompt:
                     self.adjudicated = True
+                    self.adjudication_prompt = prompt
                     rows = json.loads(prompt.split("Prior rejected rows: ", 1)[1])
                     return {"reviews": [{
                         "id": row["id"], "pass": True,
@@ -2737,6 +2739,8 @@ class YouTubeCollectionTest(unittest.TestCase):
         ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
 
         self.assertTrue(reviewer.adjudicated)
+        self.assertIn("nearest noun", reviewer.adjudication_prompt)
+        self.assertIn("earns revenue", reviewer.adjudication_prompt)
         self.assertEqual(writer.calls, 5)
         final_review = trace["attempts"][-1]["review_provenance"]
         self.assertEqual(

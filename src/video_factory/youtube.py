@@ -3352,6 +3352,7 @@ class NaturalSubtitleTranslator:
                             "Independently adjudicate the remaining subtitle review rejections after bounded repair. Do not rewrite any text.",
                             "Judge only whether each prior error identifies a material omission, invention, changed actor/modality/scope, misplaced entity, misleading cut, or incomprehensible Chinese. A sentence may continue across cards. Dismiss preferences, optional connective wording, tentative 'may affect' concerns, and an error that says the translation has no problem.",
                             "A prior error may itself contradict its claimed referent or actor. Resolve pronouns from the complete previous/current/next causal context. If you retain the error, state exactly one supported referent and one concrete semantic mismatch; do not repeat incompatible alternatives from the prior prose.",
+                            "Do not assign a pronoun to the nearest noun by default. Follow the discourse subject and causal chain, including who earns revenue, loses profit, makes a decision, or is affected; organizations may use singular-they pronouns. Prefer the interpretation that makes the surrounding mechanism coherent.",
                             "English is authoritative but may contain ASR spelling or spacing artifacts. Use each row's audio_hypothesis and context to judge spoken meaning; do not demand literal Chinese for a broken fragment, an English spelling correction, or removal of a natural implicit Chinese head noun when no factual claim was added.",
                             "Return every id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. pass=true means the unchanged card and its boundary are publication-ready and errors must be empty. pass=false requires concise material errors. Both scores must be 1–5.",
                             (
@@ -3502,7 +3503,7 @@ class NaturalSubtitleTranslator:
         last_problems: dict[int, list[str]] = {}
         final_cards: list[TranscriptCue] = []
         review_provenance: dict[str, Any] | None = None
-        for repair_round in range(7):
+        for repair_round in range(9):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
                 attempts.append({
@@ -3528,7 +3529,7 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
-            if repair_round == 6:
+            if repair_round == 8:
                 break
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
@@ -3632,7 +3633,7 @@ class NaturalSubtitleTranslator:
         if last_problems:
             raise InterviewJointTranslationError(
                 "interview joint translation exhausted three movable-boundary repairs "
-                "and three fixed-boundary semantic repairs: "
+                "and five fixed-boundary semantic repairs: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:
