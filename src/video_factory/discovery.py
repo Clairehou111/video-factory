@@ -3663,7 +3663,14 @@ class ResourceDiscoveryService:
                 )
                 retry_fresh_plan = (
                     retry_mode == "full_generation"
-                    and isinstance(error, ContentAgentError)
+                    and (
+                        isinstance(error, ContentAgentError)
+                        or (
+                            isinstance(error, ValueError)
+                            and "translation plan transcript does not match"
+                            in str(error)
+                        )
+                    )
                 )
                 retryable_error = _retryable_adoption_error(error)
                 attempts.append({
@@ -3687,7 +3694,10 @@ class ResourceDiscoveryService:
                         manifest = self._latest_failed_manifest(item.url)
                 if item.channel == DiscoveryChannel.YOUTUBE:
                     youtube_media, youtube_subtitles = self._latest_youtube_assets(item.url)
-                    youtube_translation_plan = self._latest_youtube_translation_plan(item.url)
+                    youtube_translation_plan = (
+                        None if retry_fresh_plan
+                        else self._latest_youtube_translation_plan(item.url)
+                    )
                 if isinstance(error, (NameError, UnboundLocalError, SyntaxError, ImportError)):
                     attempts[-1]["recovery"] = "stop_non_retryable_internal_error"
                     break

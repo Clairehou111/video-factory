@@ -3236,7 +3236,7 @@ class NaturalSubtitleTranslator:
                     errors = [str(value) for value in raw_errors] \
                         if isinstance(raw_errors, list) else [str(raw_errors)]
                     problems.setdefault(index, []).extend(errors)
-            if repair_round == 4 and problems:
+            if repair_round >= 4 and problems:
                 # The translator has already had three movable-boundary repairs
                 # plus one exact-card retranslation. Ask the independent reviewer
                 # to adjudicate its remaining rejections once, so tentative or
@@ -3413,7 +3413,7 @@ class NaturalSubtitleTranslator:
         last_problems: dict[int, list[str]] = {}
         final_cards: list[TranscriptCue] = []
         review_provenance: dict[str, Any] | None = None
-        for repair_round in range(5):
+        for repair_round in range(6):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
                 attempts.append({
@@ -3439,7 +3439,7 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
-            if repair_round == 4:
+            if repair_round == 5:
                 break
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
@@ -3508,9 +3508,9 @@ class NaturalSubtitleTranslator:
                     mandatory_split_ranges=mandatory_split_ranges,
                     required_boundaries=(
                         tuple(spans[index][1] for index in range(start, end - 1))
-                        if repair_round == 3 else ()
+                        if repair_round >= 3 else ()
                     ),
-                    freeze_boundaries=repair_round == 3,
+                    freeze_boundaries=repair_round >= 3,
                 )
                 repaired.extend(replacement)
                 repair_traces.append({
@@ -3533,14 +3533,14 @@ class NaturalSubtitleTranslator:
                 "round": repair_round + 1,
                 "kind": (
                     "fixed_boundary_semantic_repair"
-                    if repair_round == 3 else "local_joint_repair"
+                    if repair_round >= 3 else "local_joint_repair"
                 ),
                 "windows": repair_traces,
             })
         if last_problems:
             raise InterviewJointTranslationError(
                 "interview joint translation exhausted three movable-boundary repairs "
-                "and one fixed-boundary semantic repair: "
+                "and two fixed-boundary semantic repairs: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:
@@ -6405,6 +6405,16 @@ def _caption_numeric_alignment_errors(
         for index in range(start_word, end_word)
         for number in values(source_words[index].raw)
     ]
+    inherited_percent_indices: set[int] = set()
+    for occurrence_index, (index, number) in enumerate(occurrences):
+        if number.endswith("%"):
+            continue
+        for later_index, later_number in occurrences[occurrence_index + 1:]:
+            if later_index - index > 3:
+                break
+            if later_number.endswith("%"):
+                inherited_percent_indices.add(index)
+                break
     target_counts: dict[str, int] = {}
     for number in values(translation):
         target_counts[number] = target_counts.get(number, 0) + 1
@@ -6412,8 +6422,15 @@ def _caption_numeric_alignment_errors(
     for index, number in occurrences:
         if index in pair_by_index:
             continue
-        if target_counts.get(number, 0):
-            target_counts[number] -= 1
+        accepted = next((
+            candidate for candidate in (
+                number,
+                *((number + "%",) if index in inherited_percent_indices else ()),
+            )
+            if target_counts.get(candidate, 0)
+        ), "")
+        if accepted:
+            target_counts[accepted] -= 1
         else:
             errors.append(f"missing_number:{number}@{index + 1}")
     for index, number in occurrences:

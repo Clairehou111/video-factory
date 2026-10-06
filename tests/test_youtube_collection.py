@@ -3035,6 +3035,21 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_numeric_ownership_accepts_percent_inherited_by_a_range(self) -> None:
+        adjacent = source_words_from_cues([
+            TranscriptCue("cue-1", 0, 3, "70 80% of token usage.")
+        ])
+        connected = source_words_from_cues([
+            TranscriptCue("cue-2", 0, 3, "more than 60 or 70%.")
+        ])
+
+        self.assertEqual(_caption_numeric_alignment_errors(
+            adjacent, 0, len(adjacent), "词元使用量为 70% 到 80%。", [],
+        ), [])
+        self.assertEqual(_caption_numeric_alignment_errors(
+            connected, 0, len(connected), "超过 60% 或 70%。", [],
+        ), [])
+
     def test_numeric_ownership_still_rejects_unrelated_numeric_month(self) -> None:
         words = source_words_from_cues([
             TranscriptCue("cue-1", 0, 3, "The conference is in autumn.")

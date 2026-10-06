@@ -2390,6 +2390,58 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertEqual(options.youtube_subtitles, str(subtitles))
             self.assertEqual(options.youtube_translation_plan, str(translation_plan))
 
+    def test_youtube_adoption_discards_stale_translation_plan_after_mismatch(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            old_job = workspace.root / "jobs" / "old-youtube-plan"
+            old_job.mkdir(parents=True)
+            source_url = "https://www.youtube.com/watch?v=stale123"
+            (old_job / "result.json").write_text(json.dumps({
+                "url": source_url, "status": "failed",
+            }), encoding="utf-8")
+            media = old_job / "stale123.mkv"
+            subtitles = old_job / "stale123.en.json3"
+            translation_plan = old_job / "translation-plan.json"
+            media.write_bytes(b"video")
+            subtitles.write_text("{}", encoding="utf-8")
+            translation_plan.write_text("{}", encoding="utf-8")
+            item = DiscoveryCandidate(
+                id="youtube-stale123", channel=DiscoveryChannel.YOUTUBE,
+                url=source_url, title="Technical interview", publisher="Builder",
+                published_at=NOW.isoformat(), eligible=True, status="needs_human",
+            )
+            factory = FakeFactory([
+                ValueError(
+                    "translation plan transcript does not match the supplied YouTube subtitles"
+                ),
+                {
+                    "status": "completed", "publishable": True,
+                    "collection_manifest": "collection.json",
+                },
+            ])
+            service = ResourceDiscoveryService(
+                workspace, factory=factory, clock=lambda: NOW, sleeper=lambda _: None,
+            )
+
+            result = service._adopt(
+                item, ResourceDiscoveryConfig(retry_backoff_seconds=[0, 0]),
+                "deepseek", None,
+            )
+
+            self.assertEqual(result["status"], "generated")
+            self.assertEqual(len(factory.generate_calls), 2)
+            self.assertEqual(
+                factory.generate_calls[0][1].youtube_translation_plan,
+                str(translation_plan),
+            )
+            self.assertIsNone(
+                factory.generate_calls[1][1].youtube_translation_plan,
+            )
+            self.assertEqual(
+                result["attempts"][0]["recovery"], "retry_fresh_content_plan",
+            )
+
     def test_failed_manifest_scan_ignores_result_removed_by_cleanup(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Workspace(Path(temp))
