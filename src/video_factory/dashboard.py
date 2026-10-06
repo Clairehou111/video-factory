@@ -120,6 +120,7 @@ class PublishDashboard:
         )
         self._active_retry_ids: set[str] = set()
         self._retry_instance = secrets.token_hex(8)
+        self._recover_retry_tasks()
 
     @staticmethod
     def _now_iso() -> str:
@@ -160,6 +161,60 @@ class PublishDashboard:
             })
             self._save_retry_task(task)
         return task
+
+    def _recover_retry_tasks(self) -> None:
+        """Resume queued work left behind when the Dashboard process restarted."""
+        directory = self.workspace.root / "discovery" / "retry-tasks"
+        if not directory.is_dir():
+            return
+        pending: list[dict[str, Any]] = []
+        for path in directory.glob("*.json"):
+            try:
+                task = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, json.JSONDecodeError):
+                continue
+            if (
+                task.get("candidate_id")
+                and task.get("status") in {"queued", "running"}
+                and task.get("instance") != self._retry_instance
+            ):
+                pending.append(task)
+        pending.sort(key=lambda task: (
+            str(task.get("created_at") or ""), str(task.get("candidate_id") or ""),
+        ))
+        for task in pending:
+            candidate_id = str(task["candidate_id"])
+            try:
+                candidate = self.workspace.load_discovery_candidate(candidate_id)
+            except (KeyError, OSError, ValueError, TypeError):
+                continue
+            now = self._now_iso()
+            if str(candidate.get("status") or "") == "generated":
+                task.update({
+                    "status": "succeeded", "stage": "completed",
+                    "updated_at": now, "finished_at": now,
+                    "instance": self._retry_instance, "last_error": "",
+                })
+                task.setdefault("logs", []).append({
+                    "at": now,
+                    "message": "Generation had completed before Dashboard restart",
+                })
+                self._save_retry_task(task)
+                continue
+            task.update({
+                "status": "queued", "stage": "queued", "updated_at": now,
+                "instance": self._retry_instance,
+                "recovery_count": int(task.get("recovery_count") or 0) + 1,
+            })
+            task.pop("finished_at", None)
+            task.pop("last_error", None)
+            task.setdefault("logs", []).append({
+                "at": now, "message": "Retry recovered after Dashboard restart",
+            })
+            task["logs"] = task["logs"][-20:]
+            self._active_retry_ids.add(candidate_id)
+            self._save_retry_task(task)
+            self._retry_executor.submit(self._run_discovery_retry, candidate_id)
 
     def _recent_retry_tasks(self) -> list[dict[str, Any]]:
         directory = self.workspace.root / "discovery" / "retry-tasks"
@@ -840,7 +895,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 chunk = stream.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Browsers routinely close a prior range request when the
+                    # user seeks or leaves the preview. It is not a server error.
+                    return
                 remaining -= len(chunk)
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:

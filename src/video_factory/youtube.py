@@ -6356,6 +6356,22 @@ def _semantic_card_translation_errors(
         errors.append("reading_speed")
     if require_punctuation and translation and not re.search(r"[。！？!?]$", translation):
         errors.append("punctuation")
+    copied_asr_fragments: set[str] = set()
+    for token in source.split():
+        candidate = token.strip(".,!?;:'\"")
+        if (
+            re.fullmatch(r"\d+[a-z]{3,}", candidate, re.IGNORECASE)
+            and re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(candidate)}(?![A-Za-z0-9])",
+                translation,
+                re.IGNORECASE,
+            )
+        ):
+            copied_asr_fragments.add(candidate.casefold())
+    errors.extend(
+        f"copied_asr_fragment:{fragment}"
+        for fragment in sorted(copied_asr_fragments)
+    )
     errors.extend(_caption_entity_alignment_errors(
         source, translation, terminology, audio_conflict_entities,
     ))
@@ -6454,6 +6470,27 @@ def _caption_numeric_alignment_errors(
         pair = pair_by_index.get(index)
         if pair is None:
             continue
+        split_candidates = [
+            str(candidate).replace("％", "%")
+            for candidate in pair.get("audio_candidates", [])
+            if str(candidate)
+        ]
+        if split_candidates:
+            required_counts = {
+                candidate: split_candidates.count(candidate)
+                for candidate in set(split_candidates)
+            }
+            if all(
+                target_counts.get(candidate, 0) >= count
+                for candidate, count in required_counts.items()
+            ):
+                for candidate, count in required_counts.items():
+                    target_counts[candidate] -= count
+                continue
+            errors.append(
+                f"missing_number:{number}|{'/'.join(split_candidates)}@{index + 1}"
+            )
+            continue
         candidates = [
             str(pair.get("audio_candidate") or "").replace("％", "%"), number,
         ]
@@ -6495,7 +6532,7 @@ def _caption_numeric_alignment_errors(
 def _numeric_audio_conflict_pairs(
     source_words: list[SourceWord], audio_hypothesis: str,
 ) -> list[dict[str, Any]]:
-    """Pair one changed number on each side only inside the same aligned replace span."""
+    """Pair locally aligned numeric replacements, including proven joined tokens."""
     hypothesis_words = re.findall(r"\S+", audio_hypothesis)
     source_norm = [word.normalized for word in source_words]
     hypothesis_norm = [
@@ -6532,16 +6569,25 @@ def _numeric_audio_conflict_pairs(
             for index in range(audio_start, audio_end)
             if number(hypothesis_words[index])
         ]
-        if (
-            len(source_numbers) != 1 or len(audio_numbers) != 1
-            or source_numbers[0][1] == audio_numbers[0][1]
-        ):
+        if len(source_numbers) != 1 or not audio_numbers:
             continue
         source_index, source_value = source_numbers[0]
-        audio_index, audio_value = audio_numbers[0]
+        audio_values = [value for _, value in audio_numbers]
+        if len(audio_values) == 1:
+            if source_value == audio_values[0]:
+                continue
+        elif "".join(audio_values) != source_value:
+            # A one-to-many exception is safe only when the audio merely adds
+            # separators to one source token; it cannot introduce new digits.
+            continue
+        audio_index = audio_numbers[0][0]
+        audio_value = (
+            audio_values[0] if len(audio_values) == 1 else "/".join(audio_values)
+        )
         pairs.append({
             "source_value": source_value,
             "audio_candidate": audio_value,
+            "audio_candidates": audio_values if len(audio_values) > 1 else [],
             "source_word_index": source_index + 1,
             "audio_word_index": audio_index + 1,
             "source_context": " ".join(
@@ -6554,7 +6600,11 @@ def _numeric_audio_conflict_pairs(
                     max(0, audio_index - 5):min(len(hypothesis_words), audio_index + 6)
                 ]
             ),
-            "basis": "single-number aligned replacement",
+            "basis": (
+                "joined source number split by locally aligned audio"
+                if len(audio_values) > 1
+                else "single-number aligned replacement"
+            ),
         })
     return pairs
 

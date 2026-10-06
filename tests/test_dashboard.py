@@ -516,6 +516,72 @@ class DashboardTest(unittest.TestCase):
             self.assertFalse(rows[0]["retry_eligible"])
             self.assertIn("Generation completed", str(rows[0]["retry_task"]["logs"]))
 
+    def test_dashboard_restart_recovers_queued_and_running_retries(self) -> None:
+        class RecoveredDiscoveryService:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.finished = threading.Event()
+
+            def adopt_candidate(self, candidate_id, config):
+                self.calls.append(candidate_id)
+                if len(self.calls) == 2:
+                    self.finished.set()
+                return {
+                    "status": "blocked", "last_error": "still needs repair",
+                    "attempts": [{"status": "failed"}],
+                }
+
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            old = PublishDashboard(workspace)
+            state_rows = []
+            for index, status in enumerate(("running", "queued"), start=1):
+                candidate_id = f"youtube-recover-{index}"
+                workspace.save_discovery_candidate({
+                    "id": candidate_id, "channel": "youtube",
+                    "url": f"https://youtube.com/watch?v=recover-{index}",
+                    "title": candidate_id, "eligible": True,
+                    "status": "needs_human", "metadata": {},
+                })
+                state_rows.append({
+                    "candidate_id": candidate_id, "channel": "youtube",
+                    "title": candidate_id, "status": "needs_human",
+                })
+                old._save_retry_task({
+                    "candidate_id": candidate_id, "status": status,
+                    "stage": "generation" if status == "running" else "queued",
+                    "created_at": old._now_iso(), "updated_at": old._now_iso(),
+                    "instance": "dead-dashboard", "logs": [],
+                })
+                time.sleep(0.001)
+            workspace.save_discovery_state({
+                "channels": {}, "generated_events": [], "history": [],
+                "skipped_ids": [], "needs_human_candidates": state_rows,
+            })
+
+            service = RecoveredDiscoveryService()
+            dashboard = PublishDashboard(workspace, discovery_service=service)
+            self.assertTrue(service.finished.wait(timeout=2))
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                rows = dashboard.discovery_failures()
+                if len(rows) == 2 and all(
+                    row.get("retry_task", {}).get("status") == "failed"
+                    for row in rows
+                ):
+                    break
+                time.sleep(0.01)
+
+            self.assertEqual(service.calls, ["youtube-recover-1", "youtube-recover-2"])
+            self.assertTrue(all(
+                row["retry_task"]["recovery_count"] == 1 for row in rows
+            ))
+            self.assertTrue(all(
+                "recovered after Dashboard restart" in str(row["retry_task"]["logs"])
+                for row in rows
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

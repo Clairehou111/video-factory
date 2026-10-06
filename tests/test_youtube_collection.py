@@ -2994,6 +2994,34 @@ class YouTubeCollectionTest(unittest.TestCase):
         )
         self.assertEqual(ambiguous, [])
 
+    def test_numeric_audio_conflict_accepts_proven_joined_ratio(self) -> None:
+        words = source_words_from_cues([TranscriptCue(
+            "cue-1", 0, 6,
+            "Token use flipped from 8020 closed versus open today.",
+        )])
+        pairs = _numeric_audio_conflict_pairs(
+            words,
+            "Token use flipped from 80 20 closed versus open today.",
+        )
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["source_value"], "8020")
+        self.assertEqual(pairs[0]["audio_candidates"], ["80", "20"])
+        self.assertEqual(_caption_numeric_alignment_errors(
+            words, 0, len(words), "词元使用量从 80/20 闭源对开源翻转。", pairs,
+        ), [])
+
+        repeated_words = source_words_from_cues([TranscriptCue(
+            "cue-2", 0, 4, "The ratio changed from 11 today.",
+        )])
+        repeated_pairs = [{
+            "source_word_index": 5, "source_value": "11",
+            "audio_candidate": "1/1", "audio_candidates": ["1", "1"],
+        }]
+        self.assertIn("missing_number:11|1/1@5", _caption_numeric_alignment_errors(
+            repeated_words, 0, len(repeated_words), "比例变成 1。", repeated_pairs,
+        ))
+
     def test_numeric_ownership_rejects_missing_and_moved_values(self) -> None:
         words = source_words_from_cues([
             TranscriptCue("cue-1", 0, 3, "The cost is 93 dollars."),
@@ -3020,6 +3048,12 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertNotIn("missing_number:10@8", errors)
         self.assertFalse(any(error.startswith("missing_number:10") for error in errors))
+
+        semantic_errors = _semantic_card_translation_errors({
+            "id": "cue-1", "source": "It was a 10erson startup.",
+            "duration_seconds": 3,
+        }, "那是一家 10erson 初创公司。", [], require_punctuation=False)
+        self.assertIn("copied_asr_fragment:10erson", semantic_errors)
 
     def test_numeric_ownership_accepts_english_month_as_numeric_chinese_month(self) -> None:
         words = source_words_from_cues([

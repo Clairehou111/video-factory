@@ -4,7 +4,7 @@
 
 | 环节 | 当前处理 | 主要决策者 |
 | --- | --- | --- |
-| 0. 监测与接纳 | 搜索、去重、来源及受众评分；失败候选进入重试或人工审核。Dashboard 手动重试进入单 worker 队列，立即持久化 `queued/running/succeeded/failed/interrupted`、阶段和短日志，避免同时点击时并发覆盖 discovery state；页面每 5 秒轮询。直接 `generate URL` 可跳过发现。 | 确定性状态机 |
+| 0. 监测与接纳 | 搜索、去重、来源及受众评分；失败候选进入重试或人工审核。Dashboard 手动重试进入单 worker 队列，立即持久化 `queued/running/succeeded/failed/interrupted`、阶段和短日志，避免同时点击时并发覆盖 discovery state；页面每 5 秒轮询。Dashboard 重启后按原 `created_at` 顺序恢复遗留的 queued/running 任务；若候选在退出前已生成则直接收敛为 succeeded。直接 `generate URL` 可跳过发现。 | 确定性状态机 |
 | 1. 采集证据 | 获取 metadata 和英文 `json3`，保存原件与哈希。`TranscriptCue` 只是带时间的采集片段，不等于完整句子或最终字幕卡。 | yt-dlp、确定性解析 |
 | 2. 路线分类 | 根据标题、频道、描述、章节和人物识别技术讲座、人物访谈、可信长会议或 study；显式模式可覆盖。 | 确定性分类 |
 | 3. 策划选段 | 选择高光、标题、Hook、连续源区间及少量视频级术语；确定性合同检查范围和字段。 | 策划 LLM + 确定性合同 |
@@ -19,7 +19,7 @@
 ## 访谈字幕合同
 
 - `SourceWord` 保存稳定 ID、原始词、规范化词、经验证的 JSON3 逐词时间、可选音频时间、状态和置信度。最终卡片是连续 `[start_word, end_word)`；内部显示边界取相邻词时间的中点。只有 fragment 无时间、词序不能精确重建、时间越界或不单调时，才退回 cue 内线性插值；trace 分别统计 `json3_timed_words` 与 `linear_fallback_words`。
-- YouTube 英文是发布文本来源。stable-ts 对齐现有英文，并为访谈选中时间窗生成独立只读 ASR hypothesis；低置信度、实体冲突和数字冲突在首次翻译前显式列为证据，不能静默改写英文卡。数字候选必须由同一个局部 `SequenceMatcher` replacement、唯一源数字、唯一音频数字及两侧稳定锚点共同证明；全局 source-only/audio-only 集合只作诊断。确定性数字 ownership 不把 `10erson` 这类与字母粘连的 ASR 残片当数字；允许同卡英语月份按中文惯例写成数字月份（如 `September` → `9 月`），并允许范围尾部的 `%` 在自然中文中补到前项（如 `70 80%` → `70% 到 80%`），但没有对应月份或同卡百分比范围的新增数字仍失败。对齐结果必须全局单调并落在片段范围内，否则整段降级。媒体 SHA-256、SourceWord 账本哈希、stable-ts 提交/模型、音频 hypothesis 哈希和对齐策略进入证据指纹；完整词账本与 hypothesis 另存为 `source-word-ledger.json`。
+- YouTube 英文是发布文本来源。stable-ts 对齐现有英文，并为访谈选中时间窗生成独立只读 ASR hypothesis；低置信度、实体冲突和数字冲突在首次翻译前显式列为证据，不能静默改写英文卡。数字候选必须由同一个局部 `SequenceMatcher` replacement、唯一源数字及两侧稳定锚点共同证明；通常只接受唯一音频数字，音频把一个粘连数字拆成多个数字时，只有各项按序拼接后与源数字完全相同才允许按拆分后的数值翻译（如源 `8020`、音频 `80 20`、译文 `80/20`）。全局 source-only/audio-only 集合只作诊断。确定性数字 ownership 不把 `10erson` 这类与字母粘连的 ASR 残片当数字，同时禁止把这种“数字+长小写字母”残片原样复制进中文；允许同卡英语月份按中文惯例写成数字月份（如 `September` → `9 月`），并允许范围尾部的 `%` 在自然中文中补到前项（如 `70 80%` → `70% 到 80%`），但没有对应月份或同卡百分比范围的新增数字仍失败。对齐结果必须全局单调并落在片段范围内，否则整段降级。媒体 SHA-256、SourceWord 账本哈希、stable-ts 提交/模型、音频 hypothesis 哈希和对齐策略进入证据指纹；完整词账本与 hypothesis 另存为 `source-word-ledger.json`。
 - 22 个阅读单位是生成目标，不是硬上限。已删除 32 字门；硬门只有实际像素/三行、时长、英文词数和每秒 12 个阅读单位。混排英文按词计数，因此 `Palo Alto Networks` 计 3 个阅读单位，而不是按 16 个字母制造虚假的超速失败。
 - 中文只承载实质语义：`um`、`uh`、`you know`、`I mean`、作为话语填充的 `like/well/so` 及只作强调音效的句首 `boom` 不翻译；`[laughter]`、咳嗽、清嗓、音乐、掌声、呼吸等非语音说明从可发布卡排除。填充清理发生在独立审稿前，reviewer 把这些省略视为有意编辑，不判为漏译。
 - 审稿按有序序列判断语义，不改写文案。YouTube 英文仍是发布权威文本，但审稿会结合只读音频 hypothesis 理解其中明显的 ASR 拼写/空格残片，不要求中文逐字保留坏片段，也不要求改写英文；没有新增事实时，自然中文补出隐含中心词不算发明。修复只能由翻译模型在失败局部窗口完成；正常卡不会被全片 style repair 再次改写。

@@ -45,7 +45,7 @@ video-factory --workspace workspace dashboard --actor claire
 # 浏览器打开 http://127.0.0.1:8765，预览后点击每张卡片的“确认并发布”
 ```
 
-同一 manifest 重复 `pipeline` 复用现有批次；YouTube 合集需先完成复用依据审核（否则 `blocked`）。Dashboard 只绑 loopback（http://127.0.0.1:8765），逐条预览真实 MP4、填北京时间定时发布（至少提前 2 小时）并单独确认，不会连带提交同批其他视频。失败来源的 `Retry Now` 进入单 worker 后台队列；页面每 5 秒显示 queued/running/final 状态、阶段和短日志，多条点击按顺序执行。
+同一 manifest 重复 `pipeline` 复用现有批次；YouTube 合集需先完成复用依据审核（否则 `blocked`）。Dashboard 只绑 loopback（http://127.0.0.1:8765），逐条预览真实 MP4、填北京时间定时发布（至少提前 2 小时）并单独确认，不会连带提交同批其他视频。失败来源的 `Retry Now` 进入单 worker 后台队列；页面每 5 秒显示 queued/running/final 状态、阶段和短日志，多条点击按顺序执行。Dashboard 重启后会按原排队时间自动恢复尚未完成的任务。
 
 ### macOS 持续运行
 
