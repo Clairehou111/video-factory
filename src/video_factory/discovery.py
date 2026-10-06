@@ -3667,8 +3667,10 @@ class ResourceDiscoveryService:
                         isinstance(error, ContentAgentError)
                         or (
                             isinstance(error, ValueError)
-                            and "translation plan transcript does not match"
-                            in str(error)
+                            and any(marker in str(error) for marker in (
+                                "translation plan transcript does not match",
+                                "interview joint translation has no source words",
+                            ))
                         )
                     )
                 )
@@ -3698,6 +3700,12 @@ class ResourceDiscoveryService:
                         None if retry_fresh_plan
                         else self._latest_youtube_translation_plan(item.url)
                     )
+                    if retry_fresh_plan:
+                        # A reused interview asset may be a bounded local clip
+                        # whose original timeline is known only by the discarded
+                        # plan. Redownload the newly selected range rather than
+                        # guessing provenance from its duration.
+                        youtube_media = None
                 if isinstance(error, (NameError, UnboundLocalError, SyntaxError, ImportError)):
                     attempts[-1]["recovery"] = "stop_non_retryable_internal_error"
                     break
@@ -3804,7 +3812,12 @@ class ResourceDiscoveryService:
                 continue
             plan = result_path.parent / "translation-plan.json"
             if plan.is_file():
-                return plan
+                try:
+                    cached = json.loads(plan.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, TypeError):
+                    continue
+                if cached.get("transcript"):
+                    return plan
         return None
 
     def _latest_failed_manifest(self, source_url: str) -> Path | None:

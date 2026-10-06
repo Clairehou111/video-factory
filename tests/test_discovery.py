@@ -2365,7 +2365,9 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             translation_plan = old_job / "translation-plan.json"
             media.write_bytes(b"video")
             subtitles.write_text("{}", encoding="utf-8")
-            translation_plan.write_text("{}", encoding="utf-8")
+            translation_plan.write_text(json.dumps({
+                "transcript": [{"id": "cue-1", "source_text": "source"}],
+            }), encoding="utf-8")
             item = DiscoveryCandidate(
                 id="youtube-tech123", channel=DiscoveryChannel.YOUTUBE,
                 url=source_url, title="Agent SDK architecture tutorial",
@@ -2405,7 +2407,9 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             translation_plan = old_job / "translation-plan.json"
             media.write_bytes(b"video")
             subtitles.write_text("{}", encoding="utf-8")
-            translation_plan.write_text("{}", encoding="utf-8")
+            translation_plan.write_text(json.dumps({
+                "transcript": [{"id": "cue-1", "source_text": "source"}],
+            }), encoding="utf-8")
             item = DiscoveryCandidate(
                 id="youtube-stale123", channel=DiscoveryChannel.YOUTUBE,
                 url=source_url, title="Technical interview", publisher="Builder",
@@ -2438,9 +2442,32 @@ OpenAI launches an AI model. A physical AI robotics startup publishes a benchmar
             self.assertIsNone(
                 factory.generate_calls[1][1].youtube_translation_plan,
             )
+            self.assertIsNone(factory.generate_calls[1][1].youtube_media)
+            self.assertEqual(
+                factory.generate_calls[1][1].youtube_subtitles, str(subtitles),
+            )
             self.assertEqual(
                 result["attempts"][0]["recovery"], "retry_fresh_content_plan",
             )
+
+    def test_latest_youtube_translation_plan_skips_empty_failed_transcript(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Workspace(Path(temp))
+            workspace.initialize()
+            job = workspace.root / "jobs" / "empty-interview-plan"
+            job.mkdir(parents=True)
+            source_url = "https://youtube.com/watch?v=empty123"
+            (job / "result.json").write_text(json.dumps({
+                "url": source_url, "status": "failed",
+            }), encoding="utf-8")
+            (job / "translation-plan.json").write_text(json.dumps({
+                "editorial_mode": "known_tech_interview_clip",
+                "transcript": [],
+            }), encoding="utf-8")
+
+            service = ResourceDiscoveryService(workspace)
+
+            self.assertIsNone(service._latest_youtube_translation_plan(source_url))
 
     def test_failed_manifest_scan_ignores_result_removed_by_cleanup(self) -> None:
         with TemporaryDirectory() as temp:
