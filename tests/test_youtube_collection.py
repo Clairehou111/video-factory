@@ -3523,6 +3523,21 @@ class YouTubeCollectionTest(unittest.TestCase):
             ], terminology),
             [],
         )
+
+    def test_unlisted_acronym_meaning_is_left_to_semantic_review(self) -> None:
+        self.assertEqual(
+            _caption_entity_alignment_errors(
+                "It did not pan out on the VC side.", "风投方面没有成功。", [],
+            ),
+            [],
+        )
+        self.assertIn(
+            "missing:VC",
+            _caption_entity_alignment_errors(
+                "It did not pan out on the VC side.", "风投方面没有成功。",
+                [TerminologyEntry("VC", TerminologyStrategy.PRESERVE)],
+            ),
+        )
         phrase_terminology = [TerminologyEntry(
             "RL environments", TerminologyStrategy.TRANSLATE,
             target="强化学习环境",

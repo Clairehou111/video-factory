@@ -2544,9 +2544,7 @@ class NaturalSubtitleTranslator:
                 "source_word_index": int(row["source_word_index"]) - start_word,
             } for row in numeric_conflict_pairs
                 if start_word < int(row["source_word_index"]) <= end_word]
-            ownership_terms = set(_uppercase_source_entities(
-                " ".join(word.raw for word in window)
-            ))
+            ownership_terms: set[str] = set()
             ownership_terms.update(
                 entry.source for entry in terminology
                 if entry.strategy == TerminologyStrategy.PRESERVE
@@ -6520,17 +6518,22 @@ def _caption_entity_alignment_errors(
     for entity in source_entities:
         if entity in (audio_conflict_entities or set()):
             continue
-        contextual_targets = tuple(
-            entry.target for entry in (terminology or [])
-            if entry.strategy == TerminologyStrategy.TRANSLATE
-            and entry.target.strip()
-            and (
+        relevant_entries = [
+            entry for entry in (terminology or [])
+            if (
                 entry.source.casefold() == entity.casefold()
                 or (
                     _contains_term(entry.source, entity)
                     and _contains_term(source, entry.source)
                 )
             )
+        ]
+        if not relevant_entries:
+            continue
+        contextual_targets = tuple(
+            entry.target for entry in relevant_entries
+            if entry.strategy == TerminologyStrategy.TRANSLATE
+            and entry.target.strip()
         )
         aliases = (*CAPTION_ENTITY_ALIASES.get(entity, (entity,)), *contextual_targets)
         if not any(alias in translation for alias in aliases):
