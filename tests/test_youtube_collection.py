@@ -2682,27 +2682,31 @@ class YouTubeCollectionTest(unittest.TestCase):
         class Reviewer:
             def __init__(self, writer) -> None:
                 self.writer = writer
+                self.local_ids: list[str] = []
 
             def _request_json(self, messages, **kwargs):
                 prompt = messages[-1]["content"]
                 if "Sequence: " in prompt:
                     return {"pass": True, "issues": []}, {"model": "reviewer-global"}
                 rows = json.loads(prompt.split("Rows: ", 1)[1])
+                self.local_ids.extend(row["id"] for row in rows)
                 return {"reviews": [{
-                    "id": row["id"], "pass": self.writer.fixed or index != 1,
-                    "fidelity_score": 5 if self.writer.fixed or index != 1 else 2,
-                    "naturalness_score": 5 if self.writer.fixed or index != 1 else 3,
-                    "errors": [] if self.writer.fixed or index != 1 else [
+                    "id": row["id"],
+                    "pass": self.writer.fixed or row["id"] != "interview-card-2",
+                    "fidelity_score": 5 if self.writer.fixed or row["id"] != "interview-card-2" else 2,
+                    "naturalness_score": 5 if self.writer.fixed or row["id"] != "interview-card-2" else 3,
+                    "errors": [] if self.writer.fixed or row["id"] != "interview-card-2" else [
                         "跨卡边界语义错位：中文提前使用了下一卡的含义。",
                     ],
-                } for index, row in enumerate(rows)]}, {"model": "reviewer"}
+                } for row in rows]}, {"model": "reviewer"}
 
         source = " ".join(f"word{index}" for index in range(1, 31))
         cues = [TranscriptCue("cue-1", 0, 18, source)]
         writer = Writer()
+        reviewer = Reviewer(writer)
 
         trace = NaturalSubtitleTranslator(
-            writer, subtitle_reviewer=Reviewer(writer),
+            writer, subtitle_reviewer=reviewer,
         ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
 
         self.assertTrue(writer.fixed)
@@ -2717,6 +2721,10 @@ class YouTubeCollectionTest(unittest.TestCase):
             .split(". When this list", 1)[0]
         )
         self.assertEqual(len(fixed_rows), 1)
+        failed_reviews = reviewer.local_ids.count("interview-card-2")
+        self.assertLess(reviewer.local_ids.count("interview-card-1"), failed_reviews)
+        self.assertGreater(failed_reviews, 1)
+        self.assertLess(reviewer.local_ids.count("interview-card-3"), failed_reviews)
         self.assertEqual(trace["repair_rounds"], 3)
         self.assertEqual(trace["attempts"][-1]["kind"], "validation_and_review")
         self.assertTrue(any(
@@ -2767,13 +2775,13 @@ class YouTubeCollectionTest(unittest.TestCase):
                     return {"pass": True, "issues": []}, {"model": "reviewer-global"}
                 rows = json.loads(prompt.split("Rows: ", 1)[1])
                 return {"reviews": [{
-                    "id": row["id"], "pass": index != 1,
-                    "fidelity_score": 5 if index != 1 else 3,
-                    "naturalness_score": 5 if index != 1 else 3,
-                    "errors": [] if index != 1 else [
+                    "id": row["id"], "pass": row["id"] != "interview-card-2",
+                    "fidelity_score": 5 if row["id"] != "interview-card-2" else 3,
+                    "naturalness_score": 5 if row["id"] != "interview-card-2" else 3,
+                    "errors": [] if row["id"] != "interview-card-2" else [
                         "可能需要增加一个可选连接词。",
                     ],
-                } for index, row in enumerate(rows)]}, {"model": "reviewer"}
+                } for row in rows]}, {"model": "reviewer"}
 
         source = " ".join(f"word{index}" for index in range(1, 31))
         cues = [TranscriptCue("cue-1", 0, 18, source)]

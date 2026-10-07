@@ -2463,6 +2463,7 @@ class NaturalSubtitleTranslator:
         clip_end = cues[-1].end
         glossary = _relevant_terminology_prompt_rows(terminology, expected_source)
         attempts: list[dict[str, Any]] = []
+        local_review_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         hypothesis_words = re.findall(r"\S+", audio_hypothesis)
         hypothesis_norm = [
             re.sub(r"[^a-z0-9']+", "", value.casefold().replace("’", "'"))
@@ -3102,6 +3103,18 @@ class NaturalSubtitleTranslator:
                     "chinese": card.translation,
                 }
 
+            def review_cache_key(index: int) -> tuple[Any, ...]:
+                return tuple(
+                    (
+                        spans[neighbor][0], spans[neighbor][1],
+                        cards[neighbor].source_text,
+                        cards[neighbor].translation,
+                    )
+                    for neighbor in range(
+                        max(0, index - 1), min(len(cards), index + 2),
+                    )
+                )
+
             problems: dict[int, list[str]] = {}
             for error in interview_caption_duration_errors(
                 cards, terminology, audio_conflict_entities,
@@ -3154,13 +3167,41 @@ class NaturalSubtitleTranslator:
             by_id: dict[str, dict[str, Any]] = {}
             local_review_traces: list[dict[str, Any]] = []
             for partition_number, (core_start, core_end) in enumerate(partitions, start=1):
-                core = cards[core_start:core_end]
-                context = cards[max(0, core_start - 2):core_start] + cards[
-                    core_end:min(len(cards), core_end + 2)
-                ]
+                partition_card_indices = list(range(core_start, core_end))
+                pending_indices: list[int] = []
+                cached_ids: list[str] = []
+                for index in partition_card_indices:
+                    cached = local_review_cache.get(review_cache_key(index))
+                    if cached is None:
+                        pending_indices.append(index)
+                        continue
+                    card = cards[index]
+                    by_id[card.id] = {"id": card.id, **cached}
+                    cached_ids.append(card.id)
+                core = [cards[index] for index in pending_indices]
+                pending_set = set(pending_indices)
+                context_indices = sorted({
+                    neighbor
+                    for index in pending_indices
+                    for neighbor in range(
+                        max(0, index - 2), min(len(cards), index + 3),
+                    )
+                    if neighbor not in pending_set
+                })
+                context = [cards[index] for index in context_indices]
                 core_expected = {card.id for card in core}
                 attempt_provenances: list[dict[str, Any]] = []
                 structure_failures: list[list[str]] = []
+                if not core:
+                    local_review_traces.append({
+                        "partition": partition_number,
+                        "core_card_ids": [],
+                        "context_card_ids": [],
+                        "cached_card_ids": cached_ids,
+                        "attempts": [],
+                        "structure_failures": [],
+                    })
+                    continue
                 for review_attempt in range(2):
                     reviewed, attempt_provenance = reviewer._request_json([
                         {"role": "system", "content": "Return one valid JSON object only."},
@@ -3226,6 +3267,25 @@ class NaturalSubtitleTranslator:
                             structure_errors.append(f"{row_id}: errors must be an array")
                     if not structure_errors:
                         by_id.update({str(row["id"]): row for row in candidate_rows})
+                        card_index = {
+                            cards[index].id: index for index in pending_indices
+                        }
+                        for row in candidate_rows:
+                            if (
+                                row.get("pass") is True
+                                and _review_score_out_of_five(
+                                    row.get("fidelity_score")
+                                ) >= 4
+                                and _review_score_out_of_five(
+                                    row.get("naturalness_score")
+                                ) >= 4
+                                and not row.get("errors")
+                            ):
+                                index = card_index[str(row["id"])]
+                                local_review_cache[review_cache_key(index)] = {
+                                    key: value for key, value in row.items()
+                                    if key != "id"
+                                }
                         break
                     structure_failures.append(structure_errors)
                 else:
@@ -3237,6 +3297,7 @@ class NaturalSubtitleTranslator:
                     "partition": partition_number,
                     "core_card_ids": [card.id for card in core],
                     "context_card_ids": [card.id for card in context],
+                    "cached_card_ids": cached_ids,
                     "attempts": attempt_provenances,
                     "structure_failures": structure_failures,
                 })
