@@ -2274,6 +2274,67 @@ def _caption_scope_checkpoint_key(inputs: dict[str, Any]) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def _coalesce_checkpoint_timing_failures(
+    cards: list[TranscriptCue], terminology: list[TerminologyEntry],
+) -> tuple[list[TranscriptCue], list[dict[str, Any]]]:
+    """Repair small timing drift by joining already reviewed adjacent cards."""
+    current = cards
+    changes: list[dict[str, Any]] = []
+    for _ in range(len(cards)):
+        errors = interview_caption_duration_errors(current, terminology)
+        if not errors:
+            return current, changes
+        failing_ids = {
+            card.id for card in current
+            if any(error.startswith(card.id + " ") for error in errors)
+        }
+        best: tuple[
+            int, int, list[TranscriptCue], list[str], list[str],
+        ] | None = None
+        for index, card in enumerate(current):
+            if card.id not in failing_ids:
+                continue
+            for left_index in (index - 1, index):
+                if not 0 <= left_index < len(current) - 1:
+                    continue
+                left, right = current[left_index:left_index + 2]
+                separator = (
+                    "" if re.search(r"[。！？!?；;：:]$", left.translation.strip())
+                    else "，"
+                )
+                merged = TranscriptCue(
+                    id=left.id,
+                    start=left.start,
+                    end=right.end,
+                    source_text=f"{left.source_text} {right.source_text}".strip(),
+                    translation=(
+                        left.translation.strip() + separator
+                        + right.translation.strip()
+                    ),
+                    source_tokens=[*left.source_tokens, *right.source_tokens],
+                )
+                candidate = [
+                    *current[:left_index], merged, *current[left_index + 2:],
+                ]
+                candidate_errors = interview_caption_duration_errors(
+                    candidate, terminology,
+                )
+                score = len(candidate_errors)
+                if best is None or score < best[0]:
+                    best = (
+                        score, left_index, candidate, candidate_errors,
+                        [left.id, right.id],
+                    )
+        if best is None or best[0] >= len(errors):
+            return current, changes
+        _, _, current, remaining, merged_ids = best
+        changes.append({
+            "merged_card_ids": merged_ids,
+            "remaining_errors": remaining,
+        })
+    return current, changes
+
+
 def _validated_caption_scope_checkpoint(
     path: Path, expected_inputs: dict[str, Any], scope_words: list[SourceWord],
     terminology: list[TerminologyEntry],
@@ -2357,6 +2418,9 @@ def _validated_caption_scope_checkpoint(
         ))
         cursor += word_count
     expected_source = " ".join(word.raw for word in scope_words)
+    cards, timing_coalesces = _coalesce_checkpoint_timing_failures(
+        cards, terminology,
+    )
     if (
         " ".join(card.source_text for card in cards) != expected_source
         or terminology_contract_errors(cards, terminology)
@@ -2377,6 +2441,8 @@ def _validated_caption_scope_checkpoint(
     trace["terminology_decision_fingerprint"] = (
         _terminology_decision_fingerprint(terminology)
     )
+    if timing_coalesces:
+        trace["checkpoint_timing_coalesces"] = timing_coalesces
     return cards, trace, payload
 
 

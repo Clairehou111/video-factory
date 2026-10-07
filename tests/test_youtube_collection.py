@@ -58,6 +58,7 @@ from video_factory.youtube import (
     _interview_caption_content_fingerprint,
     _numeric_audio_conflict_pairs,
     _compact_translation_trace,
+    _coalesce_checkpoint_timing_failures,
     _write_translation_audit,
     _translation_trace_from_plan,
     _snapshot_plan_hooks,
@@ -3384,6 +3385,18 @@ class YouTubeCollectionTest(unittest.TestCase):
             )
             self.assertTrue(retry_cues[0].source_text.startswith("one,"))
             self.assertEqual(len(list(cache_dir.glob("*.json"))), 2)
+
+    def test_checkpoint_retimes_by_coalescing_a_short_reviewed_card(self) -> None:
+        cards, changes = _coalesce_checkpoint_timing_failures([
+            TranscriptCue("a", 0, 1.0, "one two extra", "第一句。"),
+            TranscriptCue("b", 1.0, 3.5, "three four", "第二句。"),
+            TranscriptCue("c", 3.5, 6.0, "five six", "第三句。"),
+        ], [])
+
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(changes[0]["merged_card_ids"], ["a", "b"])
+        self.assertEqual(interview_caption_duration_errors(cards, []), [])
+        self.assertEqual(cards[0].source_text, "one two extra three four")
 
     def test_subtitle_resegmentation_cannot_reselect_frozen_hook(self) -> None:
         plan = {
