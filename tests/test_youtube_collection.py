@@ -2014,6 +2014,24 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertNotIn("missing:OK", errors)
 
+    def test_same_card_asr_case_normalization_does_not_move_entity(self) -> None:
+        row = {
+            "id": "card", "source": "one of the first robotics teams",
+            "duration_seconds": 4.0,
+        }
+
+        self.assertNotIn(
+            "moved:FIRST",
+            _semantic_card_translation_errors(row, "最早的 FIRST 机器人团队之一。", []),
+        )
+        self.assertIn(
+            "moved:FIRST",
+            _semantic_card_translation_errors(
+                {**row, "source": "one of the robotics teams"},
+                "最早的 FIRST 机器人团队之一。", [],
+            ),
+        )
+
     def test_semantic_card_reports_which_translation_term_rule_failed(self) -> None:
         term = TerminologyEntry(
             "retrieval agent", TerminologyStrategy.TRANSLATE, target="检索代理",

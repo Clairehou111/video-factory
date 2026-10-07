@@ -6536,7 +6536,8 @@ def _caption_entity_alignment_errors(
         if not any(alias in translation for alias in aliases):
             errors.append(f"missing:{entity}")
     for entity in target_entities - source_entities:
-        errors.append(f"moved:{entity}")
+        if not _contains_term(source, entity):
+            errors.append(f"moved:{entity}")
     for entity, aliases in CAPTION_ENTITY_ALIASES.items():
         if entity in source_entities:
             continue
