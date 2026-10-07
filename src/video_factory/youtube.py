@@ -320,7 +320,7 @@ CONFERENCE_HIGHLIGHT_MIN_SECONDS = 45.0
 CONFERENCE_HIGHLIGHT_MAX_SECONDS = 300.0
 CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS = 900.0
 INTERVIEW_MAX_INTERNAL_SILENCE_SECONDS = 3.0
-INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v12-focused-semantic-convergence"
+INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v13-asr-preserve-ownership"
 INTERVIEW_CAPTION_TARGET_MAX_SECONDS = 5.0
 INTERVIEW_CAPTION_HARD_MAX_SECONDS = 7.5
 INTERVIEW_CAPTION_MIN_SECONDS = 1.2
@@ -1260,7 +1260,7 @@ def terminology_contract_errors(
                 and entry.source.casefold() in item.source.casefold()
             ]
             for item in cues:
-                source_owns_term = _contains_unprotected_term(
+                source_owns_term = _source_owns_preserved_term(
                     item.source_text, entry.source, protected_terms,
                 )
                 target_has_term = (
@@ -1494,6 +1494,45 @@ def _contains_unprotected_term(
     for protected in protected_terms:
         masked = re.sub(re.escape(protected), " ", masked, flags=re.IGNORECASE)
     return _contains_term(masked, term)
+
+
+def _one_edit_latin_variant(left: str, right: str) -> bool:
+    """Recognize one-character ASR spelling drift without term-specific aliases."""
+    left = left.casefold()
+    right = right.casefold()
+    if left == right or abs(len(left) - len(right)) > 1:
+        return left == right
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) == 1
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    short_index = long_index = differences = 0
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+        differences += 1
+        long_index += 1
+        if differences > 1:
+            return False
+    return True
+
+
+def _source_owns_preserved_term(
+    value: str, term: str, protected_terms: list[str],
+) -> bool:
+    """Bind reviewed product spelling to an obvious same-card ASR typo."""
+    if _contains_unprotected_term(value, term, protected_terms):
+        return True
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{5,}", term):
+        return False
+    masked = value
+    for protected in protected_terms:
+        masked = re.sub(re.escape(protected), " ", masked, flags=re.IGNORECASE)
+    return any(
+        len(candidate) >= 5 and _one_edit_latin_variant(candidate, term)
+        for candidate in re.findall(r"[A-Za-z][A-Za-z0-9]*", masked)
+    )
 
 
 def rebalance_translated_cues(cues: list[TranscriptCue], max_chars_per_second: float = 12.0) -> list[TranscriptCue]:
@@ -2555,7 +2594,9 @@ class NaturalSubtitleTranslator:
             ownership_terms.update(
                 entry.source for entry in terminology
                 if entry.strategy == TerminologyStrategy.PRESERVE
-                and _contains_term(" ".join(word.raw for word in window), entry.source)
+                and _source_owns_preserved_term(
+                    " ".join(word.raw for word in window), entry.source, [],
+                )
             )
             ownership: list[dict[str, Any]] = []
             for entity in sorted(ownership_terms, key=lambda value: (-len(value), value)):
@@ -6701,7 +6742,7 @@ def _semantic_card_translation_errors(
             if not same_written_form and _contains_term(translation, term.source):
                 errors.append(f"term:{term.source}:remove_english:{term.source}")
         if term.strategy == TerminologyStrategy.PRESERVE:
-            source_owns_term = _contains_unprotected_term(
+            source_owns_term = _source_owns_preserved_term(
                 source, term.source, protected_terms,
             )
             preserved_form = term.target.strip() or term.source

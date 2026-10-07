@@ -2072,6 +2072,34 @@ class YouTubeCollectionTest(unittest.TestCase):
             }, "Roomba 率先出货。", [term]),
         )
 
+    def test_preserved_term_accepts_obvious_same_card_asr_spelling_drift(self) -> None:
+        term = TerminologyEntry(
+            "Roomba", TerminologyStrategy.PRESERVE, target="Roomba",
+        )
+
+        self.assertEqual(
+            _semantic_card_translation_errors({
+                "id": "owner", "source": "the original Rooma team",
+                "duration_seconds": 3.0,
+            }, "最初的 Roomba 团队", [term], require_punctuation=False),
+            [],
+        )
+        self.assertIn(
+            "term:Roomba:moved_preserved:Roomba",
+            _semantic_card_translation_errors({
+                "id": "neighbor", "source": "the original room team",
+                "duration_seconds": 3.0,
+            }, "最初的 Roomba 团队", [term], require_punctuation=False),
+        )
+        self.assertEqual(
+            terminology_contract_errors([
+                TranscriptCue(
+                    "owner", 0, 3, "the original Rooma team", "最初的 Roomba 团队",
+                ),
+            ], [term]),
+            [],
+        )
+
     def test_semantic_card_accepts_equivalent_term_spacing_and_identity(self) -> None:
         row = {
             "id": "card", "source": "Token usage includes dark tokens.",
