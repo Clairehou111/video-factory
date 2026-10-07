@@ -2870,6 +2870,8 @@ class YouTubeCollectionTest(unittest.TestCase):
                 prompt = messages[-1]["content"]
                 if "Sequence: " in prompt:
                     self.global_calls += 1
+                    if self.global_calls < 3:
+                        return {"reviews": []}, {"model": "reviewer-global"}
                     return {"pass": True, "issues": []}, {"model": "reviewer-global"}
                 rows = json.loads(prompt.split("Rows: ", 1)[1])
                 self.local_ids.extend(row["id"] for row in rows)
@@ -2893,7 +2895,7 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(" ".join(cue.source_text for cue in cues), source)
         self.assertEqual(sorted(reviewer.local_ids), sorted(cue.id for cue in cues))
         self.assertEqual(len(reviewer.local_ids), len(set(reviewer.local_ids)))
-        self.assertEqual(reviewer.global_calls, 1)
+        self.assertEqual(reviewer.global_calls, 3)
 
     def test_joint_caption_scopes_preserve_editorial_plan_and_cut_boundaries(self) -> None:
         class Writer:

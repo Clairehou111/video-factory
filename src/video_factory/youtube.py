@@ -3306,12 +3306,16 @@ class NaturalSubtitleTranslator:
             if len(partitions) > 1:
                 global_failures: list[list[str]] = []
                 global_provenances: list[dict[str, Any]] = []
-                for global_attempt in range(2):
+                for global_attempt in range(3):
                     verdict, global_provenance = reviewer._request_json([
-                        {"role": "system", "content": "Return one valid JSON object only."},
+                        {"role": "system", "content": (
+                            "Return one compact JSON object with exactly the keys pass and issues. "
+                            "Never return reviews, per-card scores, or prose outside JSON."
+                        )},
                         {"role": "user", "content": "\n".join([
                             "Check only cross-partition consistency in this already locally reviewed bilingual subtitle sequence. Do not rewrite it.",
                             "Check consistent contextual terminology, entity ownership, adjacent boundary meaning, and cross-card duplication or omission. Return {pass,issues:[{ids,errors}]}. pass=true requires an empty issues array. Every issue id must come from Sequence.",
+                            "Return only material failures. Do not emit a review for each passing card, fidelity/naturalness scores, or explanations of correct rows.",
                             "source_word_range is the authoritative half-open word-ledger interval. Identical text in adjacent non-overlapping ranges is a real spoken repetition, not a duplicated card. Report duplication only when a source range is reused or Chinese adds repetition unsupported by its own range.",
                             "The English sequence is authoritative and may retain ASR spelling/spacing artifacts. Do not reject faithful Chinese for resolving an obvious spoken form such as 'verse' meaning 'versus', for preserving the exact English name spelling, or for adding a grammatically implicit head noun without a new factual claim. Audio ASR is read-only meaning evidence and never changes the English rows.",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
@@ -3367,7 +3371,7 @@ class NaturalSubtitleTranslator:
                     global_failures.append(structure_errors)
                 else:
                     raise ValueError(
-                        "global subtitle consistency reviewer returned invalid structure twice: "
+                        "global subtitle consistency reviewer returned invalid structure three times: "
                         + json.dumps(global_failures, ensure_ascii=False)
                     )
                 global_trace = {

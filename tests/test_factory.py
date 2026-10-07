@@ -13,7 +13,7 @@ from video_factory.agent import ContentAgentError
 from video_factory.editorial import repair_fragmented_radar_hook
 from video_factory.factory import (
     CompositeCopyReviewer, GenerateOptions, VideoFactory,
-    _browser_capture_needs_card_fallback, github_target_duration,
+    _browser_capture_needs_card_fallback, _job_llm_max_requests, github_target_duration,
     static_radar_target_duration,
 )
 from video_factory.models import (
@@ -39,6 +39,17 @@ def basic_manifest() -> RenderManifest:
 
 
 class VideoFactoryTest(unittest.TestCase):
+    def test_youtube_jobs_have_a_separate_bounded_llm_request_budget(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_job_llm_max_requests("youtube"), 300)
+            self.assertEqual(_job_llm_max_requests("url"), 200)
+        with patch.dict(os.environ, {
+            "VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS": "240",
+            "VIDEO_FACTORY_YOUTUBE_LLM_MAX_REQUESTS": "280",
+        }, clear=True):
+            self.assertEqual(_job_llm_max_requests("youtube"), 280)
+            self.assertEqual(_job_llm_max_requests("url"), 240)
+
     def test_auto_story_writer_defaults_to_low_cost_gemini_flash(self) -> None:
         with TemporaryDirectory() as temp:
             factory = VideoFactory(Workspace(Path(temp) / "workspace"))

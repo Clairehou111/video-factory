@@ -83,6 +83,16 @@ def _is_kimi_coding_model(value: str | None) -> bool:
     return (value or "").casefold() in {"kimi/kimi3", "kimi3", "kimi/k3"}
 
 
+def _job_llm_max_requests(source: str) -> int:
+    """Allow long YouTube review loops room while preserving the shared cap."""
+    specific = (
+        os.environ.get("VIDEO_FACTORY_YOUTUBE_LLM_MAX_REQUESTS")
+        if source == "youtube" else None
+    )
+    shared = os.environ.get("VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS")
+    return int(specific or shared or ("300" if source == "youtube" else "200"))
+
+
 def static_radar_target_duration(content_type: ContentType, discovery_channel: str | None) -> float:
     """Bias ordinary static news toward eight seconds without compressing research."""
     if content_type == ContentType.DEEP_DIVE:
@@ -231,7 +241,7 @@ class VideoFactory:
         self._write_result(job, result)
         llm_scope = self.llm_transport.scope(
             job_id=job_id, candidate_id=url,
-            max_requests=int(os.environ.get("VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS", "200")),
+            max_requests=_job_llm_max_requests(source),
             max_cost_usd=float(os.environ.get("VIDEO_FACTORY_JOB_LLM_MAX_COST_USD", "5.00")),
         )
         llm_scope.__enter__()
