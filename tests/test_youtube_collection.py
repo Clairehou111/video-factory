@@ -3658,6 +3658,37 @@ class YouTubeCollectionTest(unittest.TestCase):
             connected, 0, len(connected), "超过 60% 或 70%。", [],
         ), [])
 
+    def test_numeric_ownership_accepts_decade_suffix(self) -> None:
+        words = source_words_from_cues([
+            TranscriptCue("cue-1", 0, 3, "It was the early 80s."),
+        ])
+
+        self.assertEqual(_caption_numeric_alignment_errors(
+            words, 0, len(words), "那是在 80 年代初。", [],
+        ), [])
+
+    def test_numeric_ownership_accepts_exact_chinese_scale_conversion(self) -> None:
+        words = source_words_from_cues([
+            TranscriptCue("cue-1", 0, 4, "It was a $10 million a year market."),
+        ])
+
+        self.assertEqual(_caption_numeric_alignment_errors(
+            words, 0, len(words), "那是一个每年 1000 万美元的市场。", [],
+        ), [])
+
+        wrong_unit = _caption_numeric_alignment_errors(
+            words, 0, len(words), "那是一个每年 1000 美元的市场。", [],
+        )
+        self.assertIn("missing_number:10@4", wrong_unit)
+        self.assertIn("moved_number:1000", wrong_unit)
+
+        no_source_number = source_words_from_cues([
+            TranscriptCue("cue-2", 0, 2, "It was a market."),
+        ])
+        self.assertIn("moved_number:1000", _caption_numeric_alignment_errors(
+            no_source_number, 0, len(no_source_number), "那是一个 1000 万美元的市场。", [],
+        ))
+
     def test_numeric_ownership_still_rejects_unrelated_numeric_month(self) -> None:
         words = source_words_from_cues([
             TranscriptCue("cue-1", 0, 3, "The conference is in autumn.")

@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from itertools import combinations
 from pathlib import Path
@@ -7253,10 +7254,18 @@ def _caption_numeric_alignment_errors(
     )
 
     def values(value: str) -> list[str]:
-        return [
+        result = [
             (match.group(1) + (match.group(2) or "")).replace("％", "%")
             for match in pattern.finditer(value)
         ]
+        result.extend(
+            match.group(1)
+            for match in re.finditer(
+                r"(?<![A-Za-z0-9])(\d{2})['’]?s(?![A-Za-z0-9])",
+                value, re.IGNORECASE,
+            )
+        )
+        return result
 
     pair_by_index = {
         int(row["source_word_index"]) - 1: row
@@ -7281,6 +7290,45 @@ def _caption_numeric_alignment_errors(
     target_counts: dict[str, int] = {}
     for number in values(translation):
         target_counts[number] = target_counts.get(number, 0) + 1
+    scaled_target_counts: dict[tuple[str, str], int] = {}
+    for match in re.finditer(
+        r"(?<!\d)(\d+(?:[.,]\d+)*)\s*(万亿|万|亿)", translation,
+    ):
+        key = (match.group(1).replace(",", ""), match.group(2))
+        scaled_target_counts[key] = scaled_target_counts.get(key, 0) + 1
+
+    def localized_scale_candidates(index: int, number: str) -> list[tuple[str, str]]:
+        if number.endswith(("%", "x")):
+            return []
+        following = " ".join(
+            word.raw for word in source_words[index + 1:min(end_word, index + 3)]
+        ).casefold()
+        scale = next((value for value in (
+            "trillion", "billion", "million", "thousand",
+        ) if re.search(rf"\b{value}s?\b", following)), "")
+        if not scale:
+            return []
+        try:
+            value = Decimal(number.replace(",", ""))
+        except InvalidOperation:
+            return []
+
+        def plain(candidate: Decimal) -> str:
+            rendered = format(candidate, "f")
+            return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+        if scale == "thousand":
+            in_ten_thousands = value / Decimal(10)
+            return [(plain(in_ten_thousands), "万")] \
+                if in_ten_thousands == in_ten_thousands.to_integral() else []
+        if scale == "million":
+            return [(plain(value * 100), "万")]
+        if scale == "billion":
+            return [(plain(value * 10), "亿")]
+        return [
+            (plain(value), "万亿"),
+            (plain(value * 10000), "亿"),
+        ]
     # A damaged token such as ``10erson`` is not a required source number: the
     # translator may naturally spell it out as 十人. If it chooses Arabic
     # digits based on the same visible prefix, consume that target occurrence
@@ -7294,6 +7342,15 @@ def _caption_numeric_alignment_errors(
     errors: list[str] = []
     for index, number in occurrences:
         if index in pair_by_index:
+            continue
+        localized = next((
+            candidate for candidate in localized_scale_candidates(index, number)
+            if scaled_target_counts.get(candidate, 0)
+            and target_counts.get(candidate[0], 0)
+        ), None)
+        if localized is not None:
+            scaled_target_counts[localized] -= 1
+            target_counts[localized[0]] -= 1
             continue
         accepted = next((
             candidate for candidate in (
