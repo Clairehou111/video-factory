@@ -288,7 +288,6 @@ ESTABLISHED_CHINESE_TERMS: dict[str, str] = {
     "productivity gain": "生产力提升",
     "diffusion": "普及",
     "agent": "智能体",
-    "bug": "故障",
     "royalty": "版税",
     "token pricing": "token 定价",
     "memory system": "记忆系统",
@@ -3091,6 +3090,18 @@ class NaturalSubtitleTranslator:
             spans: list[tuple[int, int, str]], repair_round: int,
         ) -> tuple[list[TranscriptCue], dict[int, list[str]], dict[str, Any] | None]:
             cards = materialize(spans)
+            card_index_by_id = {card.id: index for index, card in enumerate(cards)}
+
+            def review_row(card: TranscriptCue) -> dict[str, Any]:
+                index = card_index_by_id[card.id]
+                left, right, _ = spans[index]
+                return {
+                    "id": card.id,
+                    "source_word_range": [left, right],
+                    "source": card.source_text,
+                    "chinese": card.translation,
+                }
+
             problems: dict[int, list[str]] = {}
             for error in interview_caption_duration_errors(
                 cards, terminology, audio_conflict_entities,
@@ -3157,6 +3168,7 @@ class NaturalSubtitleTranslator:
                             "Independently review this ordered bilingual subtitle partition. Do not rewrite it. Context rows are read-only and must not appear in the response. A sentence may continue naturally across cards; do not require every card to be a standalone proposition.",
                             "Reject only material omissions, inventions, changed modality or scope, misplaced entities, misleading cuts, incomprehensible Chinese, or a contextual term unsupported by the actual actor and actions. Accept faithful natural paraphrases. A preference, optional nuance, or stylistic suggestion is not enough to fail a card. alternatives are candidates, not automatic approvals.",
                             "The supplied English is the authoritative publishable wording and may contain ASR spelling or spacing artifacts. Never demand that Chinese preserve a broken fragment literally or that English be corrected. Use nearby audio and context to judge the spoken meaning. Natural Chinese may make an implicit head noun or relation explicit when it does not add a new factual claim.",
+                            "source_word_range is the authoritative half-open word-ledger interval. Identical text in adjacent non-overlapping ranges means the speaker actually repeated it; do not call that a duplicated card. Report duplication only when a source range is reused or Chinese repeats meaning absent from its own range.",
                             "Reject Chinese that translates discourse fillers or sound metadata. Their omission is intentional and is not a semantic omission.",
                             "Return every core id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. Pass only when both scores are at least 4.",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
@@ -3174,14 +3186,12 @@ class NaturalSubtitleTranslator:
                                 + json.dumps(structure_failures[-1], ensure_ascii=False)
                                 + ". Review the unchanged core rows again and return the exact schema."
                             ) if structure_failures else "",
-                            "Context rows: " + json.dumps([{
-                                "id": card.id, "source": card.source_text,
-                                "chinese": card.translation,
-                            } for card in context], ensure_ascii=False),
-                            "Rows: " + json.dumps([{
-                                "id": card.id, "source": card.source_text,
-                                "chinese": card.translation,
-                            } for card in core], ensure_ascii=False),
+                            "Context rows: " + json.dumps([
+                                review_row(card) for card in context
+                            ], ensure_ascii=False),
+                            "Rows: " + json.dumps([
+                                review_row(card) for card in core
+                            ], ensure_ascii=False),
                         ])},
                     ], max_tokens=min(8000, 500 + 220 * len(core)))
                     attempt_provenances.append(attempt_provenance)
@@ -3241,6 +3251,7 @@ class NaturalSubtitleTranslator:
                         {"role": "user", "content": "\n".join([
                             "Check only cross-partition consistency in this already locally reviewed bilingual subtitle sequence. Do not rewrite it.",
                             "Check consistent contextual terminology, entity ownership, adjacent boundary meaning, and cross-card duplication or omission. Return {pass,issues:[{ids,errors}]}. pass=true requires an empty issues array. Every issue id must come from Sequence.",
+                            "source_word_range is the authoritative half-open word-ledger interval. Identical text in adjacent non-overlapping ranges is a real spoken repetition, not a duplicated card. Report duplication only when a source range is reused or Chinese adds repetition unsupported by its own range.",
                             "The English sequence is authoritative and may retain ASR spelling/spacing artifacts. Do not reject faithful Chinese for resolving an obvious spoken form such as 'verse' meaning 'versus', for preserving the exact English name spelling, or for adding a grammatically implicit head noun without a new factual claim. Audio ASR is read-only meaning evidence and never changes the English rows.",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
                             "Audio ASR hypothesis: " + audio_evidence_for_window(
@@ -3251,10 +3262,9 @@ class NaturalSubtitleTranslator:
                                 + json.dumps(global_failures[-1], ensure_ascii=False)
                                 + ". Check the unchanged sequence again and return the exact schema."
                             ) if global_failures else "",
-                            "Sequence: " + json.dumps([{
-                                "id": card.id, "source": card.source_text,
-                                "chinese": card.translation,
-                            } for card in cards], ensure_ascii=False),
+                            "Sequence: " + json.dumps([
+                                review_row(card) for card in cards
+                            ], ensure_ascii=False),
                         ])},
                     ], max_tokens=3500)
                     global_provenances.append(global_provenance)
@@ -3327,14 +3337,21 @@ class NaturalSubtitleTranslator:
                 # self-contradictory review prose cannot block a valid sequence.
                 failed_rows = [{
                     "id": cards[index].id,
+                    "source_word_range": [spans[index][0], spans[index][1]],
                     "source": cards[index].source_text,
                     "chinese": cards[index].translation,
                     "prior_errors": errors,
                     "previous": ({
+                        "source_word_range": [
+                            spans[index - 1][0], spans[index - 1][1],
+                        ],
                         "source": cards[index - 1].source_text,
                         "chinese": cards[index - 1].translation,
                     } if index else None),
                     "next": ({
+                        "source_word_range": [
+                            spans[index + 1][0], spans[index + 1][1],
+                        ],
                         "source": cards[index + 1].source_text,
                         "chinese": cards[index + 1].translation,
                     } if index + 1 < len(cards) else None),
@@ -3354,6 +3371,7 @@ class NaturalSubtitleTranslator:
                             "A prior error may itself contradict its claimed referent or actor. Resolve pronouns from the complete previous/current/next causal context. If you retain the error, state exactly one supported referent and one concrete semantic mismatch; do not repeat incompatible alternatives from the prior prose.",
                             "Do not assign a pronoun to the nearest noun by default. Follow the discourse subject and causal chain, including who earns revenue, loses profit, makes a decision, or is affected; organizations may use singular-they pronouns. Prefer the interpretation that makes the surrounding mechanism coherent.",
                             "English is authoritative but may contain ASR spelling or spacing artifacts. Use each row's audio_hypothesis and context to judge spoken meaning; do not demand literal Chinese for a broken fragment, an English spelling correction, or removal of a natural implicit Chinese head noun when no factual claim was added.",
+                            "source_word_range is the authoritative half-open word-ledger interval. Identical wording in adjacent non-overlapping ranges is a real spoken repetition and must not be rejected as a duplicated card.",
                             "Return every id exactly once as {reviews:[{id,pass,fidelity_score,naturalness_score,errors}]}. pass=true means the unchanged card and its boundary are publication-ready and errors must be empty. pass=false requires concise material errors. Both scores must be 1–5.",
                             (
                                 "The previous adjudication response failed deterministic structure validation: "
@@ -4633,6 +4651,17 @@ class NaturalSubtitleTranslator:
                 strategy = TerminologyStrategy.PRESERVE
             if strategy != TerminologyStrategy.TRANSLATE:
                 alternatives = []
+            if (
+                strategy == TerminologyStrategy.TRANSLATE
+                and not rationale
+                and not established_target
+                and re.fullmatch(r"[a-z]+", source)
+            ):
+                # Old plans may contain auto-added ordinary vocabulary with no
+                # contextual evidence. Treat it as prose again so a polysemous
+                # word is translated from its actual actor and action instead of
+                # enforcing one video-wide dictionary sense on every occurrence.
+                continue
             entries.append(TerminologyEntry(
                 source=source, strategy=strategy, target=target,
                 alternatives=alternatives, rationale=rationale,

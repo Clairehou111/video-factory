@@ -545,6 +545,19 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(cached.alternatives, ["推荐代理", "第三个备选"])
         self.assertEqual(cached.rationale, contextual.rationale)
 
+    def test_contextless_cached_common_word_is_not_a_video_wide_term(self) -> None:
+        cues = [TranscriptCue(
+            "cue-1", 0, 8,
+            "They built six-legged bug robots and later fixed a software bug.",
+        )]
+
+        entries = NaturalSubtitleTranslator._parse_terminology([{
+            "source": "bug", "strategy": "translate", "target": "故障",
+            "alternatives": [], "rationale": "",
+        }], cues)
+
+        self.assertNotIn("bug", {entry.source for entry in entries})
+
     def test_ordinary_interview_terms_cannot_be_marked_english_preserving(self) -> None:
         cues = [
             TranscriptCue(
@@ -2364,10 +2377,14 @@ class YouTubeCollectionTest(unittest.TestCase):
         class Reviewer:
             def __init__(self) -> None:
                 self.calls = 0
+                self.rows: list[dict[str, object]] = []
+                self.prompt = ""
 
             def _request_json(self, messages, **kwargs):
                 self.calls += 1
-                rows = json.loads(messages[-1]["content"].split("Rows: ", 1)[1])
+                self.prompt = messages[-1]["content"]
+                rows = json.loads(self.prompt.split("Rows: ", 1)[1])
+                self.rows = rows
                 return {"reviews": [{
                     "id": row["id"], "pass": True,
                     "fidelity_score": 5, "naturalness_score": 5, "errors": [],
@@ -2389,6 +2406,11 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(trace["repair_rounds"], 0)
         self.assertEqual(writer.calls, 1)
         self.assertEqual(reviewer.calls, 1)
+        self.assertEqual(
+            [row["source_word_range"] for row in reviewer.rows],
+            [[0, 10], [10, 20]],
+        )
+        self.assertIn("speaker actually repeated it", reviewer.prompt)
         self.assertEqual(" ".join(cue.source_text for cue in cues), source)
         self.assertEqual(sum(len(cue.source_tokens) for cue in cues), 20)
         self.assertGreater(len(re.sub(r"\s+", "", cues[0].translation)), 32)
