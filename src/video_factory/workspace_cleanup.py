@@ -319,5 +319,7 @@ def _has_recovery_artifact(job: Path, result: dict[str, Any]) -> bool:
     for name in ("translation-plan.json", "manifest.json", "collection-manifest.json"):
         if (job / name).is_file():
             return True
+    if any((job / "caption-scope-checkpoints").glob("*.json")):
+        return True
     manifest = result.get("manifest") or result.get("collection_manifest")
     return bool(manifest and Path(str(manifest)).is_file())

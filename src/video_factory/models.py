@@ -214,6 +214,7 @@ class TerminologyEntry:
     notes: str = ""
     alternatives: list[str] = field(default_factory=list)
     rationale: str = ""
+    source_variants: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

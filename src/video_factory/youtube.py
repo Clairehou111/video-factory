@@ -320,7 +320,7 @@ CONFERENCE_HIGHLIGHT_MIN_SECONDS = 45.0
 CONFERENCE_HIGHLIGHT_MAX_SECONDS = 300.0
 CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS = 900.0
 INTERVIEW_MAX_INTERNAL_SILENCE_SECONDS = 3.0
-INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v13-asr-preserve-ownership"
+INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v15-scope-checkpoints"
 INTERVIEW_CAPTION_TARGET_MAX_SECONDS = 5.0
 INTERVIEW_CAPTION_HARD_MAX_SECONDS = 7.5
 INTERVIEW_CAPTION_MIN_SECONDS = 1.2
@@ -377,6 +377,23 @@ def _interview_caption_policy_fingerprint() -> str:
 
 
 INTERVIEW_CAPTION_POLICY_FINGERPRINT = _interview_caption_policy_fingerprint()
+
+
+def _semantic_problems_need_boundary_reconsideration(
+    problems: dict[int, list[str]],
+) -> bool:
+    """Reopen English boundaries only when the rejection identifies a boundary cause."""
+    text = " ".join(
+        error.casefold()
+        for errors in problems.values()
+        for error in errors
+    )
+    return any(marker in text for marker in (
+        "boundary", "split", "strands", "stranded", "dangling",
+        "referent", "pronoun", "fragment", "adjacent card",
+        "previous card", "next card", "边界", "跨卡", "指代", "代词",
+        "悬空", "片段", "上一卡", "下一卡", "相邻卡",
+    ))
 
 
 class YouTubeAcquisitionError(RuntimeError):
@@ -1262,6 +1279,7 @@ def terminology_contract_errors(
             for item in cues:
                 source_owns_term = _source_owns_preserved_term(
                     item.source_text, entry.source, protected_terms,
+                    entry.source_variants,
                 )
                 target_has_term = (
                     preserved_form in item.translation
@@ -1520,19 +1538,34 @@ def _one_edit_latin_variant(left: str, right: str) -> bool:
 
 def _source_owns_preserved_term(
     value: str, term: str, protected_terms: list[str],
+    source_variants: list[str] | tuple[str, ...] = (),
 ) -> bool:
-    """Bind reviewed product spelling to an obvious same-card ASR typo."""
+    """Match only canonical or independently reviewed source surface forms."""
     if _contains_unprotected_term(value, term, protected_terms):
         return True
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{5,}", term):
-        return False
-    masked = value
-    for protected in protected_terms:
-        masked = re.sub(re.escape(protected), " ", masked, flags=re.IGNORECASE)
     return any(
-        len(candidate) >= 5 and _one_edit_latin_variant(candidate, term)
-        for candidate in re.findall(r"[A-Za-z][A-Za-z0-9]*", masked)
+        variant and _contains_unprotected_term(value, variant, protected_terms)
+        for variant in source_variants
     )
+
+
+def _preserve_source_variant_candidates(
+    cues: list[TranscriptCue], term: str,
+) -> list[str]:
+    """Propose near source spellings for semantic review; never authorize them."""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{5,}", term):
+        return []
+    candidates: list[str] = []
+    for cue in cues:
+        for candidate in re.findall(r"[A-Za-z][A-Za-z0-9]*", cue.source_text):
+            if (
+                candidate.casefold() != term.casefold()
+                and len(candidate) >= 5
+                and _one_edit_latin_variant(candidate, term)
+                and candidate not in candidates
+            ):
+                candidates.append(candidate)
+    return candidates[:8]
 
 
 def rebalance_translated_cues(cues: list[TranscriptCue], max_chars_per_second: float = 12.0) -> list[TranscriptCue]:
@@ -2167,6 +2200,101 @@ def _matching_completed_directing_audit(
 
 
 
+CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _caption_scope_checkpoint_inputs(
+    source_video_id: str, editorial_mode: str, source_range: SourceRange,
+    scope_words: list[SourceWord], terminology: list[TerminologyEntry],
+    runtime_guidance: str,
+) -> dict[str, Any]:
+    return {
+        "source_video_id": source_video_id,
+        "editorial_mode": editorial_mode,
+        "policy_version": INTERVIEW_CAPTION_POLICY_VERSION,
+        "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+        "scope_range": [round(source_range.start, 6), round(source_range.end, 6)],
+        "source_ledger_fingerprint": source_ledger_fingerprint(scope_words),
+        "source_word_ids": [word.id for word in scope_words],
+        "source_word_count": len(scope_words),
+        "terminology_decision_fingerprint": _terminology_decision_fingerprint(
+            terminology,
+        ),
+        "runtime_guidance_sha256": hashlib.sha256(
+            runtime_guidance.strip().encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _caption_scope_checkpoint_key(inputs: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        {
+            "schema_version": CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION,
+            "inputs": inputs,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _validated_caption_scope_checkpoint(
+    path: Path, expected_inputs: dict[str, Any], scope_words: list[SourceWord],
+    terminology: list[TerminologyEntry],
+) -> tuple[list[TranscriptCue], dict[str, Any], dict[str, Any]] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    expected_key = _caption_scope_checkpoint_key(expected_inputs)
+    if (
+        payload.get("schema_version") != CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION
+        or payload.get("state") != "complete"
+        or payload.get("scope_key") != expected_key
+        or payload.get("inputs") != expected_inputs
+    ):
+        return None
+    output = payload.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("cues"), list):
+        return None
+    try:
+        cards = [TranscriptCue(**row) for row in output["cues"]]
+    except (TypeError, ValueError):
+        return None
+    expected_source = " ".join(word.raw for word in scope_words)
+    if (
+        not cards
+        or any(not card.translation.strip() for card in cards)
+        or " ".join(card.source_text for card in cards) != expected_source
+        or output.get("strict_source_fingerprint")
+        != _strict_interview_source_fingerprint(cards)
+        or output.get("caption_content_fingerprint")
+        != _interview_caption_content_fingerprint(cards)
+        or terminology_contract_errors(cards, terminology)
+        or interview_caption_duration_errors(cards, terminology)
+    ):
+        return None
+    trace = output.get("scope_trace")
+    if (
+        not isinstance(trace, dict)
+        or trace.get("policy_fingerprint") != INTERVIEW_CAPTION_POLICY_FINGERPRINT
+        or trace.get("source_ledger_fingerprint")
+        != source_ledger_fingerprint(scope_words)
+        or trace.get("terminology_decision_fingerprint")
+        != _terminology_decision_fingerprint(terminology)
+    ):
+        return None
+    return cards, trace, payload
+
+
 class NaturalSubtitleTranslator:
     def __init__(
         self, writer: OpenAICompatibleStoryWriter,
@@ -2590,30 +2718,37 @@ class NaturalSubtitleTranslator:
                 "source_word_index": int(row["source_word_index"]) - start_word,
             } for row in numeric_conflict_pairs
                 if start_word < int(row["source_word_index"]) <= end_word]
-            ownership_terms: set[str] = set()
-            ownership_terms.update(
-                entry.source for entry in terminology
-                if entry.strategy == TerminologyStrategy.PRESERVE
-                and _source_owns_preserved_term(
-                    " ".join(word.raw for word in window), entry.source, [],
-                )
-            )
             ownership: list[dict[str, Any]] = []
-            for entity in sorted(ownership_terms, key=lambda value: (-len(value), value)):
-                width = max(1, len(re.findall(r"\S+", entity)))
-                indices = [
-                    index + 1
-                    for index in range(max(0, len(window) - width + 1))
-                    if _contains_term(
-                        " ".join(word.raw for word in window[index:index + width]),
-                        entity,
-                    )
-                ]
-                ownership.append({
-                    "entity": entity,
-                    "source_word_start_indices": indices,
-                    "word_count": width,
-                })
+            for entry in sorted(
+                (item for item in terminology
+                 if item.strategy == TerminologyStrategy.PRESERVE),
+                key=lambda value: (-len(value.source), value.source),
+            ):
+                occurrences: list[dict[str, Any]] = []
+                for source_form in [entry.source, *entry.source_variants]:
+                    width = max(1, len(re.findall(r"\S+", source_form)))
+                    occurrences.extend({
+                        "source_form": source_form,
+                        "source_word_start_index": index + 1,
+                        "word_count": width,
+                    } for index in range(max(0, len(window) - width + 1))
+                        if _contains_term(
+                            " ".join(word.raw for word in window[index:index + width]),
+                            source_form,
+                        ))
+                if occurrences:
+                    ownership.append({
+                        "entity": entry.target.strip() or entry.source,
+                        "source_forms": [entry.source, *entry.source_variants],
+                        "source_word_start_indices": sorted({
+                            int(row["source_word_start_index"])
+                            for row in occurrences
+                        }),
+                        "word_count": max(
+                            int(row["word_count"]) for row in occurrences
+                        ),
+                        "occurrences": occurrences,
+                    })
             # Numeric ASR exceptions belong to one source occurrence.  A value may
             # appear more than once in the passage while only one occurrence has
             # strong local anchors, so never exempt every matching value by text.
@@ -3381,7 +3516,6 @@ class NaturalSubtitleTranslator:
                     } | (global_unresolved_ids & expected)
                 global_failures: list[list[str]] = []
                 global_provenances: list[dict[str, Any]] = []
-                ignored_issues: list[dict[str, Any]] = []
                 if not global_focus_ids:
                     global_review_state.clear()
                     global_review_state.update(current_global_state)
@@ -3448,23 +3582,18 @@ class NaturalSubtitleTranslator:
                     if passed is False and not issue_rows:
                         structure_errors.append("pass=false requires at least one issue")
                     if not structure_errors:
-                        actionable_issues = [
-                            issue for issue in issue_rows
-                            if set(map(str, issue["ids"])) & global_focus_ids
-                        ]
-                        ignored_issues = [
-                            issue for issue in issue_rows
-                            if not set(map(str, issue["ids"])) & global_focus_ids
-                        ]
-                        if actionable_issues:
+                        # Focus narrows the review request, but deterministic code
+                        # must not discard a material issue the independent reviewer
+                        # actually returned.  A missed issue is still actionable even
+                        # when the reviewer omitted the requested focus id.
+                        if issue_rows:
                             index_by_id = {card.id: index for index, card in enumerate(cards)}
-                            for issue in actionable_issues:
+                            for issue in issue_rows:
                                 for card_id in map(str, issue["ids"]):
                                     problems.setdefault(index_by_id[card_id], []).extend(
                                         str(error) for error in issue["errors"]
                                     )
-                        passed = not actionable_issues
-                        issue_rows = actionable_issues
+                        passed = not issue_rows
                         global_review_state.clear()
                         global_review_state.update(current_global_state)
                         break
@@ -3482,7 +3611,6 @@ class NaturalSubtitleTranslator:
                         "structure_failures": global_failures,
                         "pass": passed,
                         "issues": issue_rows,
-                        "ignored_unfocused_issues": ignored_issues,
                         "focus_card_ids": sorted(global_focus_ids),
                     }
             provenance = {
@@ -3713,6 +3841,8 @@ class NaturalSubtitleTranslator:
             INTERVIEW_MOVABLE_BOUNDARY_REPAIRS
             + INTERVIEW_FIXED_BOUNDARY_REPAIRS
         )
+        repeated_failure_states: dict[str, int] = {}
+        no_progress_stop = False
         for repair_round in range(maximum_review_round + 1):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
@@ -3739,11 +3869,37 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
+            boundary_reconsideration_needed = (
+                _semantic_problems_need_boundary_reconsideration(last_problems)
+            )
+            failure_state = hashlib.sha256(json.dumps({
+                "spans": spans,
+                "problems": last_problems,
+            }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            repeated_failure_states[failure_state] = (
+                repeated_failure_states.get(failure_state, 0) + 1
+            )
+            if (
+                repeated_failure_states[failure_state] >= 2
+                and repair_round >= 4
+                and not boundary_reconsideration_needed
+            ):
+                attempts.append({
+                    "round": repair_round,
+                    "kind": "no_progress_stop",
+                    "failed_card_ids": [
+                        final_cards[index].id for index in last_problems
+                    ],
+                    "errors": last_problems,
+                })
+                no_progress_stop = True
+                break
             if repair_round == maximum_review_round:
                 break
             failed = sorted(last_problems)
             late_boundary_repair = (
                 repair_round in INTERVIEW_LATE_BOUNDARY_REPAIR_ROUNDS
+                and boundary_reconsideration_needed
             )
             windows: list[tuple[int, int]] = []
             for index in failed:
@@ -3856,10 +4012,15 @@ class NaturalSubtitleTranslator:
             })
         if last_problems:
             raise InterviewJointTranslationError(
-                "interview joint translation exhausted "
-                f"{INTERVIEW_MOVABLE_BOUNDARY_REPAIRS} movable-boundary repairs "
-                f"and {INTERVIEW_FIXED_BOUNDARY_REPAIRS} bounded semantic repairs "
-                "including late boundary reconsideration: "
+                (
+                    "interview joint translation stopped after an unchanged "
+                    "non-boundary failure repeated: "
+                    if no_progress_stop else
+                    "interview joint translation exhausted "
+                    f"{INTERVIEW_MOVABLE_BOUNDARY_REPAIRS} movable-boundary repairs "
+                    f"and {INTERVIEW_FIXED_BOUNDARY_REPAIRS} bounded semantic repairs "
+                    "including issue-routed late boundary reconsideration: "
+                )
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:
@@ -3905,6 +4066,8 @@ class NaturalSubtitleTranslator:
     def translate_caption_scopes(
         self, cues: list[TranscriptCue], terminology: list[TerminologyEntry],
         plan: dict[str, Any], duration: float, editorial_mode: str,
+        *, source_video_id: str = "", job_checkpoint_dir: Path | None = None,
+        scope_cache_dir: Path | None = None, prior_jobs_dir: Path | None = None,
     ) -> dict[str, Any]:
         """Run the joint subtitle engine inside immutable editorial cut ranges."""
         publishable_source_cues: list[TranscriptCue] = []
@@ -3928,6 +4091,7 @@ class NaturalSubtitleTranslator:
         source_words = source_words_from_cues(publishable_source_cues)
         ranges = _caption_plan_ranges(plan, duration)
         scope_traces: list[dict[str, Any]] = []
+        checkpoint_records: list[tuple[str, dict[str, Any]]] = []
         translated: list[TranscriptCue] = []
         assigned_word_ids: set[str] = set()
         for scope_number, source_range in enumerate(ranges, start=1):
@@ -3948,20 +4112,97 @@ class NaturalSubtitleTranslator:
                     "raw": word.raw, "start": word.start, "end": word.end,
                 } for word in scope_words],
             )]
-            scope_trace = self.translate_interview_clip_once(
-                scope_cues, terminology, scope_words,
-                "json3:" + source_ledger_fingerprint(scope_words), "",
+            checkpoint_inputs = _caption_scope_checkpoint_inputs(
+                source_video_id, editorial_mode, source_range, scope_words,
+                terminology, self.runtime_guidance,
             )
+            checkpoint_key = _caption_scope_checkpoint_key(checkpoint_inputs)
+            checkpoint_name = f"{checkpoint_key}.json"
+            candidates: list[tuple[str, Path]] = []
+            if job_checkpoint_dir is not None:
+                candidates.append(("current_job", job_checkpoint_dir / checkpoint_name))
+            if scope_cache_dir is not None:
+                candidates.append(("cache", scope_cache_dir / checkpoint_name))
+            if prior_jobs_dir is not None and source_video_id:
+                dated_prior_paths: list[tuple[float, Path]] = []
+                for path in prior_jobs_dir.glob(
+                    f"watch-v-{source_video_id}-*/caption-scope-checkpoints/"
+                    + checkpoint_name
+                ):
+                    try:
+                        dated_prior_paths.append((path.stat().st_mtime, path))
+                    except OSError:
+                        # Cleanup may remove an old failed job between glob and stat.
+                        continue
+                prior_paths = [
+                    path for _, path in sorted(
+                        dated_prior_paths, key=lambda item: item[0], reverse=True,
+                    )[:20]
+                ]
+                candidates.extend(("prior_job", path) for path in prior_paths)
+            loaded: tuple[list[TranscriptCue], dict[str, Any], dict[str, Any]] | None = None
+            checkpoint_source = "generated"
+            checkpoint_asset = ""
+            for source, path in candidates:
+                loaded = _validated_caption_scope_checkpoint(
+                    path, checkpoint_inputs, scope_words, terminology,
+                )
+                if loaded is not None:
+                    checkpoint_source = source
+                    checkpoint_asset = str(path)
+                    break
+            if loaded is not None:
+                scope_cues, scope_trace, checkpoint_payload = loaded
+            else:
+                scope_trace = self.translate_interview_clip_once(
+                    scope_cues, terminology, scope_words,
+                    "json3:" + source_ledger_fingerprint(scope_words), "",
+                )
+                checkpoint_payload = {}
             for card_number, card in enumerate(scope_cues, start=1):
                 card.id = (
                     f"caption-scope-{scope_number:03d}-card-{card_number:04d}"
                 )
+            if not checkpoint_payload:
+                checkpoint_payload = {
+                    "schema_version": CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION,
+                    "state": "complete",
+                    "scope_key": checkpoint_key,
+                    "created_at": now_iso(),
+                    "inputs": checkpoint_inputs,
+                    "output": {
+                        "cues": [asdict(card) for card in scope_cues],
+                        "strict_source_fingerprint": (
+                            _strict_interview_source_fingerprint(scope_cues)
+                        ),
+                        "caption_content_fingerprint": (
+                            _interview_caption_content_fingerprint(scope_cues)
+                        ),
+                        "reviewed_cue_ids": [card.id for card in scope_cues],
+                        "scope_trace": scope_trace,
+                    },
+                    "validation": {
+                        "exact_source_coverage": True,
+                        "terminology_contract_passed": True,
+                        "caption_policy_passed": True,
+                    },
+                }
+                if job_checkpoint_dir is not None:
+                    checkpoint_path = job_checkpoint_dir / checkpoint_name
+                    _atomic_write_json(checkpoint_path, checkpoint_payload)
+                    checkpoint_asset = str(checkpoint_path)
             translated.extend(scope_cues)
+            checkpoint_records.append((checkpoint_key, checkpoint_payload))
             scope_traces.append({
                 "scope": scope_number,
                 "source_range": [source_range.start, source_range.end],
                 "reviewed_cue_ids": [card.id for card in scope_cues],
                 "trace": scope_trace,
+                "checkpoint": {
+                    "key": checkpoint_key,
+                    "source": checkpoint_source,
+                    "asset": checkpoint_asset,
+                },
             })
         selected_word_ids = {
             word.id for word in source_words
@@ -4082,6 +4323,12 @@ class NaturalSubtitleTranslator:
                 raise ValueError(
                     "cross-scope consistency reviewer returned invalid structure twice: "
                     + json.dumps(structure_failures, ensure_ascii=False)
+                )
+        if scope_cache_dir is not None:
+            for checkpoint_key, checkpoint_payload in checkpoint_records:
+                _atomic_write_json(
+                    scope_cache_dir / f"{checkpoint_key}.json",
+                    checkpoint_payload,
                 )
         cues[:] = translated
         return {
@@ -4224,7 +4471,13 @@ class NaturalSubtitleTranslator:
             entry for entry in terminology
             if entry.rationale
             and entry.source.casefold() not in ESTABLISHED_CHINESE_TERMS
-            and any(_contains_term(cue.source_text, entry.source) for cue in cues)
+            and (
+                any(_contains_term(cue.source_text, entry.source) for cue in cues)
+                or (
+                    entry.strategy == TerminologyStrategy.PRESERVE
+                    and bool(_preserve_source_variant_candidates(cues, entry.source))
+                )
+            )
         ]
         if not contextual:
             return None
@@ -4241,10 +4494,20 @@ class NaturalSubtitleTranslator:
         dropped_sources: list[str] = []
         for attempt in range(2):
             rows: list[dict[str, Any]] = []
+            variant_candidates: dict[str, list[str]] = {}
             for entry in contextual:
+                candidates = (
+                    _preserve_source_variant_candidates(cues, entry.source)
+                    if entry.strategy == TerminologyStrategy.PRESERVE else []
+                )
+                variant_candidates[entry.source.casefold()] = candidates
                 matching = [
                     index for index, cue in enumerate(cues)
                     if _contains_term(cue.source_text, entry.source)
+                    or any(
+                        _contains_term(cue.source_text, variant)
+                        for variant in candidates
+                    )
                 ]
                 context_indices = sorted({
                     neighbor
@@ -4256,6 +4519,7 @@ class NaturalSubtitleTranslator:
                     **_terminology_prompt_row(
                         entry, " ".join(cues[index].source_text for index in matching),
                     ),
+                    "source_variant_candidates": candidates,
                     "context": [cues[index].source_text for index in context_indices],
                 })
             expected = {entry.source.casefold(): entry for entry in contextual}
@@ -4269,7 +4533,8 @@ class NaturalSubtitleTranslator:
                         "Treat both translate and preserve as proposals, not instructions. Preserve English only for a product or company name, acronym, code/API identifier, or a genuinely unsettled term that lacks a clear natural Chinese rendering in this context. A term being recent or emerging is not by itself evidence that Chinese readers should see the English form. Reject preserve when a concise, established or compositionally clear Chinese rendering accurately conveys the source distinction.",
                         "For translate, reject a target that changes the actor, action, technical distinction, or contextual sense. Judge the supplied rationale against the source context rather than trusting it. Alternatives are candidates, not automatic approvals.",
                         "If the exact source is an apparent ASR corruption, misspelling, or broken fragment rather than a stable term, reject it and make the first error exactly drop:not_a_stable_term. Use that marker only when the source itself should not be a video-level terminology decision; sentence-level meaning remains for the subtitle reviewer.",
-                        "Return every source exactly once as {reviews:[{source,pass,fidelity_score,naturalness_score,errors}]}. Pass only when both scores are at least 4 and the exact strategy and target are publication-ready. Do not return replacement wording.",
+                        "For a preserve decision, source_variant_candidates are observed spellings from the selected English. Approve in source_variants only candidates that context clearly shows are the same named entity despite ASR spelling drift. Do not approve a merely similar ordinary word. For translate decisions source_variants must be empty.",
+                        "Return every source exactly once as {reviews:[{source,pass,fidelity_score,naturalness_score,errors,source_variants}]}. Pass only when both scores are at least 4 and the exact strategy, target, and approved source variants are publication-ready. Do not return replacement wording.",
                         (
                             "The previous reviewer response failed deterministic structure validation: "
                             + json.dumps(phase_structure_failures[-1], ensure_ascii=False)
@@ -4313,6 +4578,32 @@ class NaturalSubtitleTranslator:
                             )
                     if not isinstance(row.get("errors"), list):
                         structure_errors.append(f"{source}: errors must be an array")
+                    key = source.casefold()
+                    raw_variants = row.get("source_variants", [])
+                    if not isinstance(raw_variants, list) or any(
+                        not isinstance(value, str) for value in raw_variants
+                    ):
+                        structure_errors.append(
+                            f"{source}: source_variants must be an array of strings"
+                        )
+                    else:
+                        allowed = set(variant_candidates.get(key, []))
+                        returned = [str(value).strip() for value in raw_variants]
+                        if (
+                            (allowed and "source_variants" not in row)
+                            or
+                            len(returned) != len(set(returned))
+                            or not set(returned) <= allowed
+                            or (
+                                key in expected
+                                and expected[key].strategy
+                                != TerminologyStrategy.PRESERVE
+                                and returned
+                            )
+                        ):
+                            structure_errors.append(
+                                f"{source}: source_variants must be unique approved candidates"
+                            )
                 if not structure_errors:
                     reviews = {
                         str(row["source"]).casefold(): row
@@ -4347,6 +4638,11 @@ class NaturalSubtitleTranslator:
                     )
                     if rejected[entry.source] and rejected[entry.source][0] == "drop:not_a_stable_term":
                         dropped_keys.add(key)
+                else:
+                    entry.source_variants = [
+                        str(value).strip()
+                        for value in row.get("source_variants", [])
+                    ]
             if dropped_keys:
                 dropped_sources.extend(
                     expected[key].source for key in sorted(dropped_keys)
@@ -4432,6 +4728,7 @@ class NaturalSubtitleTranslator:
                 entry.target = replacement.target
                 entry.alternatives = replacement.alternatives
                 entry.rationale = replacement.rationale
+                entry.source_variants = []
                 entry.first_use_explanation = ""
                 entry.notes = replacement.notes
         rejected_keys = {source.casefold() for source in last_rejected}
@@ -4807,6 +5104,21 @@ class NaturalSubtitleTranslator:
                 re.sub(r"\s+", " ", raw_rationale).strip()[:240]
                 if isinstance(raw_rationale, str) else ""
             )
+            raw_source_variants = item.get("source_variants", [])
+            source_variants: list[str] = []
+            if isinstance(raw_source_variants, list):
+                for raw_variant in raw_source_variants:
+                    variant = (
+                        re.sub(r"\s+", " ", raw_variant).strip()
+                        if isinstance(raw_variant, str) else ""
+                    )
+                    if (
+                        variant and len(variant) <= 120
+                        and variant.casefold() != source.casefold()
+                        and _contains_term(source_text, variant)
+                        and variant not in source_variants
+                    ):
+                        source_variants.append(variant)
             if alternatives and not rationale:
                 alternatives = []
             established_target = ESTABLISHED_CHINESE_TERMS.get(source.casefold())
@@ -4853,6 +5165,8 @@ class NaturalSubtitleTranslator:
                 strategy = TerminologyStrategy.PRESERVE
             if strategy != TerminologyStrategy.TRANSLATE:
                 alternatives = []
+            else:
+                source_variants = []
             if (
                 strategy == TerminologyStrategy.TRANSLATE
                 and not rationale
@@ -4867,6 +5181,7 @@ class NaturalSubtitleTranslator:
             entries.append(TerminologyEntry(
                 source=source, strategy=strategy, target=target,
                 alternatives=alternatives, rationale=rationale,
+                source_variants=source_variants,
                 first_use_explanation=explanation,
                 notes=(
                     str(item.get("notes") or "").strip()[:240]
@@ -6743,7 +7058,7 @@ def _semantic_card_translation_errors(
                 errors.append(f"term:{term.source}:remove_english:{term.source}")
         if term.strategy == TerminologyStrategy.PRESERVE:
             source_owns_term = _source_owns_preserved_term(
-                source, term.source, protected_terms,
+                source, term.source, protected_terms, term.source_variants,
             )
             preserved_form = term.target.strip() or term.source
             target_has_term = (
@@ -8628,6 +8943,7 @@ def _terminology_decision_fingerprint(
         "notes": entry.notes,
         "alternatives": list(entry.alternatives),
         "rationale": entry.rationale,
+        "source_variants": sorted(entry.source_variants),
     } for entry in terminology]
     return hashlib.sha256(json.dumps(
         rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -9387,6 +9703,13 @@ class YouTubeCollectionFactory:
                     trace.append(translator.translate_caption_scopes(
                         cues, terminology, editorial_plan, original_duration,
                         editorial_mode,
+                        source_video_id=str(metadata.get("id") or ""),
+                        job_checkpoint_dir=job / "caption-scope-checkpoints",
+                        scope_cache_dir=(
+                            self.workspace.root / "cache" / "youtube-caption-scopes"
+                            / "v1" / str(metadata.get("id") or "unknown")
+                        ),
+                        prior_jobs_dir=self.workspace.root / "jobs",
                     ))
                 except Exception as exc:
                     failure_trace = {

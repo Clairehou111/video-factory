@@ -18,11 +18,13 @@ from video_factory.models import (
 from video_factory.media import AudioLoudness, VideoProbe, probe_audio_loudness, probe_video
 from video_factory.serde import collection_manifest_from_dict
 from video_factory.storage import Workspace
-from video_factory.youtube_alignment import ALIGNMENT_POLICY_VERSION, source_words_from_cues
+from video_factory.youtube_alignment import (
+    ALIGNMENT_POLICY_VERSION, source_ledger_fingerprint, source_words_from_cues,
+)
 from video_factory.youtube import (
     DiscoveryConfig, NaturalSubtitleTranslator, YouTubeAcquirer, YouTubeCandidate,
     YouTubeCollectionFactory, YouTubeCollectionRenderer, YouTubeDiscoveryService,
-    SourceBelow1080Error, YouTubeAcquisitionError,
+    InterviewJointTranslationError, SourceBelow1080Error, YouTubeAcquisitionError,
     build_collection_manifest, build_hook_candidates, normalize_chinese_subtitle,
     audience_relevance, classify_youtube_editorial,
     _coerce_range, editorial_plan_contract_errors, normalize_editorial_plan_structure,
@@ -2055,6 +2057,7 @@ class YouTubeCollectionTest(unittest.TestCase):
     def test_semantic_card_reports_preserved_term_ownership_before_final_gate(self) -> None:
         term = TerminologyEntry(
             "Roomba", TerminologyStrategy.PRESERVE, target="Roomba",
+            source_variants=["Rooma"],
         )
 
         self.assertIn(
@@ -2075,6 +2078,7 @@ class YouTubeCollectionTest(unittest.TestCase):
     def test_preserved_term_accepts_obvious_same_card_asr_spelling_drift(self) -> None:
         term = TerminologyEntry(
             "Roomba", TerminologyStrategy.PRESERVE, target="Roomba",
+            source_variants=["Rooma"],
         )
 
         self.assertEqual(
@@ -2098,6 +2102,16 @@ class YouTubeCollectionTest(unittest.TestCase):
                 ),
             ], [term]),
             [],
+        )
+        unreviewed = TerminologyEntry(
+            "Roomba", TerminologyStrategy.PRESERVE, target="Roomba",
+        )
+        self.assertIn(
+            "term:Roomba:moved_preserved:Roomba",
+            _semantic_card_translation_errors({
+                "id": "owner", "source": "the original Rooma team",
+                "duration_seconds": 3.0,
+            }, "最初的 Roomba 团队", [unreviewed], require_punctuation=False),
         )
 
     def test_semantic_card_accepts_equivalent_term_spacing_and_identity(self) -> None:
@@ -2428,6 +2442,63 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertIn(
             "previous reviewer response failed deterministic structure validation",
             reviewer.prompts[1],
+        )
+
+    def test_independent_terminology_review_approves_source_spelling_variant(self) -> None:
+        class MustNotRevise:
+            def _request_json(self, *args, **kwargs):
+                raise AssertionError("an approved terminology decision must not be revised")
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.terms: list[dict[str, object]] = []
+
+            def _request_json(self, messages, max_tokens):
+                prompt = messages[-1]["content"]
+                self.terms, _ = json.JSONDecoder().raw_decode(
+                    prompt.split("Terms: ", 1)[1]
+                )
+                return {"reviews": [{
+                    "source": "Roomba", "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5,
+                    "errors": [], "source_variants": ["Rooma"],
+                }]}, {"model": "reviewer"}
+
+        cues = [TranscriptCue(
+            "cue-1", 0, 4, "The original Rooma team shipped it.", "",
+        )]
+        terminology = [TerminologyEntry(
+            "Roomba", TerminologyStrategy.PRESERVE, target="Roomba",
+            rationale="The context identifies the robot company.",
+        )]
+        reviewer = Reviewer()
+
+        NaturalSubtitleTranslator(
+            MustNotRevise(), subtitle_reviewer=reviewer,
+        ).review_terminology_decisions(cues, terminology)
+
+        self.assertEqual(
+            reviewer.terms[0]["source_variant_candidates"], ["Rooma"],
+        )
+        self.assertEqual(terminology[0].source_variants, ["Rooma"])
+        self.assertEqual(terminology_contract_errors([
+            TranscriptCue(
+                "card-1", 0, 4, "The original Rooma team shipped it.",
+                "最初的 Roomba 团队将它推向市场。",
+            ),
+        ], terminology), [])
+
+    def test_similar_ordinary_word_is_not_a_preserved_term_without_review(self) -> None:
+        term = TerminologyEntry(
+            "Stripe", TerminologyStrategy.PRESERVE, target="Stripe",
+        )
+
+        self.assertIn(
+            "term:Stripe:moved_preserved:Stripe",
+            _semantic_card_translation_errors({
+                "id": "card-1", "source": "workers strike today",
+                "duration_seconds": 3.0,
+            }, "Stripe 员工今天行动", [term], require_punctuation=False),
         )
 
 
@@ -2971,7 +3042,7 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(len(reviewer.local_ids), len(set(reviewer.local_ids)))
         self.assertEqual(reviewer.global_calls, 3)
 
-    def test_global_review_cannot_introduce_unfocused_failure_after_repair(self) -> None:
+    def test_global_review_does_not_discard_reported_unfocused_failure(self) -> None:
         class Writer:
             def __init__(self) -> None:
                 self.calls = 0
@@ -2997,11 +3068,11 @@ class YouTubeCollectionTest(unittest.TestCase):
                 prompt = messages[-1]["content"]
                 if "Sequence: " in prompt:
                     self.global_calls += 1
-                    failed_id = (
-                        "interview-card-2"
-                        if self.global_calls == 1
-                        else "interview-card-20"
-                    )
+                    if self.global_calls >= 3:
+                        return {"pass": True, "issues": []}, {
+                            "model": "reviewer-global",
+                        }
+                    failed_id = "interview-card-2" if self.global_calls == 1 else "interview-card-20"
                     return {"pass": False, "issues": [{
                         "ids": [failed_id],
                         "errors": ["material global issue"],
@@ -3021,15 +3092,12 @@ class YouTubeCollectionTest(unittest.TestCase):
             writer, subtitle_reviewer=reviewer,
         ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
 
-        self.assertEqual(reviewer.global_calls, 2)
+        self.assertEqual(reviewer.global_calls, 3)
         global_trace = trace["attempts"][-1]["review_provenance"][
             "global_consistency_review"
         ]
         self.assertTrue(global_trace["pass"])
-        self.assertEqual(
-            global_trace["ignored_unfocused_issues"][0]["ids"],
-            ["interview-card-20"],
-        )
+        self.assertGreaterEqual(writer.calls, 3)
 
     def test_persistent_semantic_failure_reopens_local_boundaries(self) -> None:
         class Writer:
@@ -3101,6 +3169,49 @@ class YouTubeCollectionTest(unittest.TestCase):
             for item in trace["attempts"]
         ))
 
+    def test_unchanged_non_boundary_failure_stops_without_twelve_retries(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                rows = json.loads(
+                    prompt.split("Source words: ", 1)[1].split("\nNext source:", 1)[0]
+                )
+                return {"cards": [
+                    {"end_word": len(rows) // 2, "text": "同一错误译文。"},
+                    {"end_word": len(rows), "text": "同一错误译文。"},
+                ]}, {"model": "writer"}
+
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Prior rejected rows: " in prompt:
+                    rows = json.loads(prompt.split("Prior rejected rows: ", 1)[1])
+                else:
+                    rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": False,
+                    "fidelity_score": 2, "naturalness_score": 4,
+                    "errors": ["The translation omits the qualification."],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 21))
+        cues = [TranscriptCue("cue-1", 0, 12, source)]
+        writer = Writer()
+
+        with self.assertRaises(InterviewJointTranslationError) as raised:
+            NaturalSubtitleTranslator(
+                writer, subtitle_reviewer=Reviewer(),
+            ).translate_interview_clip_once(
+                cues, [], source_words_from_cues(cues),
+            )
+
+        self.assertEqual(writer.calls, 5)
+        self.assertEqual(raised.exception.trace[-1]["kind"], "no_progress_stop")
+
     def test_joint_caption_scopes_preserve_editorial_plan_and_cut_boundaries(self) -> None:
         class Writer:
             def _request_json(self, messages, **kwargs):
@@ -3153,6 +3264,116 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertTrue(all(cue.end <= 10 or cue.start >= 10 for cue in cues))
         self.assertTrue(all(cue.id.startswith("caption-scope-") for cue in cues))
         self.assertNotIn("laughter", " ".join(cue.source_text for cue in cues))
+
+    def test_completed_caption_scope_is_reused_after_later_scope_failure(self) -> None:
+        class Reviewer:
+            def _request_json(self, messages, **kwargs):
+                return {"pass": True, "issues": []}, {"model": "reviewer"}
+
+        cues = [
+            TranscriptCue(
+                "a", 0, 10,
+                "one two three four five six seven eight nine ten",
+            ),
+            TranscriptCue(
+                "b", 10, 20,
+                "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty",
+            ),
+        ]
+        plan = {
+            "editorial_mode": "technical_coverage",
+            "collection_title": "fixed plan",
+            "bilibili_chapters": [],
+            "wechat_lessons": [
+                {"title": "first", "start": 0, "end": 10,
+                 "hook_headlines": ["a", "b", "c"]},
+                {"title": "second", "start": 10, "end": 20,
+                 "hook_headlines": ["d", "e", "f"]},
+            ],
+        }
+
+        def complete_scope(scope_cues, terminology, words, *args):
+            midpoint = len(words) // 2
+            scope_cues[:] = [
+                TranscriptCue(
+                    "temporary-1", words[0].start, words[midpoint - 1].end,
+                    " ".join(word.raw for word in words[:midpoint]), "第一张卡。",
+                ),
+                TranscriptCue(
+                    "temporary-2", words[midpoint].start, words[-1].end,
+                    " ".join(word.raw for word in words[midpoint:]), "第二张卡。",
+                ),
+            ]
+            return {
+                "policy_fingerprint": INTERVIEW_CAPTION_POLICY_FINGERPRINT,
+                "source_ledger_fingerprint": source_ledger_fingerprint(words),
+                "terminology_decision_fingerprint": (
+                    _terminology_decision_fingerprint(terminology)
+                ),
+            }
+
+        with TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            first_job = jobs / "watch-v-video1-first"
+            first_checkpoint_dir = first_job / "caption-scope-checkpoints"
+            cache_dir = Path(temp) / "cache"
+            first_calls: list[str] = []
+
+            def fail_second(scope_cues, terminology, words, *args):
+                first_calls.append(words[0].raw)
+                if words[0].raw == "eleven":
+                    raise ValueError("second scope failed")
+                return complete_scope(scope_cues, terminology, words, *args)
+
+            first_translator = NaturalSubtitleTranslator(
+                object(), subtitle_reviewer=Reviewer(),
+            )
+            with patch.object(
+                first_translator, "translate_interview_clip_once",
+                side_effect=fail_second,
+            ):
+                with self.assertRaisesRegex(ValueError, "second scope failed"):
+                    first_translator.translate_caption_scopes(
+                        list(cues), [], plan, 20, "technical_coverage",
+                        source_video_id="video1",
+                        job_checkpoint_dir=first_checkpoint_dir,
+                        scope_cache_dir=cache_dir,
+                        prior_jobs_dir=jobs,
+                    )
+
+            self.assertEqual(first_calls, ["one", "eleven"])
+            self.assertEqual(len(list(first_checkpoint_dir.glob("*.json"))), 1)
+            self.assertEqual(list(cache_dir.glob("*.json")), [])
+
+            second_calls: list[str] = []
+
+            def finish_remaining(scope_cues, terminology, words, *args):
+                second_calls.append(words[0].raw)
+                return complete_scope(scope_cues, terminology, words, *args)
+
+            second_translator = NaturalSubtitleTranslator(
+                object(), subtitle_reviewer=Reviewer(),
+            )
+            retry_cues = list(cues)
+            with patch.object(
+                second_translator, "translate_interview_clip_once",
+                side_effect=finish_remaining,
+            ):
+                trace = second_translator.translate_caption_scopes(
+                    retry_cues, [], plan, 20, "technical_coverage",
+                    source_video_id="video1",
+                    job_checkpoint_dir=(
+                        jobs / "watch-v-video1-second" / "caption-scope-checkpoints"
+                    ),
+                    scope_cache_dir=cache_dir,
+                    prior_jobs_dir=jobs,
+                )
+
+            self.assertEqual(second_calls, ["eleven"])
+            self.assertEqual(
+                trace["scope_traces"][0]["checkpoint"]["source"], "prior_job",
+            )
+            self.assertEqual(len(list(cache_dir.glob("*.json"))), 2)
 
     def test_subtitle_resegmentation_cannot_reselect_frozen_hook(self) -> None:
         plan = {
