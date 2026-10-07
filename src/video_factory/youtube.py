@@ -6611,6 +6611,22 @@ def _semantic_card_translation_errors(
             )
             if not same_written_form and _contains_term(translation, term.source):
                 errors.append(f"term:{term.source}:remove_english:{term.source}")
+        if term.strategy == TerminologyStrategy.PRESERVE:
+            source_owns_term = _contains_unprotected_term(
+                source, term.source, protected_terms,
+            )
+            preserved_form = term.target.strip() or term.source
+            target_has_term = (
+                preserved_form in translation
+                if term.target.strip()
+                else _contains_unprotected_term(
+                    translation, term.source, protected_terms,
+                )
+            )
+            if source_owns_term and not target_has_term:
+                errors.append(f"term:{term.source}:missing_preserved:{preserved_form}")
+            elif target_has_term and not source_owns_term:
+                errors.append(f"term:{term.source}:moved_preserved:{preserved_form}")
     return errors
 
 

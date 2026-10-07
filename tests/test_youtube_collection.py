@@ -2052,6 +2052,26 @@ class YouTubeCollectionTest(unittest.TestCase):
             ),
         )
 
+    def test_semantic_card_reports_preserved_term_ownership_before_final_gate(self) -> None:
+        term = TerminologyEntry(
+            "Roomba", TerminologyStrategy.PRESERVE, target="Roomba",
+        )
+
+        self.assertIn(
+            "term:Roomba:missing_preserved:Roomba",
+            _semantic_card_translation_errors({
+                "id": "owner", "source": "Roomba shipped first.",
+                "duration_seconds": 3.0,
+            }, "它率先出货。", [term]),
+        )
+        self.assertIn(
+            "term:Roomba:moved_preserved:Roomba",
+            _semantic_card_translation_errors({
+                "id": "neighbor", "source": "The product shipped first.",
+                "duration_seconds": 3.0,
+            }, "Roomba 率先出货。", [term]),
+        )
+
     def test_semantic_card_accepts_equivalent_term_spacing_and_identity(self) -> None:
         row = {
             "id": "card", "source": "Token usage includes dark tokens.",
