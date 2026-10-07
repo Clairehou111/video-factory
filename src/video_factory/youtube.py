@@ -320,7 +320,7 @@ CONFERENCE_HIGHLIGHT_MIN_SECONDS = 45.0
 CONFERENCE_HIGHLIGHT_MAX_SECONDS = 300.0
 CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS = 900.0
 INTERVIEW_MAX_INTERNAL_SILENCE_SECONDS = 3.0
-INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v11-batched-semantic-convergence"
+INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v12-focused-semantic-convergence"
 INTERVIEW_CAPTION_TARGET_MAX_SECONDS = 5.0
 INTERVIEW_CAPTION_HARD_MAX_SECONDS = 7.5
 INTERVIEW_CAPTION_MIN_SECONDS = 1.2
@@ -332,6 +332,7 @@ INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND = 12.0
 INTERVIEW_CAPTION_MAX_RENDERED_LINES = 3
 INTERVIEW_MOVABLE_BOUNDARY_REPAIRS = 3
 INTERVIEW_FIXED_BOUNDARY_REPAIRS = 12
+INTERVIEW_LATE_BOUNDARY_REPAIR_ROUNDS = frozenset({5, 9})
 INTERVIEW_HOOK_CONTEXT_MIN_VISIBLE_CHARACTERS = 22
 INTERVIEW_HOOK_CONTEXT_DRAFT_TARGET_MAX_VISIBLE_CHARACTERS = 105
 INTERVIEW_DIRECTING_POLICY_VERSION = "2026-09-21-v3-atomic-hook-pair"
@@ -367,6 +368,9 @@ def _interview_caption_policy_fingerprint() -> str:
         "maximum_rendered_lines": INTERVIEW_CAPTION_MAX_RENDERED_LINES,
         "movable_boundary_repairs": INTERVIEW_MOVABLE_BOUNDARY_REPAIRS,
         "fixed_boundary_repairs": INTERVIEW_FIXED_BOUNDARY_REPAIRS,
+        "late_boundary_repair_rounds": sorted(
+            INTERVIEW_LATE_BOUNDARY_REPAIR_ROUNDS
+        ),
     }
     encoded = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -2468,6 +2472,9 @@ class NaturalSubtitleTranslator:
         glossary = _relevant_terminology_prompt_rows(terminology, expected_source)
         attempts: list[dict[str, Any]] = []
         local_review_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        global_review_state: dict[str, tuple[Any, ...]] = {}
+        global_unresolved_ids: set[str] = set()
+        review_error_history: dict[tuple[int, int, str], list[str]] = {}
         hypothesis_words = re.findall(r"\S+", audio_hypothesis)
         hypothesis_norm = [
             re.sub(r"[^a-z0-9']+", "", value.casefold().replace("’", "'"))
@@ -3306,9 +3313,43 @@ class NaturalSubtitleTranslator:
 
             global_trace: dict[str, Any] | None = None
             if len(partitions) > 1:
+                current_global_state = {
+                    card.id: (
+                        spans[index][0], spans[index][1],
+                        card.source_text, card.translation,
+                    )
+                    for index, card in enumerate(cards)
+                }
+                if not global_review_state:
+                    global_focus_ids = set(expected)
+                else:
+                    changed_indices = {
+                        index for index, card in enumerate(cards)
+                        if global_review_state.get(card.id)
+                        != current_global_state[card.id]
+                    }
+                    focused_indices = {
+                        neighbor
+                        for index in changed_indices
+                        for neighbor in range(
+                            max(0, index - 1), min(len(cards), index + 2),
+                        )
+                    }
+                    global_focus_ids = {
+                        cards[index].id for index in focused_indices
+                    } | (global_unresolved_ids & expected)
                 global_failures: list[list[str]] = []
                 global_provenances: list[dict[str, Any]] = []
-                for global_attempt in range(3):
+                ignored_issues: list[dict[str, Any]] = []
+                if not global_focus_ids:
+                    global_review_state.clear()
+                    global_review_state.update(current_global_state)
+                    global_trace = {
+                        "attempts": [], "structure_failures": [],
+                        "pass": True, "issues": [],
+                        "focus_card_ids": [], "skipped_unchanged_sequence": True,
+                    }
+                for global_attempt in range(3) if global_focus_ids else ():
                     verdict, global_provenance = reviewer._request_json([
                         {"role": "system", "content": (
                             "Return one compact JSON object with exactly the keys pass and issues. "
@@ -3316,11 +3357,15 @@ class NaturalSubtitleTranslator:
                         )},
                         {"role": "user", "content": "\n".join([
                             "Check only cross-partition consistency in this already locally reviewed bilingual subtitle sequence. Do not rewrite it.",
+                            "Only report an issue when at least one issue id is in Focus ids. Rows outside Focus ids already passed the same global review unchanged; they are context and cannot become a new standalone rejection.",
                             "Check consistent contextual terminology, entity ownership, adjacent boundary meaning, and cross-card duplication or omission. Return {pass,issues:[{ids,errors}]}. pass=true requires an empty issues array. Every issue id must come from Sequence.",
                             "Return only material failures. Do not emit a review for each passing card, fidelity/naturalness scores, or explanations of correct rows.",
                             "source_word_range is the authoritative half-open word-ledger interval. Identical text in adjacent non-overlapping ranges is a real spoken repetition, not a duplicated card. Report duplication only when a source range is reused or Chinese adds repetition unsupported by its own range.",
                             "The English sequence is authoritative and may retain ASR spelling/spacing artifacts. Do not reject faithful Chinese for resolving an obvious spoken form such as 'verse' meaning 'versus', for preserving the exact English name spelling, or for adding a grammatically implicit head noun without a new factual claim. Audio ASR is read-only meaning evidence and never changes the English rows.",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                            "Focus ids: " + json.dumps(
+                                sorted(global_focus_ids), ensure_ascii=False,
+                            ),
                             "Audio ASR hypothesis: " + audio_evidence_for_window(
                                 spans[0][0], spans[-1][1],
                             ),
@@ -3362,26 +3407,43 @@ class NaturalSubtitleTranslator:
                     if passed is False and not issue_rows:
                         structure_errors.append("pass=false requires at least one issue")
                     if not structure_errors:
-                        if passed is False:
+                        actionable_issues = [
+                            issue for issue in issue_rows
+                            if set(map(str, issue["ids"])) & global_focus_ids
+                        ]
+                        ignored_issues = [
+                            issue for issue in issue_rows
+                            if not set(map(str, issue["ids"])) & global_focus_ids
+                        ]
+                        if actionable_issues:
                             index_by_id = {card.id: index for index, card in enumerate(cards)}
-                            for issue in issue_rows:
+                            for issue in actionable_issues:
                                 for card_id in map(str, issue["ids"]):
                                     problems.setdefault(index_by_id[card_id], []).extend(
                                         str(error) for error in issue["errors"]
                                     )
+                        passed = not actionable_issues
+                        issue_rows = actionable_issues
+                        global_review_state.clear()
+                        global_review_state.update(current_global_state)
                         break
                     global_failures.append(structure_errors)
                 else:
-                    raise ValueError(
-                        "global subtitle consistency reviewer returned invalid structure three times: "
-                        + json.dumps(global_failures, ensure_ascii=False)
-                    )
-                global_trace = {
-                    "attempts": global_provenances,
-                    "structure_failures": global_failures,
-                    "pass": passed,
-                    "issues": issue_rows,
-                }
+                    if global_focus_ids:
+                        raise ValueError(
+                            "global subtitle consistency reviewer returned invalid "
+                            "structure three times: "
+                            + json.dumps(global_failures, ensure_ascii=False)
+                        )
+                if global_focus_ids:
+                    global_trace = {
+                        "attempts": global_provenances,
+                        "structure_failures": global_failures,
+                        "pass": passed,
+                        "issues": issue_rows,
+                        "ignored_unfocused_issues": ignored_issues,
+                        "focus_card_ids": sorted(global_focus_ids),
+                    }
             provenance = {
                 "local_review_partitions": local_review_traces,
                 "global_consistency_review": global_trace,
@@ -3402,12 +3464,22 @@ class NaturalSubtitleTranslator:
                 # plus one exact-card retranslation. Ask the independent reviewer
                 # to adjudicate its remaining rejections once, so tentative or
                 # self-contradictory review prose cannot block a valid sequence.
+                for index, errors in problems.items():
+                    key = (spans[index][0], spans[index][1], cards[index].source_text)
+                    history = review_error_history.setdefault(key, [])
+                    for error in errors:
+                        if error not in history:
+                            history.append(error)
                 failed_rows = [{
                     "id": cards[index].id,
                     "source_word_range": [spans[index][0], spans[index][1]],
                     "source": cards[index].source_text,
                     "chinese": cards[index].translation,
                     "prior_errors": errors,
+                    "review_history": review_error_history.get(
+                        (spans[index][0], spans[index][1], cards[index].source_text),
+                        [],
+                    ),
                     "previous": ({
                         "source_word_range": [
                             spans[index - 1][0], spans[index - 1][1],
@@ -3436,6 +3508,7 @@ class NaturalSubtitleTranslator:
                             "Independently adjudicate the remaining subtitle review rejections after bounded repair. Do not rewrite any text.",
                             "Judge only whether each prior error identifies a material omission, invention, changed actor/modality/scope, misplaced entity, misleading cut, or incomprehensible Chinese. A sentence may continue across cards. Dismiss preferences, optional connective wording, tentative 'may affect' concerns, and an error that says the translation has no problem.",
                             "A prior error may itself contradict its claimed referent or actor. Resolve pronouns from the complete previous/current/next causal context. If you retain the error, state exactly one supported referent and one concrete semantic mismatch; do not repeat incompatible alternatives from the prior prose.",
+                            "review_history contains earlier verdicts for the same unchanged English range. If those verdicts disagree about whether a token is an entity, verb, actor, or referent, resolve that conflict from Full sequence once. Do not keep an error merely because one earlier reviewer asserted it.",
                             "Do not assign a pronoun to the nearest noun by default. Follow the discourse subject and causal chain, including who earns revenue, loses profit, makes a decision, or is affected; organizations may use singular-they pronouns. Prefer the interpretation that makes the surrounding mechanism coherent.",
                             "English is authoritative but may contain ASR spelling or spacing artifacts. Use each row's audio_hypothesis and context to judge spoken meaning; do not demand literal Chinese for a broken fragment, an English spelling correction, or removal of a natural implicit Chinese head noun when no factual claim was added.",
                             "source_word_range is the authoritative half-open word-ledger interval. Identical wording in adjacent non-overlapping ranges is a real spoken repetition and must not be rejected as a duplicated card.",
@@ -3448,6 +3521,9 @@ class NaturalSubtitleTranslator:
                                 )
                             ) if adjudication_structure_failures else "",
                             "Terminology: " + json.dumps(glossary, ensure_ascii=False),
+                            "Full sequence: " + json.dumps([
+                                review_row(card) for card in cards
+                            ], ensure_ascii=False),
                             "Prior rejected rows: " + json.dumps(
                                 failed_rows, ensure_ascii=False,
                             ),
@@ -3518,6 +3594,10 @@ class NaturalSubtitleTranslator:
                         cards[index].id for index in sorted(problems)
                     ],
                 }
+            global_unresolved_ids.clear()
+            global_unresolved_ids.update(
+                cards[index].id for index in problems
+            )
             return cards, problems, provenance
 
         def initial_windows() -> list[tuple[int, int]]:
@@ -3621,9 +3701,12 @@ class NaturalSubtitleTranslator:
             if repair_round == maximum_review_round:
                 break
             failed = sorted(last_problems)
+            late_boundary_repair = (
+                repair_round in INTERVIEW_LATE_BOUNDARY_REPAIR_ROUNDS
+            )
             windows: list[tuple[int, int]] = []
             for index in failed:
-                if repair_round >= 3:
+                if repair_round >= 3 and not late_boundary_repair:
                     # Once English boundaries are frozen, passing neighbors are
                     # read-only context. Rewriting them caused already-correct
                     # cards to regress while repairing a different card.
@@ -3687,7 +3770,9 @@ class NaturalSubtitleTranslator:
                     )
                 )
                 freeze_semantic_boundaries = (
-                    repair_round >= 3 and not requires_extra_card
+                    repair_round >= 3
+                    and not late_boundary_repair
+                    and not requires_extra_card
                 )
                 replacement, provenance = request_window(
                     word_start, word_end, previous, following, rejection,
@@ -3720,8 +3805,11 @@ class NaturalSubtitleTranslator:
             attempts.append({
                 "round": repair_round + 1,
                 "kind": (
-                    "fixed_boundary_semantic_repair"
-                    if repair_round >= 3 else "local_joint_repair"
+                    "late_boundary_semantic_repair"
+                    if late_boundary_repair
+                    else "fixed_boundary_semantic_repair"
+                    if repair_round >= 3
+                    else "local_joint_repair"
                 ),
                 "windows": repair_traces,
             })
@@ -3729,7 +3817,8 @@ class NaturalSubtitleTranslator:
             raise InterviewJointTranslationError(
                 "interview joint translation exhausted "
                 f"{INTERVIEW_MOVABLE_BOUNDARY_REPAIRS} movable-boundary repairs "
-                f"and {INTERVIEW_FIXED_BOUNDARY_REPAIRS} fixed-boundary semantic repairs: "
+                f"and {INTERVIEW_FIXED_BOUNDARY_REPAIRS} bounded semantic repairs "
+                "including late boundary reconsideration: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:

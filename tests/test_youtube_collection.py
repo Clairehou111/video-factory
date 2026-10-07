@@ -2943,6 +2943,136 @@ class YouTubeCollectionTest(unittest.TestCase):
         self.assertEqual(len(reviewer.local_ids), len(set(reviewer.local_ids)))
         self.assertEqual(reviewer.global_calls, 3)
 
+    def test_global_review_cannot_introduce_unfocused_failure_after_repair(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                self.calls += 1
+                prompt = messages[-1]["content"]
+                rows = json.loads(
+                    prompt.split("Source words: ", 1)[1].split("\nNext source:", 1)[0]
+                )
+                repaired = "Previous rejection (mandatory:" in prompt
+                ends = list(range(10, len(rows), 10)) + [len(rows)]
+                return {"cards": [{
+                    "end_word": end,
+                    "text": "修复后的译文。" if repaired else "初始译文。",
+                } for end in ends]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self) -> None:
+                self.global_calls = 0
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Sequence: " in prompt:
+                    self.global_calls += 1
+                    failed_id = (
+                        "interview-card-2"
+                        if self.global_calls == 1
+                        else "interview-card-20"
+                    )
+                    return {"pass": False, "issues": [{
+                        "ids": [failed_id],
+                        "errors": ["material global issue"],
+                    }]}, {"model": "reviewer-global"}
+                rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"], "pass": True,
+                    "fidelity_score": 5, "naturalness_score": 5, "errors": [],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 261))
+        cues = [TranscriptCue("cue-1", 0, 156, source)]
+        writer = Writer()
+        reviewer = Reviewer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=reviewer,
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertEqual(reviewer.global_calls, 2)
+        global_trace = trace["attempts"][-1]["review_provenance"][
+            "global_consistency_review"
+        ]
+        self.assertTrue(global_trace["pass"])
+        self.assertEqual(
+            global_trace["ignored_unfocused_issues"][0]["ids"],
+            ["interview-card-20"],
+        )
+
+    def test_persistent_semantic_failure_reopens_local_boundaries(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.fixed_calls = 0
+                self.late_boundary_repair = False
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                rows = json.loads(
+                    prompt.split("Source words: ", 1)[1].split("\nNext source:", 1)[0]
+                )
+                fixed_rows = json.loads(
+                    prompt.split("Fixed card translation rows: ", 1)[1]
+                    .split(". When this list", 1)[0]
+                )
+                if fixed_rows:
+                    self.fixed_calls += 1
+                    return {"cards": [{
+                        "end_word": row["end_word"], "text": "仍有歧义。",
+                    } for row in fixed_rows]}, {"model": "writer"}
+                if (
+                    self.fixed_calls >= 2
+                    and "Previous rejection (mandatory:" in prompt
+                ):
+                    self.late_boundary_repair = True
+                ends = list(range(10, len(rows), 10)) + [len(rows)]
+                return {"cards": [{
+                    "end_word": end,
+                    "text": (
+                        "结合相邻语境后的正确译文。"
+                        if self.late_boundary_repair else "仍有歧义。"
+                    ),
+                } for end in ends]}, {"model": "writer"}
+
+        class Reviewer:
+            def __init__(self, writer) -> None:
+                self.writer = writer
+
+            def _request_json(self, messages, **kwargs):
+                prompt = messages[-1]["content"]
+                if "Prior rejected rows: " in prompt:
+                    rows = json.loads(
+                        prompt.split("Prior rejected rows: ", 1)[1]
+                    )
+                else:
+                    rows = json.loads(prompt.split("Rows: ", 1)[1])
+                return {"reviews": [{
+                    "id": row["id"],
+                    "pass": self.writer.late_boundary_repair,
+                    "fidelity_score": 5 if self.writer.late_boundary_repair else 2,
+                    "naturalness_score": 5 if self.writer.late_boundary_repair else 2,
+                    "errors": [] if self.writer.late_boundary_repair else [
+                        "The fixed boundary strands the referent from its context."
+                    ],
+                } for row in rows]}, {"model": "reviewer"}
+
+        source = " ".join(f"word{index}" for index in range(1, 31))
+        cues = [TranscriptCue("cue-1", 0, 18, source)]
+        writer = Writer()
+
+        trace = NaturalSubtitleTranslator(
+            writer, subtitle_reviewer=Reviewer(writer),
+        ).translate_interview_clip_once(cues, [], source_words_from_cues(cues))
+
+        self.assertTrue(writer.late_boundary_repair)
+        self.assertTrue(any(
+            item["kind"] == "late_boundary_semantic_repair"
+            for item in trace["attempts"]
+        ))
+
     def test_joint_caption_scopes_preserve_editorial_plan_and_cut_boundaries(self) -> None:
         class Writer:
             def _request_json(self, messages, **kwargs):
