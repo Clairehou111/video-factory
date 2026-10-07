@@ -41,7 +41,7 @@ def basic_manifest() -> RenderManifest:
 class VideoFactoryTest(unittest.TestCase):
     def test_youtube_jobs_have_a_separate_bounded_llm_request_budget(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_job_llm_max_requests("youtube"), 300)
+            self.assertEqual(_job_llm_max_requests("youtube"), 400)
             self.assertEqual(_job_llm_max_requests("url"), 200)
         with patch.dict(os.environ, {
             "VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS": "240",

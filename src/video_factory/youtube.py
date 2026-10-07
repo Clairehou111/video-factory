@@ -320,7 +320,7 @@ CONFERENCE_HIGHLIGHT_MIN_SECONDS = 45.0
 CONFERENCE_HIGHLIGHT_MAX_SECONDS = 300.0
 CONFERENCE_HIGHLIGHT_MAX_TOTAL_SECONDS = 900.0
 INTERVIEW_MAX_INTERNAL_SILENCE_SECONDS = 3.0
-INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-06-v10-subtitle-hardening"
+INTERVIEW_CAPTION_POLICY_VERSION = "2026-10-07-v11-batched-semantic-convergence"
 INTERVIEW_CAPTION_TARGET_MAX_SECONDS = 5.0
 INTERVIEW_CAPTION_HARD_MAX_SECONDS = 7.5
 INTERVIEW_CAPTION_MIN_SECONDS = 1.2
@@ -330,6 +330,8 @@ INTERVIEW_CAPTION_MAX_ENGLISH_WORDS = 28
 INTERVIEW_CAPTION_TARGET_MAX_CHINESE_CHARACTERS = 22
 INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND = 12.0
 INTERVIEW_CAPTION_MAX_RENDERED_LINES = 3
+INTERVIEW_MOVABLE_BOUNDARY_REPAIRS = 3
+INTERVIEW_FIXED_BOUNDARY_REPAIRS = 12
 INTERVIEW_HOOK_CONTEXT_MIN_VISIBLE_CHARACTERS = 22
 INTERVIEW_HOOK_CONTEXT_DRAFT_TARGET_MAX_VISIBLE_CHARACTERS = 105
 INTERVIEW_DIRECTING_POLICY_VERSION = "2026-09-21-v3-atomic-hook-pair"
@@ -363,6 +365,8 @@ def _interview_caption_policy_fingerprint() -> str:
             INTERVIEW_CAPTION_MAX_CHINESE_CHARACTERS_PER_SECOND
         ),
         "maximum_rendered_lines": INTERVIEW_CAPTION_MAX_RENDERED_LINES,
+        "movable_boundary_repairs": INTERVIEW_MOVABLE_BOUNDARY_REPAIRS,
+        "fixed_boundary_repairs": INTERVIEW_FIXED_BOUNDARY_REPAIRS,
     }
     encoded = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -3586,7 +3590,11 @@ class NaturalSubtitleTranslator:
         last_problems: dict[int, list[str]] = {}
         final_cards: list[TranscriptCue] = []
         review_provenance: dict[str, Any] | None = None
-        for repair_round in range(12):
+        maximum_review_round = (
+            INTERVIEW_MOVABLE_BOUNDARY_REPAIRS
+            + INTERVIEW_FIXED_BOUNDARY_REPAIRS
+        )
+        for repair_round in range(maximum_review_round + 1):
             spans, deterministic_merges = coalesce_mechanical_boundary_failures(spans)
             if deterministic_merges:
                 attempts.append({
@@ -3612,7 +3620,7 @@ class NaturalSubtitleTranslator:
             })
             if not last_problems:
                 break
-            if repair_round == 11:
+            if repair_round == maximum_review_round:
                 break
             failed = sorted(last_problems)
             windows: list[tuple[int, int]] = []
@@ -3721,8 +3729,9 @@ class NaturalSubtitleTranslator:
             })
         if last_problems:
             raise InterviewJointTranslationError(
-                "interview joint translation exhausted three movable-boundary repairs "
-                "and eight fixed-boundary semantic repairs: "
+                "interview joint translation exhausted "
+                f"{INTERVIEW_MOVABLE_BOUNDARY_REPAIRS} movable-boundary repairs "
+                f"and {INTERVIEW_FIXED_BOUNDARY_REPAIRS} fixed-boundary semantic repairs: "
                 + json.dumps(last_problems, ensure_ascii=False), attempts,
             )
         if " ".join(card.source_text for card in final_cards) != actual_source:

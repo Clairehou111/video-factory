@@ -90,7 +90,7 @@ def _job_llm_max_requests(source: str) -> int:
         if source == "youtube" else None
     )
     shared = os.environ.get("VIDEO_FACTORY_JOB_LLM_MAX_REQUESTS")
-    return int(specific or shared or ("300" if source == "youtube" else "200"))
+    return int(specific or shared or ("400" if source == "youtube" else "200"))
 
 
 def static_radar_target_duration(content_type: ContentType, discovery_channel: str | None) -> float:
