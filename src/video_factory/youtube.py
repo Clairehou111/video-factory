@@ -6496,7 +6496,7 @@ def _uppercase_source_entities(value: str) -> set[str]:
     """Return auditable acronym-like entities that must not move across cards."""
     return set(re.findall(
         r"\b([A-Z][A-Z0-9.-]{1,}?)(?:s|es)?\b", value,
-    )) - {"AI", "US", "USA"}
+    )) - {"AI", "US", "USA", "OK"}
 
 
 def _caption_entity_alignment_errors(

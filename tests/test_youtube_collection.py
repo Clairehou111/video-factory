@@ -2006,6 +2006,14 @@ class YouTubeCollectionTest(unittest.TestCase):
 
         self.assertNotIn("modality", errors)
 
+    def test_spoken_ok_is_not_treated_as_an_owned_acronym(self) -> None:
+        errors = _semantic_card_translation_errors({
+            "id": "card", "source": "OK so we built the first prototype.",
+            "duration_seconds": 4.0,
+        }, "于是我们做出了第一台原型。", [])
+
+        self.assertNotIn("missing:OK", errors)
+
     def test_semantic_card_reports_which_translation_term_rule_failed(self) -> None:
         term = TerminologyEntry(
             "retrieval agent", TerminologyStrategy.TRANSLATE, target="检索代理",
