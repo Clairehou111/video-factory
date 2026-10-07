@@ -3354,7 +3354,16 @@ class YouTubeCollectionTest(unittest.TestCase):
             second_translator = NaturalSubtitleTranslator(
                 object(), subtitle_reviewer=Reviewer(),
             )
-            retry_cues = list(cues)
+            retry_cues = [
+                TranscriptCue(
+                    "new-a", 0, 10,
+                    "one, two three four five six seven eight nine ten",
+                ),
+                TranscriptCue(
+                    "new-b", 10, 20,
+                    "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty",
+                ),
+            ]
             with patch.object(
                 second_translator, "translate_interview_clip_once",
                 side_effect=finish_remaining,
@@ -3373,6 +3382,7 @@ class YouTubeCollectionTest(unittest.TestCase):
             self.assertEqual(
                 trace["scope_traces"][0]["checkpoint"]["source"], "prior_job",
             )
+            self.assertTrue(retry_cues[0].source_text.startswith("one,"))
             self.assertEqual(len(list(cache_dir.glob("*.json"))), 2)
 
     def test_subtitle_resegmentation_cannot_reselect_frozen_hook(self) -> None:

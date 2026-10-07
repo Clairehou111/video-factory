@@ -2200,7 +2200,7 @@ def _matching_completed_directing_audit(
 
 
 
-CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION = 1
+CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -2218,6 +2218,22 @@ def _caption_scope_checkpoint_inputs(
     scope_words: list[SourceWord], terminology: list[TerminologyEntry],
     runtime_guidance: str,
 ) -> dict[str, Any]:
+    source_content_fingerprint = hashlib.sha256(json.dumps(
+        [word.normalized for word in scope_words],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    terminology_enforcement_fingerprint = hashlib.sha256(json.dumps([
+        {
+            "source": entry.source,
+            "strategy": entry.strategy.value,
+            "target": entry.target,
+            "alternatives": list(entry.alternatives),
+            "source_variants": sorted(entry.source_variants),
+        }
+        for entry in terminology
+    ], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )).hexdigest()
     return {
         "source_video_id": source_video_id,
         "editorial_mode": editorial_mode,
@@ -2227,6 +2243,10 @@ def _caption_scope_checkpoint_inputs(
         "source_ledger_fingerprint": source_ledger_fingerprint(scope_words),
         "source_word_ids": [word.id for word in scope_words],
         "source_word_count": len(scope_words),
+        "source_content_fingerprint": source_content_fingerprint,
+        "terminology_enforcement_fingerprint": (
+            terminology_enforcement_fingerprint
+        ),
         "terminology_decision_fingerprint": _terminology_decision_fingerprint(
             terminology,
         ),
@@ -2240,7 +2260,15 @@ def _caption_scope_checkpoint_key(inputs: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(
         {
             "schema_version": CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION,
-            "inputs": inputs,
+            "inputs": {
+                key: inputs[key] for key in (
+                    "source_video_id", "editorial_mode", "policy_version",
+                    "policy_fingerprint", "scope_range", "source_word_count",
+                    "source_content_fingerprint",
+                    "terminology_enforcement_fingerprint",
+                    "runtime_guidance_sha256",
+                )
+            },
         },
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
@@ -2255,29 +2283,82 @@ def _validated_caption_scope_checkpoint(
     except (OSError, json.JSONDecodeError):
         return None
     expected_key = _caption_scope_checkpoint_key(expected_inputs)
+    schema_version = payload.get("schema_version")
+    stored_inputs = payload.get("inputs")
+    stable_input_keys = (
+        "source_video_id", "editorial_mode", "policy_version",
+        "policy_fingerprint", "scope_range", "source_word_count",
+        "runtime_guidance_sha256",
+    )
     if (
-        payload.get("schema_version") != CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION
+        schema_version not in {1, CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION}
         or payload.get("state") != "complete"
-        or payload.get("scope_key") != expected_key
-        or payload.get("inputs") != expected_inputs
+        or not isinstance(stored_inputs, dict)
+        or any(
+            stored_inputs.get(key) != expected_inputs.get(key)
+            for key in stable_input_keys
+        )
+        or (
+            schema_version == CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION
+            and (
+                payload.get("scope_key") != expected_key
+                or stored_inputs.get("source_content_fingerprint")
+                != expected_inputs.get("source_content_fingerprint")
+                or stored_inputs.get("terminology_enforcement_fingerprint")
+                != expected_inputs.get("terminology_enforcement_fingerprint")
+            )
+        )
     ):
         return None
     output = payload.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("cues"), list):
         return None
     try:
-        cards = [TranscriptCue(**row) for row in output["cues"]]
+        original_cards = [TranscriptCue(**row) for row in output["cues"]]
     except (TypeError, ValueError):
         return None
+    if (
+        not original_cards
+        or any(not card.translation.strip() for card in original_cards)
+        or output.get("strict_source_fingerprint")
+        != _strict_interview_source_fingerprint(original_cards)
+        or output.get("caption_content_fingerprint")
+        != _interview_caption_content_fingerprint(original_cards)
+    ):
+        return None
+    card_word_counts = [
+        len(re.findall(r"\S+", card.source_text)) for card in original_cards
+    ]
+    original_normalized = [
+        re.sub(r"[^a-z0-9']+", "", token.casefold().replace("’", "'"))
+        for card in original_cards
+        for token in re.findall(r"\S+", card.source_text)
+    ]
+    if (
+        sum(card_word_counts) != len(scope_words)
+        or original_normalized != [word.normalized for word in scope_words]
+    ):
+        return None
+    cards: list[TranscriptCue] = []
+    cursor = 0
+    for card, word_count in zip(original_cards, card_word_counts):
+        card_words = scope_words[cursor:cursor + word_count]
+        if not card_words:
+            return None
+        cards.append(TranscriptCue(
+            id=card.id,
+            start=card_words[0].start,
+            end=card_words[-1].end,
+            source_text=" ".join(word.raw for word in card_words),
+            translation=card.translation,
+            source_tokens=[{
+                "raw": word.raw, "start": word.start, "end": word.end,
+            } for word in card_words],
+        ))
+        cursor += word_count
     expected_source = " ".join(word.raw for word in scope_words)
     if (
-        not cards
-        or any(not card.translation.strip() for card in cards)
-        or " ".join(card.source_text for card in cards) != expected_source
-        or output.get("strict_source_fingerprint")
-        != _strict_interview_source_fingerprint(cards)
-        or output.get("caption_content_fingerprint")
-        != _interview_caption_content_fingerprint(cards)
+        " ".join(card.source_text for card in cards) != expected_source
         or terminology_contract_errors(cards, terminology)
         or interview_caption_duration_errors(cards, terminology)
     ):
@@ -2286,12 +2367,16 @@ def _validated_caption_scope_checkpoint(
     if (
         not isinstance(trace, dict)
         or trace.get("policy_fingerprint") != INTERVIEW_CAPTION_POLICY_FINGERPRINT
-        or trace.get("source_ledger_fingerprint")
-        != source_ledger_fingerprint(scope_words)
-        or trace.get("terminology_decision_fingerprint")
-        != _terminology_decision_fingerprint(terminology)
     ):
         return None
+    trace = dict(trace)
+    trace["checkpoint_review_source_ledger_fingerprint"] = trace.get(
+        "source_ledger_fingerprint", ""
+    )
+    trace["source_ledger_fingerprint"] = source_ledger_fingerprint(scope_words)
+    trace["terminology_decision_fingerprint"] = (
+        _terminology_decision_fingerprint(terminology)
+    )
     return cards, trace, payload
 
 
@@ -4125,10 +4210,10 @@ class NaturalSubtitleTranslator:
                 candidates.append(("cache", scope_cache_dir / checkpoint_name))
             if prior_jobs_dir is not None and source_video_id:
                 dated_prior_paths: list[tuple[float, Path]] = []
-                for path in prior_jobs_dir.glob(
-                    f"watch-v-{source_video_id}-*/caption-scope-checkpoints/"
-                    + checkpoint_name
-                ):
+                prior_pattern = (
+                    f"watch-v-{source_video_id}-*/caption-scope-checkpoints/*.json"
+                )
+                for path in prior_jobs_dir.glob(prior_pattern):
                     try:
                         dated_prior_paths.append((path.stat().st_mtime, path))
                     except OSError:
@@ -4137,7 +4222,7 @@ class NaturalSubtitleTranslator:
                 prior_paths = [
                     path for _, path in sorted(
                         dated_prior_paths, key=lambda item: item[0], reverse=True,
-                    )[:20]
+                    )[:200]
                 ]
                 candidates.extend(("prior_job", path) for path in prior_paths)
             loaded: tuple[list[TranscriptCue], dict[str, Any], dict[str, Any]] | None = None
@@ -4163,7 +4248,11 @@ class NaturalSubtitleTranslator:
                 card.id = (
                     f"caption-scope-{scope_number:03d}-card-{card_number:04d}"
                 )
-            if not checkpoint_payload:
+            if (
+                not checkpoint_payload
+                or checkpoint_payload.get("schema_version")
+                != CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION
+            ):
                 checkpoint_payload = {
                     "schema_version": CAPTION_SCOPE_CHECKPOINT_SCHEMA_VERSION,
                     "state": "complete",
